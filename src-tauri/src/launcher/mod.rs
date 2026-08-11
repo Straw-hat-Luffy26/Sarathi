@@ -8,6 +8,7 @@
 //! of the user's is modified and there is nothing to undo. The trade-off is
 //! deliberate: opening the tool by other means will not be connected.
 
+pub mod console;
 pub mod mcp;
 pub mod registry;
 pub mod spec;
@@ -60,13 +61,17 @@ pub struct ToolStatus {
 /// Tracks processes Sarathi started, so cards can show Running and offer Stop.
 #[derive(Default)]
 pub struct LaunchedProcesses {
-    inner: Mutex<HashMap<String, u32>>,
+    /// Tool id to the pid Sarathi received and the title of the window it
+    /// opened. Both are kept because neither answers on its own: on Windows the
+    /// pid belongs to a `start` wrapper that exits immediately, and elsewhere
+    /// there is no window to look for.
+    inner: Mutex<HashMap<String, (u32, String)>>,
 }
 
 impl LaunchedProcesses {
-    pub fn record(&self, tool_id: &str, pid: u32) {
+    pub fn record(&self, tool_id: &str, pid: u32, window_title: &str) {
         if let Ok(mut m) = self.inner.lock() {
-            m.insert(tool_id.to_string(), pid);
+            m.insert(tool_id.to_string(), (pid, window_title.to_string()));
         }
     }
 
@@ -77,11 +82,30 @@ impl LaunchedProcesses {
     }
 
     pub fn pid_of(&self, tool_id: &str) -> Option<u32> {
-        self.inner.lock().ok()?.get(tool_id).copied()
+        self.inner.lock().ok()?.get(tool_id).map(|(pid, _)| *pid)
     }
 
     pub fn running_count(&self) -> usize {
         self.inner.lock().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// The tool's process, if one is tracked *and* still alive.
+    ///
+    /// A pid alone is not enough to answer "is it running": the user may have
+    /// closed the terminal, which Sarathi is not told about. A stale entry is
+    /// dropped here so the next launch opens a window rather than reporting a
+    /// process that no longer exists.
+    pub fn live_pid(&self, tool_id: &str) -> Option<u32> {
+        let (pid, title) = self.inner.lock().ok()?.get(tool_id).cloned()?;
+
+        // Either signal is enough. The window is the reliable one on Windows,
+        // where the pid belongs to a wrapper that has already exited; the pid
+        // covers the platforms that open no window of their own.
+        if console::window_open(&title) || console::is_running(pid) {
+            return Some(pid);
+        }
+        self.forget(tool_id);
+        None
     }
 }
 
@@ -298,10 +322,54 @@ pub fn launch(spec: &ToolSpec, ctx: &LaunchContext, workspace: &std::path::Path)
     std::fs::create_dir_all(workspace)
         .map_err(|e| format!("could not prepare the Sarathi workspace: {e}")) ?;
 
-    let mut cmd = std::process::Command::new(&program);
     // Filled, not passed raw: an argument may name a generated config file, and
     // that path is only known once the client directory is.
-    cmd.args(resolve_args(&spec.launch.args, ctx));
+    let args = resolve_args(&spec.launch.args, ctx);
+
+    // On Windows the tool is run through a generated script in its own console.
+    //
+    // Sarathi is a GUI process in release builds, so it has no console for a
+    // child to inherit — and these tools are terminal agents with nowhere to
+    // draw without one. Handing the child `CREATE_NEW_CONSOLE` gives it a real
+    // window whether or not Sarathi has one, and the script prints which model
+    // and gateway it is connected to before the agent takes the screen.
+    #[cfg(windows)]
+    let mut cmd = {
+        let script = console::write_script(
+            std::path::Path::new(&ctx.client_dir),
+            spec,
+            ctx,
+            &program,
+            &args,
+        )?;
+
+        // `start`, not `CREATE_NEW_CONSOLE`.
+        //
+        // The flag alone is not enough. Rust's `Command` always sets
+        // STARTF_USESTDHANDLES and, for the default inherit, fills it with the
+        // parent's handles — so the child gets a new console window *and* keeps
+        // writing to the old one, which is empty in a GUI build. Observed
+        // directly: the banner appeared in the launching terminal instead of the
+        // new window.
+        //
+        // `start` hands the job to the shell, which detaches the child properly
+        // and gives it the new console's own handles. The empty first argument
+        // is `start`'s title parameter — without it, a quoted script path is
+        // taken as the title and nothing runs.
+        let mut cmd = std::process::Command::new("cmd.exe");
+        cmd.arg("/c").arg("start").arg("").arg(&script);
+        cmd
+    };
+
+    // Elsewhere the terminal the user launched Sarathi from is the console, and
+    // opening another would need a terminal emulator this cannot assume exists.
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = std::process::Command::new(&program);
+        cmd.args(&args);
+        cmd
+    };
+
     cmd.current_dir(workspace);
 
     // Stripped before setting ours: a tool that reads a provider key from the
@@ -414,7 +482,7 @@ mod tests {
         assert_eq!(procs.running_count(), 0);
         assert_eq!(procs.pid_of("claude-code"), None);
 
-        procs.record("claude-code", 1234);
+        procs.record("claude-code", 1234, "Sarathi - Claude Code");
         assert_eq!(procs.pid_of("claude-code"), Some(1234));
         assert_eq!(procs.running_count(), 1);
 

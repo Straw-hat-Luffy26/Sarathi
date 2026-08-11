@@ -22,6 +22,17 @@ pub enum Protocol {
     Anthropic,
 }
 
+impl Protocol {
+    /// How the endpoint reads in the terminal Sarathi opens, so the banner says
+    /// which of the gateway's two APIs the tool is speaking.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::OpenAi => "OpenAI API",
+            Self::Anthropic => "Anthropic API",
+        }
+    }
+}
+
 /// Package managers Sarathi will delegate installation to.
 ///
 /// Deliberately a closed set. Sarathi never downloads an installer itself; it

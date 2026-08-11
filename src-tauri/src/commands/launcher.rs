@@ -198,6 +198,16 @@ pub async fn launch_tool(
         .ok_or_else(|| format!("no tool called '{tool_id}'"))?
         .clone();
 
+    // A tool Sarathi already started keeps the terminal it is working in.
+    //
+    // Launching again would open a second window against the same workspace and
+    // the same gateway, with two agents editing the same files. The card's Stop
+    // is how a user detaches from one deliberately.
+    if let Some(pid) = procs.live_pid(&tool_id) {
+        log::info!("[LAUNCH] '{tool_id}' is already running (pid {pid}); not starting another");
+        return Ok(pid);
+    }
+
     let data_dir = app
         .path()
         .app_data_dir()
@@ -231,12 +241,13 @@ pub async fn launch_tool(
         mcp,
     };
     let model_label = model.model_name.clone();
+    let tool_name = spec.name.clone();
 
     let pid = tokio::task::spawn_blocking(move || launcher::launch(&spec, &ctx, &workspace))
         .await
         .map_err(|e| format!("launch task failed: {e}"))??;
 
-    procs.record(&tool_id, pid);
+    procs.record(&tool_id, pid, &launcher::console::title_for(&tool_name));
     log::info!(
         "[LAUNCH] Started '{tool_id}' (pid {pid}) as a Sarathi client on port {port}, serving '{model_label}'"
     );
