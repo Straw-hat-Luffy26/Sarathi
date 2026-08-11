@@ -71,21 +71,56 @@ pub struct MoeWeightSplit {
 /// offloadable and leave nothing resident.
 const MAX_EXPERT_FRACTION: f64 = 0.95;
 
-/// Splits a MoE model's weights into resident and offloadable parts.
+/// The share of a MoE model's weights that are routed experts.
 ///
-/// A MoE model does **not** offload proportionally the way a dense one does.
-/// Only the routed experts move; attention and the KV cache have to stay on the
-/// card. Treating it proportionally overstates the VRAM a machine needs and
-/// misreports where the memory actually goes.
-///
-/// The expert share is solved from figures the catalog already carries. With
-/// `D` non-expert parameters and `E` routed-expert parameters:
+/// Solved from figures the catalog already carries. With `D` non-expert
+/// parameters and `E` routed-expert parameters:
 ///
 /// ```text
 /// D + E                       = total
 /// D + E × (active/num experts) = active
 /// ⇒ E = (total − active) / (1 − active_experts/num_experts)
 /// ```
+///
+/// Kept separate from [`split_moe_weights`] because the browse listing has to
+/// answer the same question *before* a model is downloaded, where the geometry
+/// comes from
+/// [`moe_geometry`](crate::model_providers::huggingface::moe_geometry) rather
+/// than from a [`ModelMetadata`] record. One formula, so the listing and the
+/// loader cannot disagree about how much of a model can leave the card.
+///
+/// Returns `None` when the figures cannot produce a sensible share.
+pub fn moe_expert_fraction(
+    num_experts: u32,
+    active_experts: u32,
+    total_parameters: u64,
+    active_parameters: u64,
+) -> Option<f64> {
+    if num_experts == 0 || active_experts == 0 || active_experts >= num_experts {
+        return None;
+    }
+
+    let total = total_parameters as f64;
+    let active = active_parameters as f64;
+    if total <= 0.0 || active <= 0.0 || active >= total {
+        return None;
+    }
+
+    let used_share = f64::from(active_experts) / f64::from(num_experts);
+    let expert_params = (total - active) / (1.0 - used_share);
+    if expert_params <= 0.0 {
+        return None;
+    }
+
+    Some((expert_params / total).min(MAX_EXPERT_FRACTION))
+}
+
+/// Splits a MoE model's weights into resident and offloadable parts.
+///
+/// A MoE model does **not** offload proportionally the way a dense one does.
+/// Only the routed experts move; attention and the KV cache have to stay on the
+/// card. Treating it proportionally overstates the VRAM a machine needs and
+/// misreports where the memory actually goes.
 ///
 /// Returns `None` for dense models, or when the figures cannot produce a
 /// sensible split — the caller then falls back to the proportional estimate.
@@ -97,23 +132,12 @@ pub fn split_moe_weights(model: &ModelMetadata, weight_bytes: u64) -> Option<Moe
         _ => return None,
     };
 
-    if num_experts == 0 || active_experts == 0 || active_experts >= num_experts {
-        return None;
-    }
-
-    let total = model.total_parameters as f64;
-    let active = model.active_parameters? as f64;
-    if total <= 0.0 || active <= 0.0 || active >= total {
-        return None;
-    }
-
-    let used_share = f64::from(active_experts) / f64::from(num_experts);
-    let expert_params = (total - active) / (1.0 - used_share);
-    if expert_params <= 0.0 {
-        return None;
-    }
-
-    let expert_fraction = (expert_params / total).min(MAX_EXPERT_FRACTION);
+    let expert_fraction = moe_expert_fraction(
+        num_experts,
+        active_experts,
+        model.total_parameters,
+        model.active_parameters?,
+    )?;
     let expert_bytes = (weight_bytes as f64 * expert_fraction) as u64;
 
     Some(MoeWeightSplit {
@@ -312,6 +336,7 @@ mod tests {
         // openai/gpt-oss-20b's published config.json.
         let from_header = GgufMetadata {
             architecture: "gpt-oss".to_string(),
+            role: crate::ai_engine::gguf_meta::GgufRole::Model,
             block_count: 24,
             embedding_length: 2880,
             expert_count: 32,
@@ -321,6 +346,10 @@ mod tests {
             key_length: 64,
             value_length: 64,
             parameter_count: Some(20_900_000_000),
+            context_length: 131_072,
+            has_vision: false,
+            has_pooling: false,
+            file_type: Some(38),
         }
         .expert_bytes(file_bytes, None);
 

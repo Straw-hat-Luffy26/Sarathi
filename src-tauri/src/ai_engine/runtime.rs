@@ -206,6 +206,12 @@ impl LlamaCppRuntime {
             );
         }
 
+        // Recorded by the preflight below and used only to explain a failure —
+        // a load that fails for both GPU and CPU is almost always the build not
+        // recognising the architecture, and naming it is the difference between
+        // an actionable message and "NullResult".
+        let mut preflight_architecture: Option<String> = None;
+
         // Use the path exactly as resolved upstream. Rewriting separators here
         // corrupts absolute paths on every non-Windows platform.
         let clean_path = config.model_path.clone();
@@ -244,6 +250,46 @@ impl LlamaCppRuntime {
                 log::error!("{}", err);
                 return Err(err);
             }
+        }
+
+        // Is this file a model at all?
+        //
+        // The magic-bytes check above only proves the file is *a* GGUF. A vision
+        // projector, an MTP head and an EAGLE-3 speculative-decoding draft are
+        // all valid GGUFs, and llama.cpp answers a request to load one with a
+        // null pointer — which surfaced as "GPU error: NullResult, CPU error:
+        // NullResult" and sent people looking for a hardware fault.
+        //
+        // Asked before the load rather than after it fails, because afterwards
+        // there is nothing left to inspect: a null carries no reason.
+        match crate::ai_engine::gguf_meta::read_gguf_metadata(path_obj) {
+            Ok(meta) => {
+                if let Some(reason) = meta.role.refusal(&meta.architecture) {
+                    let err = anyhow!("[STAGE 4 RUNTIME ERROR] {reason}");
+                    log::error!("{}", err);
+                    return Err(err);
+                }
+                log::info!(
+                    "[STAGE 4 RUNTIME AUDIT] '{}' is a loadable model (architecture '{}', {} layers, {})",
+                    clean_path,
+                    meta.architecture,
+                    meta.block_count,
+                    if meta.is_moe() {
+                        format!("MoE with {} experts", meta.expert_count)
+                    } else {
+                        "dense".to_string()
+                    }
+                );
+                preflight_architecture = Some(meta.architecture);
+            }
+            // A header this cannot parse is not grounds to refuse the load.
+            // llama.cpp reads more of the format than this does, and rejecting a
+            // model it would have loaded is the worse error.
+            Err(e) => log::warn!(
+                "[STAGE 4 RUNTIME WARN] Could not classify '{}' before loading ({e:#}); \
+                 handing it to llama.cpp anyway",
+                clean_path
+            ),
         }
 
         // Shard completeness check for split GGUFs (e.g., -00001-of-00002.gguf)
@@ -328,9 +374,31 @@ impl LlamaCppRuntime {
                         (cpu_model, "llama.cpp (CPU Fallback)".to_string())
                     }
                     Err(e2) => {
+                        // Failing on CPU too rules out the offload plan, the
+                        // card and its driver: those are the only things the
+                        // two attempts differ in. What is left is the file, and
+                        // llama.cpp's way of saying it cannot read one is a null
+                        // pointer with no reason attached — so the reason has to
+                        // be supplied here.
+                        let cause = match &preflight_architecture {
+                            Some(arch) => format!(
+                                "This build of llama.cpp does not support the '{arch}' \
+                                 architecture. It is a valid model file; the bundled runtime is \
+                                 too old to read it, or the architecture is not implemented \
+                                 upstream. Check for a Sarathi update, or pick a model built on \
+                                 an architecture this version supports."
+                            ),
+                            None => "The file could not be read as a model. It may be truncated, \
+                                     corrupted, or not a model at all — a failed or interrupted \
+                                     download is the usual cause."
+                                .to_string(),
+                        };
                         let err = anyhow!(
-                            "[STAGE 4 RUNTIME ERROR] LlamaModel::load_from_file failed for both GPU and CPU! GPU error: {:?}, CPU error: {:?}",
-                            e, e2
+                            "[STAGE 4 RUNTIME ERROR] {cause} (loading '{}' failed on GPU and CPU \
+                             alike; GPU error: {:?}, CPU error: {:?})",
+                            clean_path,
+                            e,
+                            e2
                         );
                         log::error!("{}", err);
                         return Err(err);
