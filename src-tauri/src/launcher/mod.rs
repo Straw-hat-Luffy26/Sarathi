@@ -357,7 +357,24 @@ pub fn launch(spec: &ToolSpec, ctx: &LaunchContext, workspace: &std::path::Path)
         // is `start`'s title parameter — without it, a quoted script path is
         // taken as the title and nothing runs.
         let mut cmd = std::process::Command::new("cmd.exe");
-        cmd.arg("/c").arg("start").arg("").arg(&script);
+        // `start` detaches the child into its own console with its own
+        // handles; `CREATE_NEW_CONSOLE` alone does not, because Rust's Command
+        // always fills STARTF_USESTDHANDLES with the parent's handles and the
+        // child keeps writing to those. The empty argument is `start`'s title
+        // parameter — without it a quoted path is taken as the title.
+        //
+        // PowerShell rather than cmd: the startup screen needs ANSI, a timer and
+        // the real window size, and it has to `&` the provider afterwards so the
+        // agent inherits this console rather than another one.
+        cmd.arg("/c")
+            .arg("start")
+            .arg("")
+            .arg("powershell")
+            .arg("-NoProfile")
+            .arg("-ExecutionPolicy")
+            .arg("Bypass")
+            .arg("-File")
+            .arg(&script);
         cmd
     };
 
@@ -470,6 +487,7 @@ mod tests {
             client_dir: std::env::temp_dir().join("sarathi-test-client").to_string_lossy().into(),
             context_length: 8192,
             mcp: crate::launcher::mcp::McpRegistry::default(),
+            runtime: crate::launcher::spec::RuntimeSnapshot::default(),
         };
         let err = launch(&spec, &ctx, &std::env::temp_dir()).unwrap_err();
         assert!(err.contains("could not start"), "got: {err}");

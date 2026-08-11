@@ -11,7 +11,7 @@ use std::path::Path;
 
 use sarathi_lib::launcher::console::script_for;
 use sarathi_lib::launcher::mcp::McpRegistry;
-use sarathi_lib::launcher::spec::{builtin_tools, resolve_args, LaunchContext};
+use sarathi_lib::launcher::spec::{builtin_tools, resolve_args, LaunchContext, RuntimeSnapshot};
 
 fn main() {
     let ctx = LaunchContext {
@@ -21,6 +21,15 @@ fn main() {
         client_dir: r"C:\Users\lenovo\AppData\Roaming\com.sarathi.app\clients\claude-code".into(),
         context_length: 8192,
         mcp: McpRegistry::default(),
+        runtime: RuntimeSnapshot {
+            quantization: Some("Q4_0".into()),
+            backend: Some("llama.cpp (GPU offload: 999 layers)".into()),
+            gpu_layers: Some(999),
+            cpu_moe_layers: Some(0),
+            gpu_name: Some("NVIDIA GeForce RTX 5060 Laptop GPU".into()),
+            vram_total_bytes: Some(8_151_000_000),
+            gpu_backend_compiled: true,
+        },
     };
 
     for spec in builtin_tools() {
@@ -33,8 +42,9 @@ fn main() {
         println!("{}", "=".repeat(78));
         println!("{}  ({})", spec.name, spec.id);
         println!("{}", "=".repeat(78));
-        print!("{}", script_for(&spec, &ctx, &program, &args));
-        println!();
+        let out = std::env::temp_dir().join(format!("sarathi-yatra-{}.ps1", spec.id));
+        std::fs::write(&out, script_for(&spec, &ctx, &program, &args)).unwrap();
+        println!("wrote {}", out.display());
     }
 
 }

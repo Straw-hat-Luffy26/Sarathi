@@ -245,6 +245,39 @@ pub struct LaunchContext {
     pub context_length: u32,
     /// MCP servers to hand this tool, shared by every tool Sarathi launches.
     pub mcp: crate::launcher::mcp::McpRegistry,
+    /// What the runtime is actually doing, for the startup screen.
+    ///
+    /// Read from the loaded model and the hardware profile at launch. Every
+    /// field is optional because every one of them can genuinely be unknown —
+    /// no model loaded, no GPU, a build without a GPU backend — and the screen
+    /// says so rather than filling the space.
+    pub runtime: RuntimeSnapshot,
+}
+
+/// The runtime facts the Dharma Yatra screen reports.
+///
+/// Deliberately a snapshot rather than a live handle: it is taken once, at
+/// launch, by the command that already holds the loaded-model info and the
+/// hardware profile. Nothing here detects anything of its own — duplicating
+/// that logic is how two parts of an app start disagreeing about the same
+/// machine.
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeSnapshot {
+    /// Quantization of the loaded model, e.g. `Q4_0`.
+    pub quantization: Option<String>,
+    /// How llama.cpp reported the placement it achieved, e.g.
+    /// `llama.cpp (GPU offload: 999 layers)`.
+    pub backend: Option<String>,
+    /// Layers requested on the GPU. `999` is llama.cpp's "all".
+    pub gpu_layers: Option<u32>,
+    /// For a MoE model, layers whose routed experts were pinned to system RAM.
+    pub cpu_moe_layers: Option<u32>,
+    /// The card the loader selected, if any.
+    pub gpu_name: Option<String>,
+    pub vram_total_bytes: Option<u64>,
+    /// Whether this binary has a GPU backend compiled in at all. False means
+    /// every model runs on CPU regardless of what hardware is present.
+    pub gpu_backend_compiled: bool,
 }
 
 impl LaunchContext {
@@ -698,6 +731,7 @@ mod tests {
             client_dir: r"C:\data\clients\opencode".into(),
             context_length: 32768,
             mcp: crate::launcher::mcp::McpRegistry::default(),
+            runtime: RuntimeSnapshot::default(),
         }
     }
 

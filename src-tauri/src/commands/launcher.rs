@@ -224,6 +224,12 @@ pub async fn launch_tool(
     // port was taken and the gateway bound elsewhere. Model likewise comes from
     // what is loaded right now, so the tool cannot open on a stale one.
     let port = gateway.port();
+
+    // The same card the loader selected, read rather than recomputed — the
+    // startup screen must not be able to disagree with the placement it reports.
+    let selected_gpu = crate::system_analyzer::get_system_analyzer_manager()
+        .get_profile()
+        .and_then(|p| crate::ai_engine::manager::select_inference_gpu(&p.gpus.current()));
     // Loaded per launch rather than cached: a server added to mcp.json should
     // reach the next tool started, without restarting Sarathi.
     let mcp = launcher::mcp::load(&data_dir);
@@ -239,6 +245,18 @@ pub async fn launch_tool(
         client_dir: client_dir.to_string_lossy().to_string(),
         context_length: model.context_length,
         mcp,
+        // Taken from what is already in hand: the loaded model reports its own
+        // placement, and the profile the loader planned against says which card
+        // it chose. Nothing is detected a second time here.
+        runtime: launcher::spec::RuntimeSnapshot {
+            quantization: Some(model.quantization.clone()).filter(|q| !q.is_empty()),
+            backend: Some(model.backend_used.clone()).filter(|b| !b.is_empty()),
+            gpu_layers: Some(model.gpu_layers),
+            cpu_moe_layers: Some(model.cpu_moe_layers),
+            gpu_name: selected_gpu.as_ref().map(|g| g.model.clone()),
+            vram_total_bytes: selected_gpu.as_ref().map(|g| g.vram_total_bytes),
+            gpu_backend_compiled: cfg!(any(feature = "cuda", feature = "vulkan")),
+        },
     };
     let model_label = model.model_name.clone();
     let tool_name = spec.name.clone();
