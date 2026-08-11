@@ -28,6 +28,47 @@ function probe(cmd, args) {
   return r.status === 0;
 }
 
+/** Trimmed stdout of `cmd`, or '' if it could not be run. */
+function capture(cmd, args) {
+  const r = spawnSync(cmd, args, { encoding: 'utf8', shell: isWindows });
+  return r.status === 0 ? (r.stdout || '').trim() : '';
+}
+
+/**
+ * The CUDA architectures to compile kernels for, read from the GPUs present.
+ *
+ * This matters more than it looks. `llama-cpp-sys-2` does not set
+ * `CMAKE_CUDA_ARCHITECTURES`, so the target list falls back to llama.cpp's own
+ * default — a fixed set chosen when that version was released. A GPU newer than
+ * the list gets a binary with no kernels it can run: CUDA initialisation fails,
+ * llama.cpp falls back to CPU, and nothing says so. The symptom is a GPU sitting
+ * at 0% while the CPU saturates, which is indistinguishable from not having
+ * built with CUDA at all.
+ *
+ * `nvidia-smi` reports compute capability as `12.0`; CMake wants `120`. Every
+ * distinct capability found is passed, so a machine with two different cards
+ * gets kernels for both.
+ *
+ * Returns null when the capability cannot be read, which leaves llama.cpp's
+ * default in place rather than guessing at one.
+ */
+function cudaArchitectures() {
+  const out = capture('nvidia-smi', ['--query-gpu=compute_cap', '--format=csv,noheader']);
+  if (!out) return null;
+
+  const archs = [
+    ...new Set(
+      out
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => /^\d+\.\d+$/.test(l))
+        .map((l) => l.replace('.', ''))
+    ),
+  ];
+
+  return archs.length > 0 ? archs.join(';') : null;
+}
+
 function detectBackend() {
   if (process.env.SARATHI_BACKEND) {
     const forced = process.env.SARATHI_BACKEND.toLowerCase();
@@ -121,11 +162,31 @@ if (isWindows && feature === 'cuda') {
   }
   console.log(`[sarathi] msvc env: ${vcvars}`);
 
+  // CMake reads CUDAARCHS as the default for CMAKE_CUDA_ARCHITECTURES when the
+  // project does not set one, which is exactly the gap here.
+  const archs = cudaArchitectures();
+  console.log(
+    archs
+      ? `[sarathi] cuda arch: ${archs} (from the GPUs present)`
+      : '[sarathi] cuda arch: llama.cpp default — compute capability could not be read'
+  );
+
   const quoted = tauriArgs.map((a) => (a.includes(' ') ? `"${a}"` : a)).join(' ');
-  const line = `"${vcvars}" >nul && set CMAKE_GENERATOR=Ninja&& npx tauri ${quoted}`;
+  const archLine = archs ? `set CUDAARCHS=${archs}&& ` : '';
+  const line = `"${vcvars}" >nul && set CMAKE_GENERATOR=Ninja&& ${archLine}npx tauri ${quoted}`;
   const child = spawn('cmd', ['/c', line], { stdio: 'inherit' });
   child.on('exit', (code) => process.exit(code ?? 1));
 } else {
-  const child = spawn('npx', ['tauri', ...tauriArgs], { stdio: 'inherit', shell: isWindows });
+  const env = { ...process.env };
+  if (feature === 'cuda') {
+    // Same reasoning as the Windows branch: a GPU newer than llama.cpp's
+    // default architecture list gets a binary with no kernels it can run.
+    const archs = cudaArchitectures();
+    if (archs) {
+      env.CUDAARCHS = archs;
+      console.log(`[sarathi] cuda arch: ${archs} (from the GPUs present)`);
+    }
+  }
+  const child = spawn('npx', ['tauri', ...tauriArgs], { stdio: 'inherit', shell: isWindows, env });
   child.on('exit', (code) => process.exit(code ?? 1));
 }
