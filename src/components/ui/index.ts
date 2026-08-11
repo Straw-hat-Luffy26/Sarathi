@@ -2,6 +2,7 @@ export * from './Button';
 export * from './Card';
 export * from './Input';
 export * from './Dialog';
+export * from './ConfirmDialog';
 export * from './Toast';
 export * from './Spinner';
 export * from './Badge';

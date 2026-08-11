@@ -2,13 +2,39 @@
   position: fixed; bottom: var(--space-6); right: var(--space-6); z-index: var(--z-toast);
   display: flex; flex-direction: column; gap: var(--space-3);
 }
+/* Same glass construction as the confirmation dialog, so everything Sarathi
+ * says — whether it is asking or telling — reads as one surface floating above
+ * the app rather than two unrelated widgets. */
 .toast {
-  background: var(--bg-secondary); border: 1px solid var(--border-default);
-  border-radius: var(--radius-md); padding: var(--space-3) var(--space-4);
-  box-shadow: var(--shadow-md); display: flex; align-items: flex-start; gap: var(--space-3);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-edge);
+  border-radius: 12px;
+  padding: var(--space-3) var(--space-4);
+  box-shadow: var(--glass-shadow);
+  display: flex; align-items: flex-start; gap: var(--space-3);
   min-width: 300px; max-width: 400px;
   animation: slideIn 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative; overflow: hidden;
+}
+
+/* The top-edge highlight, as on the dialog. */
+.toast::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--glass-sheen), transparent);
+  pointer-events: none;
+}
+
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .toast { background: var(--bg-secondary); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast { animation: none; }
 }
 .icon { flex-shrink: 0; margin-top: 2px; }
 .success { color: var(--success); }

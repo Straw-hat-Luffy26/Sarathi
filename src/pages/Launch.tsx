@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Button, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
+import { useConfirm } from '../contexts/ConfirmContext';
 import {
   forgetToolProcess,
   getLaunchOverview,
@@ -39,6 +40,7 @@ function sinceLabel(lastSeenMs: number): string {
 
 export const Launch: React.FC = () => {
   const { addToast } = useToast();
+  const confirm = useConfirm();
   const [overview, setOverview] = useState<LaunchOverview | null>(null);
   const [loading, setLoading] = useState(true);
   /** Tool id currently mid-action, so only that card shows a spinner. */
@@ -93,10 +95,15 @@ export const Launch: React.FC = () => {
     try {
       // Show exactly what will run, and get consent, before anything executes.
       const command = await previewToolInstall(tool.id);
-      const approved = window.confirm(
-        `Sarathi will run:\n\n${command}\n\n` +
-          `This installs ${tool.name} using a package manager already on your computer. Continue?`
-      );
+      const approved = await confirm({
+        title: `Install ${tool.name}?`,
+        message:
+          `Sarathi will run this command, using a package manager already on your computer:`,
+        // Carried separately rather than folded into the sentence: a command
+        // being approved has to be readable exactly as it will run.
+        detail: command,
+        confirmLabel: 'Run it',
+      });
       if (!approved) return;
 
       addToast('info', `Installing ${tool.name}…`);

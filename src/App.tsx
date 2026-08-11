@@ -4,6 +4,7 @@ import { AppStateProvider } from './contexts/AppStateContext';
 import { ConfigProvider } from './contexts/ConfigContext';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider } from './contexts/ToastContext';
+import { ConfirmProvider } from './contexts/ConfirmContext';
 import { AppShell } from './components/layout';
 import { Welcome } from './pages/Welcome';
 import { Settings } from './pages/Settings';
@@ -20,6 +21,9 @@ function App() {
       <ConfigProvider>
         <ThemeProvider>
           <ToastProvider>
+            {/* Inside ToastProvider so a confirmed action can raise a toast,
+              * and outside the router so a question survives a route change. */}
+            <ConfirmProvider>
             <BrowserRouter>
               <Routes>
                 <Route path="/" element={<AppShell />}>
@@ -37,6 +41,7 @@ function App() {
                 </Route>
               </Routes>
             </BrowserRouter>
+            </ConfirmProvider>
           </ToastProvider>
         </ThemeProvider>
       </ConfigProvider>

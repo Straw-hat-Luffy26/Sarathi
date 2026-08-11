@@ -100,6 +100,31 @@
    * standing in for one, so nothing depends on distinguishing hues. */
   --tag-fit: #4ADE80;
   --tag-fit-bg: rgba(74, 222, 128, 0.12);
+  /* Runs, but across the PCIe bus rather than on the card. Distinct from
+   * --tag-fit because "runs at full speed" and "runs with its experts in system
+   * memory" are different promises, and the listing makes both. */
+  --tag-offload: #38BDF8;
+  --tag-offload-bg: rgba(56, 189, 248, 0.12);
+
+  /* Glass surfaces.
+   *
+   * Used for surfaces that float above the app and must read as *in front of*
+   * it rather than as another panel: confirmations, and anything else that
+   * replaces a browser dialog. The blur is what does the work — a flat
+   * translucent fill over a dark page just looks grey. Saturation is lifted
+   * because blurring desaturates whatever shows through.
+   *
+   * `--glass-edge` is the hairline that gives the panel an edge against a
+   * blurred background, and `--glass-sheen` the faint top highlight that reads
+   * as a light source above it. Both are near-invisible on their own and are
+   * what separates glass from a translucent rectangle. */
+  --glass-bg: rgba(28, 28, 32, 0.72);
+  --glass-blur: blur(28px) saturate(170%);
+  --glass-edge: rgba(255, 255, 255, 0.14);
+  --glass-sheen: rgba(255, 255, 255, 0.07);
+  --glass-shadow: 0 24px 64px -12px rgba(0, 0, 0, 0.75), 0 0 0 1px rgba(0, 0, 0, 0.35);
+  --glass-scrim: rgba(6, 6, 8, 0.58);
+  --glass-scrim-blur: blur(6px);
   --tag-lora: #C084FC;
   --tag-lora-bg: rgba(192, 132, 252, 0.14);
   --tag-type: #60A5FA;
@@ -142,6 +167,18 @@
   /* Semantic accents, darkened for contrast on a light surface. */
   --tag-fit: #15803D;
   --tag-fit-bg: rgba(21, 128, 61, 0.10);
+  --tag-offload: #0369A1;
+  --tag-offload-bg: rgba(3, 105, 161, 0.10);
+
+  /* The same construction inverted: a bright translucent panel over a light
+   * page, with a dark hairline, since a white edge would vanish. */
+  --glass-bg: rgba(255, 255, 255, 0.78);
+  --glass-blur: blur(28px) saturate(150%);
+  --glass-edge: rgba(0, 0, 0, 0.10);
+  --glass-sheen: rgba(255, 255, 255, 0.65);
+  --glass-shadow: 0 24px 64px -12px rgba(0, 0, 0, 0.22), 0 0 0 1px rgba(0, 0, 0, 0.05);
+  --glass-scrim: rgba(255, 255, 255, 0.55);
+  --glass-scrim-blur: blur(6px);
   --tag-lora: #7E22CE;
   --tag-lora-bg: rgba(126, 34, 206, 0.10);
   --tag-type: #1D4ED8;

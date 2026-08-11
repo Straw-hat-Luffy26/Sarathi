@@ -1,0 +1,185 @@
+/* The confirmation that replaces `window.confirm`.
+ *
+ * A browser dialog says "localhost:1420 says", pins itself to the top of the
+ * window, ignores the theme, and cannot show anything but a string. It reads as
+ * a page misbehaving rather than as the application asking a question — which
+ * matters most for the one thing it is used for here: deleting gigabytes.
+ */
+
+.scrim {
+  position: fixed;
+  inset: 0;
+  z-index: var(--z-modal, 1000);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-5);
+  background: var(--glass-scrim);
+  -webkit-backdrop-filter: var(--glass-scrim-blur);
+  backdrop-filter: var(--glass-scrim-blur);
+  animation: scrimIn 160ms ease-out;
+}
+
+.panel {
+  position: relative;
+  width: min(440px, 100%);
+  border-radius: 16px;
+  padding: var(--space-5);
+  color: var(--text-primary);
+  background: var(--glass-bg);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-edge);
+  box-shadow: var(--glass-shadow);
+  animation: panelIn 200ms cubic-bezier(0.2, 0.9, 0.3, 1);
+}
+
+/* The sheen: a one-pixel highlight along the top edge, as though the light in
+ * the room were above the panel. Drawn as a pseudo-element so it sits over the
+ * blurred fill rather than being blurred with it. */
+.panel::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 1px;
+  border-radius: 16px 16px 0 0;
+  background: linear-gradient(90deg, transparent, var(--glass-sheen), transparent);
+  pointer-events: none;
+}
+
+.head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.icon {
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
+  background: var(--info-bg);
+  color: var(--info);
+}
+
+/* Destructive actions get the warning accent. Colour is never the only signal —
+ * the button says "Delete" and the body names what is lost. */
+.iconDanger {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: var(--font-semibold);
+  line-height: 1.35;
+}
+
+.body {
+  margin: 0 0 var(--space-5);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed, 1.6);
+  color: var(--text-secondary);
+  /* Messages are written with line breaks and sometimes carry a command to be
+     read literally, so the author's spacing is preserved. */
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 46vh;
+  overflow-y: auto;
+}
+
+/* A command the user is being asked to approve is quoted verbatim, so it is set
+   apart from the prose around it rather than blending into it. */
+.detail {
+  display: block;
+  margin: var(--space-3) 0;
+  padding: var(--space-3);
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid var(--glass-edge);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: var(--text-xs);
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.btn {
+  padding: 7px 16px;
+  border-radius: 8px;
+  font-size: var(--text-sm);
+  font-weight: var(--font-medium, 500);
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: background 120ms ease, border-color 120ms ease, opacity 120ms ease;
+}
+
+.cancel {
+  background: transparent;
+  border-color: var(--glass-edge);
+  color: var(--text-secondary);
+}
+
+.cancel:hover {
+  color: var(--text-primary);
+  background: var(--glass-sheen);
+}
+
+.confirm {
+  background: var(--accent-primary);
+  color: var(--accent-foreground);
+}
+
+.confirm:hover {
+  opacity: 0.88;
+}
+
+.confirmDanger {
+  background: var(--error);
+  color: var(--bg-primary);
+}
+
+[data-theme='light'] .confirmDanger {
+  color: #ffffff;
+}
+
+.confirmDanger:hover {
+  opacity: 0.88;
+}
+
+.btn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+@keyframes scrimIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes panelIn {
+  from { opacity: 0; transform: translateY(8px) scale(0.97); }
+  to   { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+/* The blur is decoration; the dialog must still be readable without it. Where
+   `backdrop-filter` is unsupported the panel falls back to an opaque surface
+   rather than a translucent one nothing shows through. */
+@supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) {
+  .panel { background: var(--bg-secondary); }
+  .scrim { background: rgba(0, 0, 0, 0.72); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .scrim, .panel { animation: none; }
+}
