@@ -44,8 +44,10 @@ pub const ANONYMOUS_PAGES: u32 = 1;
 /// every category in the library rather than only the most-downloaded corner of
 /// it. Three things make that affordable:
 ///
-/// - The result is cached for 24 hours, so the cost is paid once a day, not per
-///   visit.
+/// - The result is stored by
+///   [`catalog_cache`](super::catalog_cache) and survives a restart, so the cost
+///   is paid once and then refreshed behind an already-drawn listing rather than
+///   per visit.
 /// - Detail requests run at [`CONCURRENCY`], so the sweep is bounded work rather
 ///   than 2,000 serial round trips.
 /// - A page that fails past the first is not fatal: `discover_repos` keeps
@@ -166,12 +168,45 @@ pub async fn fetch_repo(repo_id: &str, token: Option<&str>) -> Result<GgufRepo> 
         .ok_or_else(|| anyhow!("{repo_id} has no usable GGUF files"))
 }
 
+/// How far along a sweep is.
+///
+/// A sweep is two phases with very different shapes: a handful of search pages,
+/// then a detail request per repository — hundreds of them. Reporting them as
+/// one percentage would sit at zero through the first phase and then crawl, so
+/// each phase reports its own counts and the UI says which is running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepProgress {
+    /// Listing candidate repositories. `page` is 1-based.
+    Searching { page: u32, pages: u32, found: usize },
+    /// Reading each repository's GGUF metadata and file sizes.
+    Fetching { done: usize, total: usize },
+}
+
+/// Reports sweep progress. Called from the sweep's own task, so implementations
+/// must not block.
+pub type ProgressFn<'a> = &'a (dyn Fn(SweepProgress) + Send + Sync);
+
 /// Fetches many repositories concurrently, in bounded batches.
 ///
 /// Individual failures are logged and skipped rather than failing the sweep —
 /// one unreachable repo must not empty the catalog.
 pub async fn fetch_repos(repo_ids: &[String], token: Option<&str>) -> Vec<GgufRepo> {
+    fetch_repos_reporting(repo_ids, token, None).await
+}
+
+/// [`fetch_repos`], reporting after each batch.
+pub async fn fetch_repos_reporting(
+    repo_ids: &[String],
+    token: Option<&str>,
+    progress: Option<ProgressFn<'_>>,
+) -> Vec<GgufRepo> {
     let mut out = Vec::with_capacity(repo_ids.len());
+    let total = repo_ids.len();
+    let mut attempted = 0usize;
+
+    if let Some(report) = progress {
+        report(SweepProgress::Fetching { done: 0, total });
+    }
 
     for chunk in repo_ids.chunks(CONCURRENCY) {
         let futures = chunk.iter().map(|id| async move {
@@ -194,6 +229,14 @@ pub async fn fetch_repos(repo_ids: &[String], token: Option<&str>) -> Vec<GgufRe
         // requests and digging the rate limit deeper.
         let limited = results.iter().any(|(_, l)| *l);
         out.extend(results.into_iter().filter_map(|(r, _)| r));
+
+        // Counted as attempted rather than as kept: a repository skipped for
+        // having no usable GGUF is still work done, and a bar that stalls
+        // whenever a few are skipped looks like a hang.
+        attempted += chunk.len();
+        if let Some(report) = progress {
+            report(SweepProgress::Fetching { done: attempted, total });
+        }
 
         if limited {
             log::warn!(
@@ -416,9 +459,32 @@ pub async fn discover_repos(
     pages: u32,
     token: Option<&str>,
 ) -> Result<Vec<GgufRepo>> {
-    let mut repo_ids = Vec::new();
+    discover_repos_reporting(query, pages, token, None).await
+}
 
-    for page in 0..pages.max(1) {
+/// [`discover_repos`], reporting progress as it goes.
+///
+/// A full authenticated sweep is ~2,000 requests and takes minutes. Without
+/// this the UI has nothing to say for the whole of it, which is why the loading
+/// state read as a frozen application.
+pub async fn discover_repos_reporting(
+    query: Option<&str>,
+    pages: u32,
+    token: Option<&str>,
+    progress: Option<ProgressFn<'_>>,
+) -> Result<Vec<GgufRepo>> {
+    let mut repo_ids = Vec::new();
+    let total_pages = pages.max(1);
+
+    for page in 0..total_pages {
+        if let Some(report) = progress {
+            report(SweepProgress::Searching {
+                page: page + 1,
+                pages: total_pages,
+                found: repo_ids.len(),
+            });
+        }
+
         match search_repos(query, 100, page, token).await {
             Ok(ids) if ids.is_empty() => break, // no more results
             Ok(ids) => repo_ids.extend(ids),
@@ -432,7 +498,7 @@ pub async fn discover_repos(
 
     log::info!("[HF_CATALOG] {} candidate repositories found", repo_ids.len());
 
-    Ok(fetch_repos(&repo_ids, token).await)
+    Ok(fetch_repos_reporting(&repo_ids, token, progress).await)
 }
 
 #[cfg(test)]

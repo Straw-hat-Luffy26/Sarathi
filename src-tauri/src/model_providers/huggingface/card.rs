@@ -16,6 +16,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::model_providers::huggingface::discovery::{GgufRepo, Quantization};
+use crate::model_providers::huggingface::moe_fit;
+use crate::model_providers::huggingface::moe_geometry::KnownMoe;
 
 /// What a model is for. A model can carry several.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,6 +33,11 @@ pub enum ModelCategory {
     Agentic,
     Vision,
     MixtureOfExperts,
+    /// A MoE model this machine can actually run by keeping routed experts in
+    /// system RAM. Separate from [`Self::MixtureOfExperts`], which says only
+    /// what a model *is*: this one is a claim about the hardware in front of the
+    /// user, recomputed from detected VRAM and RAM on every sweep.
+    MoeOffloadable,
     LongContext,
     Multilingual,
     /// Small enough to run comfortably on modest hardware.
@@ -49,6 +56,7 @@ impl ModelCategory {
             Self::Agentic => "Agentic",
             Self::Vision => "Vision",
             Self::MixtureOfExperts => "MoE",
+            Self::MoeOffloadable => "MoE — runs here offloaded",
             Self::LongContext => "Long context",
             Self::Multilingual => "Multilingual",
             Self::SmallAndFast => "Small & fast",
@@ -66,6 +74,7 @@ impl ModelCategory {
             Self::Agentic,
             Self::Vision,
             Self::MixtureOfExperts,
+            Self::MoeOffloadable,
             Self::LongContext,
             Self::Multilingual,
             Self::SmallAndFast,
@@ -87,12 +96,19 @@ const LONG_CONTEXT_TOKENS: u32 = 100_000;
 ///
 /// Always returns at least one category — [`ModelCategory::General`] when
 /// nothing more specific applies — so no model is unreachable from the sidebar.
+///
+/// `verified_moe` comes from
+/// [`moe_fit::known_geometry`](super::moe_fit::known_geometry) and is trusted
+/// over the name heuristics below. Those look for "moe", "mixtral", "a3b" and
+/// friends, which openai/gpt-oss-20b carries none of — it was filed as a plain
+/// general model despite being the very model expert offload exists for.
 pub fn categorize(
     name: &str,
     tags: &[String],
     total_params: u64,
     context_length: u32,
     architecture: &str,
+    verified_moe: bool,
 ) -> Vec<ModelCategory> {
     let hay = format!(
         "{} {} {}",
@@ -126,7 +142,7 @@ pub fn categorize(
     if has(&["vision", "-vl", "llava", "image-text", "multimodal", "moondream"]) {
         out.push(ModelCategory::Vision);
     }
-    if has(&["moe", "mixtral", "mixture-of-experts", "a3b", "a22b"]) {
+    if verified_moe || has(&["moe", "mixtral", "mixture-of-experts", "a3b", "a22b"]) {
         out.push(ModelCategory::MixtureOfExperts);
     }
     if has(&["multilingual", "aya", "bloom", "sea-lion"]) {
@@ -277,13 +293,31 @@ pub struct QuantizationOption {
     pub size_bytes: u64,
     /// Plain-English quality note, e.g. "Best quality", "Smallest".
     pub quality_note: String,
-    /// Whether this option fits the machine's memory budget.
+    /// Whether the weights fit in the machine's VRAM budget as they are.
+    ///
+    /// This stays a statement about VRAM alone. A MoE model that only runs by
+    /// moving experts to system RAM reports `fits: false` here and describes
+    /// itself in [`Self::offload`] — folding the two together would lose the
+    /// distinction between "loads onto the card" and "loads across the PCIe
+    /// bus", which is a real difference in speed.
     pub fits: bool,
     /// True for 1- and 2-bit quantizations, where output degrades enough that
     /// a model can read as broken rather than merely weaker. Surfaced so the UI
     /// can warn before someone spends a multi-gigabyte download finding out.
     #[serde(default)]
     pub low_quality: bool,
+    /// Set when this build is a MoE model that runs on this machine by keeping
+    /// routed experts in system RAM. `None` means either not a verified MoE, or
+    /// no placement this hardware can execute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload: Option<super::moe_fit::ExpertOffload>,
+    /// Why there is no placement, when a verified MoE model cannot run here.
+    ///
+    /// Worth showing rather than reducing to "too large": the planner
+    /// distinguishes a machine short of system RAM from one short of VRAM, and
+    /// those have opposite remedies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offload_blocked_reason: Option<String>,
 }
 
 /// Presentation-ready model card.
@@ -413,23 +447,51 @@ fn is_low_quality(label: &str) -> bool {
     l.starts_with("Q2") || l.starts_with("IQ2") || l.starts_with("Q1") || l.starts_with("IQ1")
 }
 
-fn to_option(q: &Quantization, budget_bytes: u64) -> QuantizationOption {
+/// Sizes one quantization against this machine, both ways it could run.
+///
+/// `known_moe` is `None` for dense models and for MoE architectures without a
+/// verified geometry, in which case only the VRAM answer is given.
+fn to_option(
+    repo_id: &str,
+    q: &Quantization,
+    budget_bytes: u64,
+    known_moe: Option<&'static KnownMoe>,
+    host: moe_fit::HostCapacity,
+) -> QuantizationOption {
+    let fits = budget_bytes > 0 && q.size_bytes <= budget_bytes;
+
+    // Asked even when the weights already fit, because the answer is not always
+    // "no offload needed": a build that fits the weight budget can still be
+    // pushed off it by the KV cache, and the planner is the thing that knows.
+    let (offload, offload_blocked_reason) = match known_moe {
+        Some(known) => match moe_fit::plan_for(repo_id, known, q.size_bytes, host) {
+            Ok(plan) => (Some(plan), None),
+            Err(reason) => (None, Some(reason)),
+        },
+        None => (None, None),
+    };
+
     QuantizationOption {
         label: q.label.clone(),
         size_bytes: q.size_bytes,
         quality_note: quality_note(&q.label).to_string(),
-        fits: budget_bytes > 0 && q.size_bytes <= budget_bytes,
+        fits,
         low_quality: is_low_quality(&q.label),
+        offload,
+        offload_blocked_reason,
     }
 }
 
 /// Builds a card from a discovered repository.
 ///
 /// `budget_bytes` is the memory this machine can give to model weights; pass 0
-/// when unknown, and no option will be marked as fitting.
+/// when unknown, and no option will be marked as fitting. `host` supplies the
+/// raw VRAM and system RAM figures the MoE planner needs; a default (all zero)
+/// disables offload classification rather than guessing at it.
 pub fn build_card(
     repo: &GgufRepo,
     budget_bytes: u64,
+    host: moe_fit::HostCapacity,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ModelCard {
     let (params, context, arch) = repo
@@ -438,15 +500,32 @@ pub fn build_card(
         .map(|g| (g.total_parameters, g.context_length, g.architecture.clone()))
         .unwrap_or((0, 0, String::new()));
 
-    let categories = categorize(&repo.repo_id, &repo.tags, params, context, &arch);
+    let known_moe = moe_fit::known_geometry(repo);
+
+    let mut categories =
+        categorize(&repo.repo_id, &repo.tags, params, context, &arch, known_moe.is_some());
     let kind = model_kind(&repo.tags);
 
-    let quantizations: Vec<QuantizationOption> =
-        repo.quantizations.iter().map(|q| to_option(q, budget_bytes)).collect();
+    let quantizations: Vec<QuantizationOption> = repo
+        .quantizations
+        .iter()
+        .map(|q| to_option(&repo.repo_id, q, budget_bytes, known_moe, host))
+        .collect();
+
+    // Earned per machine, not per model: the same repository is offloadable on
+    // one computer and out of reach on another, and the filter has to mean
+    // "these run here" or it is worse than no filter at all.
+    if quantizations.iter().any(|q| q.offload.is_some()) {
+        categories.push(ModelCategory::MoeOffloadable);
+    }
 
     // An unknown budget marks nothing as fitting, which must not be read as
     // "nothing runs here" — that would empty the recommended section on a
     // machine whose hardware could not be read.
+    //
+    // Offload is deliberately not counted here. Sarathi vouching for a model
+    // implies it is a comfortable default, and running across the PCIe bus is a
+    // capable answer rather than a comfortable one.
     let fits_here = budget_bytes == 0 || quantizations.iter().any(|q| q.fits);
 
     ModelCard {
@@ -485,7 +564,7 @@ mod tests {
 
     #[test]
     fn coding_models_are_categorised_as_coding() {
-        let c = categorize("bartowski/Qwen2.5-Coder-7B-GGUF", &tags(&["code"]), 7_600_000_000, 32768, "qwen2");
+        let c = categorize("bartowski/Qwen2.5-Coder-7B-GGUF", &tags(&["code"]), 7_600_000_000, 32768, "qwen2", false);
         assert!(c.contains(&ModelCategory::Coding));
         assert!(!c.contains(&ModelCategory::General), "a specialised model is not 'general'");
     }
@@ -493,22 +572,22 @@ mod tests {
     #[test]
     fn a_model_can_hold_several_categories() {
         // Small coding model: both, because either filter should surface it.
-        let c = categorize("x/Qwen2.5-Coder-1.5B-GGUF", &tags(&["code"]), 1_500_000_000, 32768, "qwen2");
+        let c = categorize("x/Qwen2.5-Coder-1.5B-GGUF", &tags(&["code"]), 1_500_000_000, 32768, "qwen2", false);
         assert!(c.contains(&ModelCategory::Coding));
         assert!(c.contains(&ModelCategory::SmallAndFast));
     }
 
     #[test]
     fn mixture_of_experts_is_detected() {
-        assert!(categorize("x/Mixtral-8x7B-GGUF", &tags(&[]), 46_000_000_000, 32768, "llama")
+        assert!(categorize("x/Mixtral-8x7B-GGUF", &tags(&[]), 46_000_000_000, 32768, "llama", false)
             .contains(&ModelCategory::MixtureOfExperts));
-        assert!(categorize("x/Qwen3-30B-A3B-GGUF", &tags(&[]), 30_000_000_000, 32768, "qwen3moe")
+        assert!(categorize("x/Qwen3-30B-A3B-GGUF", &tags(&[]), 30_000_000_000, 32768, "qwen3moe", false)
             .contains(&ModelCategory::MixtureOfExperts));
     }
 
     #[test]
     fn reasoning_and_long_context_are_detected() {
-        let c = categorize("x/DeepSeek-R1-Distill-8B", &tags(&[]), 8_000_000_000, 131072, "llama");
+        let c = categorize("x/DeepSeek-R1-Distill-8B", &tags(&[]), 8_000_000_000, 131072, "llama", false);
         assert!(c.contains(&ModelCategory::Reasoning));
         assert!(c.contains(&ModelCategory::LongContext));
     }
@@ -524,6 +603,7 @@ mod tests {
             0,
             0,
             "",
+            false,
         );
 
         assert!(c.contains(&ModelCategory::LoraAdapter));
@@ -535,7 +615,7 @@ mod tests {
 
     #[test]
     fn a_peft_tag_alone_marks_an_adapter() {
-        let c = categorize("x/y", &tags(&["peft"]), 0, 0, "");
+        let c = categorize("x/y", &tags(&["peft"]), 0, 0, "", false);
         assert!(c.contains(&ModelCategory::LoraAdapter));
     }
 
@@ -543,7 +623,7 @@ mod tests {
     fn a_model_merely_named_lora_is_not_treated_as_an_adapter() {
         // Detection reads tags, not the name — mislabelling a runnable model as
         // an adapter would hide it from the model list.
-        let c = categorize("someone/lora-tuned-chat-7B", &tags(&["en"]), 7_000_000_000, 8192, "llama");
+        let c = categorize("someone/lora-tuned-chat-7B", &tags(&["en"]), 7_000_000_000, 8192, "llama", false);
 
         assert!(!c.contains(&ModelCategory::LoraAdapter));
         assert!(c.contains(&ModelCategory::General));
@@ -558,6 +638,7 @@ mod tests {
             0,
             0,
             "",
+            false,
         );
 
         assert!(c.contains(&ModelCategory::LoraAdapter));
@@ -567,16 +648,16 @@ mod tests {
     #[test]
     fn quantizations_and_finetunes_are_not_adapters() {
         // These are runnable models; only `base_model:adapter:` is a patch.
-        let quantized = categorize("x/y", &tags(&["base_model:quantized:Qwen/Qwen2.5-7B"]), 7_000_000_000, 8192, "");
+        let quantized = categorize("x/y", &tags(&["base_model:quantized:Qwen/Qwen2.5-7B"]), 7_000_000_000, 8192, "", false);
         assert!(!quantized.contains(&ModelCategory::LoraAdapter));
 
-        let finetuned = categorize("x/y", &tags(&["base_model:finetune:meta-llama/Llama-3.1-8B"]), 8_000_000_000, 8192, "");
+        let finetuned = categorize("x/y", &tags(&["base_model:finetune:meta-llama/Llama-3.1-8B"]), 8_000_000_000, 8192, "", false);
         assert!(!finetuned.contains(&ModelCategory::LoraAdapter));
     }
 
     #[test]
     fn a_plain_chat_model_falls_back_to_general() {
-        let c = categorize("x/Llama-3.1-8B-Instruct-GGUF", &tags(&["en"]), 8_000_000_000, 8192, "llama");
+        let c = categorize("x/Llama-3.1-8B-Instruct-GGUF", &tags(&["en"]), 8_000_000_000, 8192, "llama", false);
         assert_eq!(c, vec![ModelCategory::General]);
     }
 
@@ -584,7 +665,7 @@ mod tests {
     fn small_general_models_stay_general() {
         // Size alone must not strip the General label, or small chat models
         // vanish from the General filter.
-        let c = categorize("x/Llama-3.2-1B-Instruct", &tags(&[]), 1_200_000_000, 8192, "llama");
+        let c = categorize("x/Llama-3.2-1B-Instruct", &tags(&[]), 1_200_000_000, 8192, "llama", false);
         assert!(c.contains(&ModelCategory::SmallAndFast));
         assert!(c.contains(&ModelCategory::General));
     }
@@ -593,7 +674,7 @@ mod tests {
     fn every_model_gets_at_least_one_category() {
         // Nothing may be unreachable from the sidebar.
         for (name, params, ctx) in [("x/mystery", 0u64, 0u32), ("y/z", 7_000_000_000, 4096)] {
-            assert!(!categorize(name, &tags(&[]), params, ctx, "").is_empty());
+            assert!(!categorize(name, &tags(&[]), params, ctx, "", false).is_empty());
         }
     }
 
@@ -732,7 +813,7 @@ mod tests {
             .with_timezone(&chrono::Utc);
 
         // 4 GB budget, as on the RTX 3050.
-        let card = build_card(&repo_for_card(), 4_000_000_000, now);
+        let card = build_card(&repo_for_card(), 4_000_000_000, no_host(), now);
 
         assert_eq!(card.publisher, "bartowski");
         assert_eq!(card.license.as_deref(), Some("apache-2.0"));
@@ -746,7 +827,7 @@ mod tests {
     #[test]
     fn quantization_comparison_marks_only_what_fits() {
         let now = chrono::Utc::now();
-        let card = build_card(&repo_for_card(), 4_000_000_000, now);
+        let card = build_card(&repo_for_card(), 4_000_000_000, no_host(), now);
 
         let fitting: Vec<&str> = card
             .quantizations
@@ -762,7 +843,136 @@ mod tests {
     #[test]
     fn an_unknown_budget_marks_nothing_as_fitting() {
         // Claiming a fit without knowing the hardware would be a guess.
-        let card = build_card(&repo_for_card(), 0, chrono::Utc::now());
+        let card = build_card(&repo_for_card(), 0, no_host(), chrono::Utc::now());
         assert!(card.quantizations.iter().all(|q| !q.fits));
+    }
+
+    // ─── MoE offload classification ─────────────────────────────────────────
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    /// Hardware that could not be read. Nothing may be classified against it.
+    fn no_host() -> moe_fit::HostCapacity {
+        moe_fit::HostCapacity::default()
+    }
+
+    /// A 12.8 GB MXFP4 build of gpt-oss-20b — larger than any weight budget
+    /// this app's target hardware has, and runnable on all of it.
+    fn gpt_oss_repo() -> GgufRepo {
+        GgufRepo {
+            repo_id: "unsloth/gpt-oss-20b-GGUF".into(),
+            author: "unsloth".into(),
+            downloads: 90_000,
+            likes: 400,
+            last_modified: "2026-07-01T00:00:00Z".into(),
+            quantizations: vec![Quantization {
+                label: "MXFP4".into(),
+                filename: "gpt-oss-20b-MXFP4.gguf".into(),
+                size_bytes: 12_800_000_000,
+                is_sharded: false,
+            }],
+            gguf: Some(GgufMeta {
+                total_parameters: 20_900_000_000,
+                architecture: "gpt-oss".into(),
+                context_length: 131072,
+                chat_template: None,
+                bos_token: None,
+                eos_token: None,
+            }),
+            base_model: None,
+            is_finetune: false,
+            is_lora_adapter: false,
+            tags: tags(&["gguf"]),
+        }
+    }
+
+    /// The bug this category exists to fix: a model the listing called
+    /// unrunnable at every size, on a machine that runs it.
+    #[test]
+    fn an_offloadable_moe_is_tagged_even_though_no_size_fits_vram() {
+        let host = moe_fit::HostCapacity {
+            vram_total_bytes: 8 * GB,
+            usable_ram_bytes: 24 * GB,
+        };
+        // A 5.5 GB weight budget, as an 8 GB card actually has.
+        let card = build_card(&gpt_oss_repo(), 5_500_000_000, host, chrono::Utc::now());
+
+        assert!(
+            card.quantizations.iter().all(|q| !q.fits),
+            "12.8 GB of weights genuinely do not fit an 8 GB card"
+        );
+        assert!(card.categories.contains(&ModelCategory::MoeOffloadable));
+        assert!(
+            card.quantizations[0].offload.is_some(),
+            "and yet there is a placement that runs it"
+        );
+    }
+
+    /// The same repository on a machine short of RAM. The tag is a claim about
+    /// hardware, so it has to disappear when the hardware changes.
+    #[test]
+    fn the_same_model_is_not_tagged_on_a_machine_that_cannot_run_it() {
+        let host = moe_fit::HostCapacity {
+            vram_total_bytes: 8 * GB,
+            usable_ram_bytes: 6 * GB,
+        };
+        let card = build_card(&gpt_oss_repo(), 5_500_000_000, host, chrono::Utc::now());
+
+        assert!(!card.categories.contains(&ModelCategory::MoeOffloadable));
+        assert!(card.quantizations[0].offload.is_none());
+        // And it says which resource was short, since the remedies differ.
+        let reason = card.quantizations[0].offload_blocked_reason.as_deref().unwrap_or("");
+        assert!(reason.contains("system RAM"), "got: {reason}");
+    }
+
+    #[test]
+    fn unreadable_hardware_never_earns_the_tag() {
+        let card = build_card(&gpt_oss_repo(), 0, no_host(), chrono::Utc::now());
+
+        assert!(!card.categories.contains(&ModelCategory::MoeOffloadable));
+        assert!(card.quantizations[0].offload.is_none());
+    }
+
+    /// gpt-oss's name says nothing about experts, and its architecture string is
+    /// `gpt-oss`. Before the verified geometry was consulted it was filed as a
+    /// plain general model — the one model expert offload was built for.
+    #[test]
+    fn a_verified_moe_is_categorised_as_moe_whatever_its_name_says() {
+        let card = build_card(&gpt_oss_repo(), 0, no_host(), chrono::Utc::now());
+
+        assert!(card.categories.contains(&ModelCategory::MixtureOfExperts));
+        assert!(
+            !card.categories.contains(&ModelCategory::General),
+            "a MoE model is not an unspecialised one"
+        );
+    }
+
+    /// Dense models must be untouched by any of this.
+    #[test]
+    fn a_dense_model_gets_no_offload_fields_at_all() {
+        let host = moe_fit::HostCapacity {
+            vram_total_bytes: 8 * GB,
+            usable_ram_bytes: 24 * GB,
+        };
+        let card = build_card(&repo_for_card(), 4_000_000_000, host, chrono::Utc::now());
+
+        assert!(!card.categories.contains(&ModelCategory::MoeOffloadable));
+        assert!(card
+            .quantizations
+            .iter()
+            .all(|q| q.offload.is_none() && q.offload_blocked_reason.is_none()));
+    }
+
+    /// Offload is a capable answer, not a comfortable one, so it must not by
+    /// itself put a model in the section Sarathi vouches for.
+    #[test]
+    fn offload_alone_does_not_make_a_model_recommended() {
+        let host = moe_fit::HostCapacity {
+            vram_total_bytes: 8 * GB,
+            usable_ram_bytes: 24 * GB,
+        };
+        let card = build_card(&gpt_oss_repo(), 5_500_000_000, host, chrono::Utc::now());
+
+        assert!(!card.recommended, "nothing fits in VRAM, so it is not a default choice");
     }
 }

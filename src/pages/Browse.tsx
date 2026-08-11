@@ -12,14 +12,20 @@ import {
   X,
   Sparkles,
   ArrowDownWideNarrow,
+  Cpu,
+  Database,
 } from 'lucide-react';
 import { Button, Spinner } from '../components/ui';
 import {
   browseModelCards,
   findModelAdapters,
   formatSize,
+  onCatalogProgress,
+  onCatalogUpdated,
+  refreshModelLibrary,
   type AdapterPage,
   type CatalogPage,
+  type CatalogProgress,
 } from '../services/catalog.service';
 import {
   downloadAdapter,
@@ -29,10 +35,12 @@ import {
 import { startModelDownload } from '../services/download.service';
 import { useDownloads } from '../hooks/useDownloads';
 import { useToast } from '../hooks/useToast';
+import { useConfirm, type ConfirmFn } from '../contexts/ConfirmContext';
 import {
   CATEGORY_LABELS,
   KIND_LABELS,
   MODEL_CATEGORIES,
+  runsHere,
   type ModelCard,
   type ModelCategory,
   type ModelKind,
@@ -85,10 +93,16 @@ const SORT_LABELS: Record<SortKey, string> = {
  * orders of magnitude and would otherwise swamp every other term.
  */
 function quality(card: ModelCard): number {
-  const runsHere = card.quantizations.some((q) => q.fits);
+  const fitsVram = card.quantizations.some((q) => q.fits);
+  // A model that only runs by holding its experts in system memory does run —
+  // it is just slower than one that sits on the card. Ranking it above models
+  // that cannot run at all, and below those that fit, is what puts an
+  // offloadable MoE somewhere a user would actually find it.
+  const offloads = !fitsVram && card.quantizations.some((q) => q.offload);
   return (
     (card.recommended ? 1000 : 0) +
-    (runsHere ? 500 : 0) +
+    (fitsVram ? 500 : 0) +
+    (offloads ? 250 : 0) +
     (card.emitsReasoning ? -250 : 0) +
     Math.log10(card.downloads + 1) * 20 +
     Math.log10(card.likes + 1) * 5
@@ -156,25 +170,73 @@ export const Browse: React.FC = () => {
   const [activeSearch, setActiveSearch] = useState('');
   /** The card whose details are open in the drawer. */
   const [detailCard, setDetailCard] = useState<ModelCard | null>(null);
+  /** Latest sweep progress, so a multi-minute fetch is visibly working. */
+  const [progress, setProgress] = useState<CatalogProgress | null>(null);
 
-  const load = useCallback(async (query?: string) => {
-    setLoading(true);
-    setError(null);
-    try {
-      setPage(await browseModelCards(query));
-      setActiveSearch(query ?? '');
-    } catch (err) {
-      // These messages are written for people — rate limiting says to add a
-      // token — so they are shown as-is rather than replaced.
-      setError(String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  /**
+   * Fetches a page of results.
+   *
+   * `quiet` swaps the results in without showing the loading state. It is what
+   * a background refresh uses: the user is reading a working listing, and
+   * replacing it with a spinner to deliver an update they did not ask for would
+   * undo the whole point of serving the saved library first.
+   */
+  const load = useCallback(
+    async (query?: string, opts?: { force?: boolean; quiet?: boolean }) => {
+      const quiet = opts?.quiet ?? false;
+      if (!quiet) {
+        setLoading(true);
+        setProgress(null);
+      }
+      setError(null);
+      try {
+        setPage(opts?.force ? await refreshModelLibrary() : await browseModelCards(query));
+        setActiveSearch(opts?.force ? '' : query ?? '');
+      } catch (err) {
+        // These messages are written for people — rate limiting says to add a
+        // token — so they are shown as-is rather than replaced.
+        //
+        // A quiet reload is the exception: it was not requested, so a failure
+        // is not news. The listing already on screen still works.
+        if (!quiet) setError(String(err));
+      } finally {
+        if (!quiet) {
+          setLoading(false);
+          setProgress(null);
+        }
+      }
+    },
+    []
+  );
 
   useEffect(() => {
     load();
   }, [load]);
+
+  // Progress arrives from the sweep itself, which is the only thing that knows
+  // how many repositories there are to read. Subscribed for the life of the
+  // page rather than per request, so a background refresh started by an earlier
+  // visit still reports into this one.
+  useEffect(() => {
+    const pending = onCatalogProgress(setProgress);
+    return () => {
+      void pending.then((off) => off());
+    };
+  }, []);
+
+  // A background refresh replaces the stored library. Re-reading it here is
+  // what turns "we will check for updates" into the updates actually appearing,
+  // rather than the user having to know to reload.
+  useEffect(() => {
+    const pending = onCatalogUpdated(() => {
+      // Only for the default listing: pulling the swept library out from under
+      // someone reading search results would discard what they asked for.
+      if (!activeSearch) void load(undefined, { quiet: true });
+    });
+    return () => {
+      void pending.then((off) => off());
+    };
+  }, [activeSearch, load]);
 
   /**
    * The full catalog for this search, and the single source every tab and
@@ -213,6 +275,16 @@ export const Browse: React.FC = () => {
   }, [all]);
 
   const recommendedCount = useMemo(() => all.filter((c) => c.recommended).length, [all]);
+
+  /**
+   * Progress from a refresh running behind the results.
+   *
+   * Filtered on the flag rather than on `loading`, because the two are not the
+   * same thing: a foreground sweep started from another window reports here
+   * too, and putting its counts in the banner beside a listing that is already
+   * drawn would describe the wrong work.
+   */
+  const backgroundProgress = progress?.background ? progress : null;
 
   /**
    * Recommended cards shown as their own section, ahead of everything else.
@@ -280,6 +352,33 @@ export const Browse: React.FC = () => {
           </select>
         </label>
       </header>
+
+      {/* Where these results came from. Shown whenever they are a saved copy,
+          because "this list is from yesterday and we are checking" and "this
+          list is current" are different claims and the user is owed the right
+          one. */}
+      {!loading && page && page.source === 'stored' && (
+        <div className={styles.cacheBar} role="status">
+          <Database size={14} aria-hidden />
+          <span>
+            Showing your saved library{ageLabel(page.ageSeconds) && ` from ${ageLabel(page.ageSeconds)}`}.
+            {page.refreshing
+              ? // The same counts the loading screen would show, in one line.
+                // "Checking in the background" on its own is indistinguishable
+                // from a check that silently died.
+                ` ${backgroundProgress?.message ?? 'Checking HuggingFace for new models'}…`
+              : ' It is up to date.'}
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            disabled={loading || page.refreshing}
+            onClick={() => void load(undefined, { force: true })}
+          >
+            <RefreshCw size={13} /> Check now
+          </Button>
+        </div>
+      )}
 
       {page?.notice && (
         <div className={styles.notice} role="status">
@@ -369,12 +468,7 @@ export const Browse: React.FC = () => {
         </nav>
 
         <section className={styles.results}>
-          {loading && (
-            <div className={styles.centered}>
-              <Spinner />
-              <p>Reading the model library…</p>
-            </div>
-          )}
+          {loading && <LoadingLibrary progress={progress} />}
 
           {!loading && visible.length === 0 && !error && (
             <div className={styles.centered}>
@@ -435,23 +529,99 @@ export const Browse: React.FC = () => {
   );
 };
 
-/** Largest size that fits, or the smallest overall when nothing does. */
-function pickOffer(card: ModelCard): { offer: Quant | null; fitsHere: boolean } {
-  const fitting = card.quantizations.filter((q) => q.fits);
+/** Compact age of a saved library: `2 hours ago`, `3 days ago`. */
+function ageLabel(seconds?: number | null): string | null {
+  if (seconds === null || seconds === undefined || seconds < 60) return null;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? '' : 's'} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'} ago`;
+}
 
-  // Quantization trades quality for size, so the biggest that runs is the most
-  // capable that runs.
-  const best = fitting.reduce<Quant | null>(
+/**
+ * The loading state, which has to prove the application is working.
+ *
+ * A full authenticated sweep is around two thousand requests and takes minutes.
+ * The previous state — a spinner over the words "Reading the model library…" —
+ * said the same thing at second one and at minute three, so the honest reading
+ * of it was that the app had hung.
+ *
+ * Three things fix that, and all three are needed. The phase says which of the
+ * two very different jobs is running. The counts move, which no frozen process
+ * does. And the bar fills, but only once there is a real denominator to fill it
+ * against: during the search phase the number of repositories is not yet known,
+ * so an indeterminate shimmer is shown rather than a percentage that would have
+ * to jump backwards when the truth arrives.
+ */
+function LoadingLibrary({ progress }: { progress: CatalogProgress | null }) {
+  const pct = progress?.fraction != null ? Math.round(progress.fraction * 100) : null;
+
+  return (
+    <div className={styles.centered}>
+      <Spinner />
+      <p className={styles.loadingMessage}>
+        {progress?.message ?? 'Reading the model library…'}
+      </p>
+
+      <div
+        className={styles.progressTrack}
+        role="progressbar"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        // Omitted while indeterminate, which is what tells a screen reader the
+        // difference between "no progress yet" and "0% done".
+        aria-valuenow={pct ?? undefined}
+        aria-label="Loading the model library"
+      >
+        <div
+          className={pct === null ? styles.progressIndeterminate : styles.progressFill}
+          style={pct === null ? undefined : { width: `${pct}%` }}
+        />
+      </div>
+
+      <p className={styles.loadingNote}>
+        {pct !== null
+          ? `${pct}% — reading details for ${progress?.total.toLocaleString()} models`
+          : 'The first load reads the whole library from HuggingFace. After this it is saved, and opening this page is instant.'}
+      </p>
+    </div>
+  );
+}
+
+/** How the offered download would run, if it runs at all. */
+type Runs = 'vram' | 'offload' | 'no';
+
+function largest(quants: Quant[]): Quant | null {
+  return quants.reduce<Quant | null>(
     (acc, q) => (acc === null || q.sizeBytes > acc.sizeBytes ? q : acc),
     null
   );
-  if (best) return { offer: best, fitsHere: true };
+}
+
+/**
+ * The size the card's button would download.
+ *
+ * Preference order is what each option actually gives the user: a build that
+ * sits on the GPU, then one that runs with its experts in system memory, then —
+ * only if nothing runs — the smallest build, offered with a warning.
+ *
+ * Within each tier the largest wins, because quantization trades quality for
+ * size and the biggest that runs is the most capable that runs.
+ */
+function pickOffer(card: ModelCard): { offer: Quant | null; runs: Runs } {
+  const onCard = largest(card.quantizations.filter((q) => q.fits));
+  if (onCard) return { offer: onCard, runs: 'vram' };
+
+  const offloaded = largest(card.quantizations.filter((q) => q.offload));
+  if (offloaded) return { offer: offloaded, runs: 'offload' };
 
   const smallest = card.quantizations.reduce<Quant | null>(
     (acc, q) => (acc === null || q.sizeBytes < acc.sizeBytes ? q : acc),
     null
   );
-  return { offer: smallest, fitsHere: false };
+  return { offer: smallest, runs: 'no' };
 }
 
 /**
@@ -462,14 +632,23 @@ function pickOffer(card: ModelCard): { offer: Quant | null; fitsHere: boolean } 
 async function beginDownload(
   card: ModelCard,
   quant: Quant,
-  addToast: (kind: 'success' | 'error', msg: string) => void
+  addToast: (kind: 'success' | 'error', msg: string) => void,
+  // Passed in rather than reached for: this is a plain function shared by the
+  // card and the drawer, so it cannot call a hook itself.
+  confirm: ConfirmFn
 ): Promise<void> {
-  if (!quant.fits) {
-    const ok = window.confirm(
-      `${quant.label} needs more memory than this computer has free.\n\n` +
-        `It would download ${formatSize(quant.sizeBytes)} and then most likely fail to ` +
-        `load, or run very slowly. Download it anyway?`
-    );
+  // An offloadable build is not a risky download — the planner has already
+  // found a placement this machine can execute. Warning about it would train
+  // people to click through the warning that matters.
+  if (runsHere(quant) === 'no') {
+    const ok = await confirm({
+      title: `${quant.label} needs more memory than this computer has free`,
+      message:
+        `It would download ${formatSize(quant.sizeBytes)} and then most likely fail to load, ` +
+        `or run very slowly.`,
+      confirmLabel: 'Download anyway',
+      tone: 'danger',
+    });
     if (!ok) return;
   }
 
@@ -497,15 +676,17 @@ interface CardProps {
 function Card({ card, open, onOpen }: CardProps) {
   const [starting, setStarting] = useState(false);
   const { addToast } = useToast();
+  const confirm = useConfirm();
   const { isDownloading } = useDownloads();
   const fitting = card.quantizations.filter((q) => q.fits);
-  const { offer, fitsHere } = pickOffer(card);
+  const offloadable = card.quantizations.filter((q) => !q.fits && q.offload);
+  const { offer, runs } = pickOffer(card);
 
   const download = async () => {
     if (!offer) return;
     setStarting(true);
     try {
-      await beginDownload(card, offer, addToast);
+      await beginDownload(card, offer, addToast, confirm);
     } finally {
       setStarting(false);
     }
@@ -570,23 +751,37 @@ function Card({ card, open, onOpen }: CardProps) {
         </p>
       )}
 
+      {/* The one line that changes what this card means on this machine: a
+        * model far larger than the card's VRAM, which nonetheless runs here.
+        * Without it the sizes table reads "too large" all the way down and the
+        * download button looks like a mistake. */}
+      {offloadable.length > 0 && offloadable[0].offload && (
+        <p className={styles.offloadNote}>
+          <Cpu size={12} aria-hidden /> {offloadable[0].offload.note}
+        </p>
+      )}
+
       <div className={styles.cardFoot}>
         <button className={styles.expand} onClick={onOpen} aria-expanded={open}>
           {`Sizes & LoRA — ${fitting.length} of ${card.quantizations.length} fit`}
+          {offloadable.length > 0 && `, ${offloadable.length} offloadable`}
         </button>
 
         {/* An adapter is not a runnable model, so it gets no download button —
           * it is installed from the base model's card instead. */}
         {card.kind !== 'lora-adapter' && offer && (
           <button
-            className={fitsHere ? styles.downloadBtn : styles.downloadBtnWarn}
+            className={runs === 'no' ? styles.downloadBtnWarn : styles.downloadBtn}
             disabled={starting || isDownloading(card.repoId)}
             onClick={() => void download()}
             title={
-              fitsHere
+              runs === 'vram'
                 ? `Download the largest size that fits: ${offer.label}, ${formatSize(
                     offer.sizeBytes
                   )}`
+                : runs === 'offload'
+                ? `Download ${offer.label} (${formatSize(offer.sizeBytes)}). Larger than this ` +
+                  `computer's video memory, but it runs by keeping its experts in system memory.`
                 : `${offer.label} is the smallest build at ${formatSize(
                     offer.sizeBytes
                   )}, but it still needs more memory than this computer has free`
@@ -598,8 +793,8 @@ function Card({ card, open, onOpen }: CardProps) {
               : starting
               ? 'Starting…'
               : // "anyway" is the honest word: the card already says nothing
-                // fits, so the button should not pretend otherwise.
-                `Download ${offer.label}${fitsHere ? '' : ' anyway'}`}
+                // runs, so the button should not pretend otherwise.
+                `Download ${offer.label}${runs === 'no' ? ' anyway' : ''}`}
           </button>
         )}
       </div>
@@ -626,6 +821,7 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
   const [installError, setInstallError] = useState<string | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
   const { addToast } = useToast();
+  const confirm = useConfirm();
   const { isDownloading } = useDownloads();
 
   // Escape closes it, as with any dialog.
@@ -679,7 +875,7 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
   const download = async (q: Quant) => {
     setStarting(q.label);
     try {
-      await beginDownload(card, q, addToast);
+      await beginDownload(card, q, addToast, confirm);
     } finally {
       setStarting(null);
     }
@@ -725,8 +921,19 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                 </tr>
               </thead>
               <tbody>
-                {card.quantizations.map((q) => (
-                  <tr key={q.label} className={q.fits ? styles.fits : styles.tooBig}>
+                {card.quantizations.map((q) => {
+                  const runs = runsHere(q);
+                  return (
+                  <tr
+                    key={q.label}
+                    className={
+                      runs === 'vram'
+                        ? styles.fits
+                        : runs === 'offload'
+                        ? styles.offloads
+                        : styles.tooBig
+                    }
+                  >
                     <td className={styles.qLabel}>{q.label}</td>
                     <td>{formatSize(q.sizeBytes)}</td>
                     <td className={styles.qNote}>
@@ -739,7 +946,17 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                       )}
                       {q.qualityNote}
                     </td>
-                    <td className={styles.qFit}>{q.fits ? 'fits' : 'too large'}</td>
+                    {/* Three answers, not two. "Offloaded" is a real way to run
+                      * and reducing it to "too large" hid every model this
+                      * machine could run but not hold. The reason a MoE model
+                      * cannot run is worth carrying too — short of system RAM
+                      * and short of VRAM have opposite remedies. */}
+                    <td
+                      className={styles.qFit}
+                      title={q.offload?.note ?? q.offloadBlockedReason ?? undefined}
+                    >
+                      {runs === 'vram' ? 'fits' : runs === 'offload' ? 'offloaded' : 'too large'}
+                    </td>
                     <td className={styles.qAction}>
                       {card.kind !== 'lora-adapter' && (
                         <button
@@ -755,7 +972,8 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                       )}
                     </td>
                   </tr>
-                ))}
+                  );
+                })}
               </tbody>
             </table>
 
@@ -764,6 +982,18 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
               Running also needs spare memory for the conversation, which “Runs here”
               already allows for.
             </p>
+
+            {/* Spelled out once, in the place someone is comparing sizes. The
+              * word "offloaded" in a table cell does not explain why a 12 GB
+              * download is being offered on an 8 GB card. */}
+            {card.quantizations.some((q) => q.offload) && (
+              <p className={styles.sizeNote}>
+                <strong>Offloaded</strong> means this is a mixture-of-experts model: only a
+                fraction of it runs for any one word, so Sarathi keeps the unused experts in
+                system memory and the rest on the graphics card. It runs on this computer
+                despite being larger than its video memory.
+              </p>
+            )}
           </section>
 
           <section>

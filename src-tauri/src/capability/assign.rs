@@ -77,6 +77,8 @@ fn capability_for(category: ModelCategory) -> Option<&'static str> {
         | ModelCategory::Multilingual
         | ModelCategory::LongContext
         | ModelCategory::MixtureOfExperts
+        // Where a model's weights sit on this machine, not what it is good at.
+        | ModelCategory::MoeOffloadable
         | ModelCategory::SmallAndFast
         | ModelCategory::General
         | ModelCategory::LoraAdapter => None,

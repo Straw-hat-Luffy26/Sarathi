@@ -323,6 +323,7 @@ pub fn run() {
 
             // Model browsing by category
             commands::catalog::browse_model_cards,
+            commands::catalog::refresh_model_library,
             commands::catalog::list_model_categories,
             commands::catalog::find_model_adapters,
 

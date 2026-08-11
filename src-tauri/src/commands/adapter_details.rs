@@ -92,7 +92,7 @@ fn describe(skill: ModelCategory) -> &'static str {
         // Matched explicitly rather than with a wildcard, so adding a category
         // to the enum fails to compile here instead of silently describing
         // itself as a vague "general behaviour" change.
-        ModelCategory::MixtureOfExperts => {
+        ModelCategory::MixtureOfExperts | ModelCategory::MoeOffloadable => {
             "Relates to how the model routes work internally rather than to a skill."
         }
         ModelCategory::SmallAndFast => "Relates to the model's size rather than to a skill.",
@@ -111,14 +111,16 @@ fn describe(skill: ModelCategory) -> &'static str {
 pub(crate) fn stated_skills(tags: &[String]) -> Vec<ModelCategory> {
     // Categorising the tags alone — with an empty name — means anything found
     // here came from something the author wrote, not from the repo's title.
-    categorize("", tags, 0, 0, "")
+    // An adapter's tags cannot establish expert geometry, so the verified-MoE
+    // flag is false: a skill list is not the place to guess at a model's shape.
+    categorize("", tags, 0, 0, "", false)
         .into_iter()
         .filter(|c| !matches!(c, ModelCategory::General | ModelCategory::LoraAdapter))
         .collect()
 }
 
 pub(crate) fn suggested_skills(name: &str) -> Vec<ModelCategory> {
-    categorize(name, &[], 0, 0, "")
+    categorize(name, &[], 0, 0, "", false)
         .into_iter()
         .filter(|c| !matches!(c, ModelCategory::General | ModelCategory::LoraAdapter))
         .collect()

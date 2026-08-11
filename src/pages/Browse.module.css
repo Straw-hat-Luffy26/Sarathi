@@ -212,6 +212,94 @@
   color: var(--text-secondary);
 }
 
+/* Loading the library --------------------------------------------------- */
+
+/* The first sweep takes minutes. Everything here exists to make that legible
+ * as work rather than as a hang: a phase that changes, counts that move, and a
+ * bar that fills only once there is a real denominator to fill it against. */
+
+.loadingMessage {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.loadingNote {
+  margin: 0;
+  max-width: 46ch;
+  text-align: center;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+.progressTrack {
+  width: min(340px, 100%);
+  height: 4px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--accent-primary);
+  border-radius: 999px;
+  /* Eased, because the sweep reports in batches of eight and an unanimated bar
+   * would jump in visible steps — which reads as stalling between them. */
+  transition: width 400ms ease-out;
+}
+
+/* Used while the denominator is unknown. It has to move, since the only claim
+ * being made here is "something is happening". */
+.progressIndeterminate {
+  height: 100%;
+  width: 35%;
+  border-radius: 999px;
+  background: var(--accent-primary);
+  animation: sweep 1.4s ease-in-out infinite;
+}
+
+@keyframes sweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(340%); }
+}
+
+/* Respecting a system-wide request for less motion. The bar is not the only
+ * signal — the counts and the phase message carry the same information — so
+ * holding it still costs nothing. */
+@media (prefers-reduced-motion: reduce) {
+  .progressIndeterminate {
+    animation: none;
+    width: 100%;
+    opacity: 0.4;
+  }
+
+  .progressFill {
+    transition: none;
+  }
+}
+
+/* Where the results came from. Quieter than .notice: a saved library is the
+ * normal, good case, not a warning. */
+.cacheBar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: 8px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-default);
+}
+
+.cacheBar span {
+  flex: 1;
+}
+
 /* Cards ------------------------------------------------------------------ */
 
 .card {
@@ -523,8 +611,41 @@
   font-weight: 600;
 }
 
+/* A third answer, between the two. These rows are as readable as ".fits" —
+ * they *do* run — but the accent differs, because running with half the model
+ * in system memory is not the same promise as running on the card. */
+.offloads td {
+  color: var(--text-primary);
+}
+
+.offloads .qFit {
+  color: var(--tag-offload);
+  font-weight: 600;
+}
+
 .tooBig td {
   color: var(--text-tertiary);
+}
+
+/* The card's one-line explanation of why a model larger than this machine's
+ * video memory is nonetheless on offer. */
+.offloadNote {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  margin: 0;
+  padding: var(--space-2);
+  border-radius: 6px;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-secondary);
+  background: var(--tag-offload-bg);
+}
+
+.offloadNote svg {
+  color: var(--tag-offload);
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
 /* ── LoRA adapters for a model ─────────────────────────────────────────── */

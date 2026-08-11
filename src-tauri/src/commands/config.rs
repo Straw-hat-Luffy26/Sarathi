@@ -74,7 +74,10 @@ pub async fn set_hf_token(app: AppHandle, token: String) -> Result<HfTokenStatus
     // The cached sweep was fetched under the previous credentials and is a
     // smaller slice of the library than a token allows; dropping it means the
     // next browse re-fetches rather than showing the anonymous result.
-    crate::commands::catalog::invalidate_browse_cache();
+    //
+    // The stored library goes too, or a sweep gathered anonymously would
+    // outlive the credentials that produced it and survive a restart.
+    crate::commands::catalog::invalidate_browse_cache(app.path().app_data_dir().ok().as_deref());
 
     log::info!(
         "[CONFIG] HuggingFace token {}",
