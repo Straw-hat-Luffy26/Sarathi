@@ -1,5 +1,6 @@
 //! Model manager module
 
+pub mod classify;
 pub mod traits;
 pub mod manager;
 

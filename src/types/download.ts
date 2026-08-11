@@ -1,3 +1,5 @@
+import type { Classification } from './ai';
+
 export type DownloadStatus =
   | 'Resolving'
   | 'Queued'
@@ -59,9 +61,24 @@ export interface InstalledModel {
   filePath: string;
   sizeBytes: number;
   installedAt: string;
+  /**
+   * Whether this can actually be loaded.
+   *
+   * Not merely "the file is present": a helper module is complete on disk and
+   * still cannot be loaded, so it reports false.
+   */
   isReady: boolean;
   checksum: string | null;
   adapters?: Record<string, AdapterManifestInfo>;
+  /**
+   * What the file on disk actually is, read from its GGUF header.
+   *
+   * Everything above comes from the manifest, which records what was
+   * *requested* at download time — a request that fetched the wrong file is
+   * recorded just as faithfully as one that did not. Absent only for a model
+   * installed before this existed, or one whose header could not be read.
+   */
+  classification?: Classification | null;
 }
 
 export interface StorageSummary {

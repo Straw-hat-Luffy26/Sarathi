@@ -176,6 +176,9 @@
 
 /* The one state worth spotting instantly: this model is answering requests. */
 .serving {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   font-size: var(--text-xs);
   color: var(--tag-fit);
   font-weight: 600;
@@ -281,4 +284,117 @@
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* ── Grouped shelves ─────────────────────────────────────────────────────── */
+
+/* Each section says what its group is *and* what that means. "Mixture of
+ * experts" is a heading only a specialist can act on; the sentence under it is
+ * what makes the grouping useful to everyone else. */
+.sectionBar {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-bottom: var(--space-1);
+}
+
+.sectionNote {
+  margin: 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug, 1.5);
+  color: var(--text-tertiary);
+  max-width: 74ch;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+/* ── Card specs ──────────────────────────────────────────────────────────── */
+
+/* One row carrying the facts that decide whether this is the model to load.
+ * Kept as separate chips rather than a run-on sentence so the eye can find the
+ * size, which is the field people scan for. */
+.specs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.spec,
+.specMuted,
+.specAccent {
+  font-size: var(--text-xs);
+  padding: 2px 7px;
+  border-radius: 4px;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.spec {
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+}
+
+/* Where the model came from is context rather than a property of the weights,
+ * so it recedes. */
+.specMuted {
+  background: transparent;
+  color: var(--text-tertiary);
+  font-family: inherit;
+}
+
+/* Expert counts are the one spec that explains why a model far larger than the
+ * card can still run, so they are the one that gets an accent. */
+.specAccent {
+  background: var(--tag-offload-bg);
+  color: var(--tag-offload);
+}
+
+/* ── States ──────────────────────────────────────────────────────────────── */
+
+/* The loaded model is the only one answering requests, and it should be
+ * findable without reading every card. */
+.modelLoaded {
+  border-color: var(--tag-fit);
+  background: linear-gradient(var(--tag-fit-bg), var(--tag-fit-bg)), var(--bg-secondary);
+}
+
+/* A file that cannot be loaded is still listed — it is taking up disk space —
+ * but it should not compete with the models that can. */
+.modelInert {
+  opacity: 0.72;
+  border-style: dashed;
+}
+
+.modelInert:hover {
+  opacity: 1;
+}
+
+.inertNote {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug, 1.5);
+  color: var(--text-tertiary);
+  max-width: 82ch;
+}
+
+.inertNote svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--warning);
+}
+
+/* A steady dot, not a blinking one: this is a state to notice on arrival, not
+ * something demanding attention every second. */
+.servingDot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tag-fit);
+  box-shadow: 0 0 0 3px var(--tag-fit-bg);
 }

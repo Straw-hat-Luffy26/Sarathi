@@ -61,6 +61,7 @@ export type ModelCategory =
   | 'agentic'
   | 'vision'
   | 'mixture-of-experts'
+  | 'moe-offloadable'
   | 'long-context'
   | 'multilingual'
   | 'small-and-fast'
@@ -81,6 +82,7 @@ export const MODEL_CATEGORIES: readonly ModelCategory[] = [
   'agentic',
   'vision',
   'mixture-of-experts',
+  'moe-offloadable',
   'long-context',
   'multilingual',
   'small-and-fast',
@@ -95,6 +97,7 @@ export const CATEGORY_LABELS: Record<ModelCategory, string> = {
   agentic: 'Agentic',
   vision: 'Vision',
   'mixture-of-experts': 'MoE',
+  'moe-offloadable': 'Runs here (MoE offload)',
   'long-context': 'Long context',
   multilingual: 'Multilingual',
   'small-and-fast': 'Small & fast',
@@ -116,16 +119,130 @@ export const KIND_LABELS: Record<ModelKind, string> = {
   'lora-adapter': 'LoRA adapter',
 };
 
+/**
+ * A MoE placement this machine can execute — routed experts held in system RAM
+ * while attention and the KV cache stay on the GPU.
+ *
+ * Computed from detected VRAM and RAM on every sweep, never stored: the same
+ * model is offloadable on one computer and out of reach on another.
+ */
+export interface ExpertOffload {
+  /** Routed experts of this many leading layers move to system RAM. */
+  cpuMoeLayers: number;
+  totalLayers: number;
+  /** System RAM the offloaded experts occupy. */
+  hostBytes: number;
+  /** Parameters used per token — why a model this size stays responsive. */
+  activeParameters: number;
+  /** One line for the UI, in the terms someone choosing a download needs. */
+  note: string;
+}
+
 /** One quantization choice, for the size/quality comparison. */
 export interface QuantizationOption {
   label: string;
   sizeBytes: number;
   /** Plain-English quality note, e.g. "Balanced — recommended". */
   qualityNote: string;
-  /** Whether this option fits the detected memory budget. */
+  /**
+   * Whether the weights fit in VRAM as they are.
+   *
+   * A statement about VRAM alone. A MoE model that runs only by moving experts
+   * to system RAM reports `false` here and describes itself in `offload` —
+   * loading onto the card and loading across the PCIe bus are a real difference
+   * in speed, and folding them together would hide it.
+   */
   fits: boolean;
   /** True for 1–2 bit quantizations, where output can degrade to nonsense. */
   lowQuality?: boolean;
+  /** Set when this build runs here by offloading experts to system RAM. */
+  offload?: ExpertOffload | null;
+  /**
+   * Why there is no placement, when a MoE model cannot run here. Names whether
+   * RAM or VRAM was short, which have opposite remedies.
+   */
+  offloadBlockedReason?: string | null;
+}
+
+/** Whether a build runs here, and by what route. */
+export function runsHere(q: QuantizationOption): 'vram' | 'offload' | 'no' {
+  if (q.fits) return 'vram';
+  if (q.offload) return 'offload';
+  return 'no';
+}
+
+/**
+ * The shelf an installed model sits on in Storage.
+ *
+ * Decided in Rust from the file's GGUF header, never from its name — see
+ * `model_manager::classify`. The categories below it are the same
+ * `ModelCategory` values Discover files models under, so one model is described
+ * the same way on both screens.
+ */
+export type ModelGroup =
+  | 'mixture-of-experts'
+  | 'dense'
+  | 'vision'
+  | 'embedding'
+  /** A LoRA, a projector, a speculative-decoding draft. Not loadable. */
+  | 'auxiliary'
+  /** The header could not be read. */
+  | 'unknown';
+
+/** Display order: what you can chat with first, then everything else. */
+export const MODEL_GROUPS: readonly ModelGroup[] = [
+  'mixture-of-experts',
+  'dense',
+  'vision',
+  'embedding',
+  'auxiliary',
+  'unknown',
+] as const;
+
+export const GROUP_LABELS: Record<ModelGroup, string> = {
+  'mixture-of-experts': 'Mixture of experts',
+  dense: 'Dense',
+  vision: 'Vision',
+  embedding: 'Embedding',
+  auxiliary: 'Helper files',
+  unknown: 'Unrecognised',
+};
+
+export const GROUP_DESCRIPTIONS: Record<ModelGroup, string> = {
+  'mixture-of-experts':
+    'Only some of the weights run for each word, so these can be far larger than your graphics card and still be quick.',
+  dense: 'Every weight runs for every word. The ordinary kind.',
+  vision: 'These can be shown images as well as text.',
+  embedding:
+    'These turn text into vectors for search and comparison. They do not hold conversations.',
+  auxiliary:
+    'Files that support a model rather than being one. They cannot be loaded on their own.',
+  unknown: 'Sarathi could not read these files well enough to say.',
+};
+
+/** Groups whose models can actually be loaded and talked to. */
+export function isLoadableGroup(group: ModelGroup): boolean {
+  return group === 'mixture-of-experts' || group === 'dense' || group === 'vision';
+}
+
+/** What an installed file actually is, read from its GGUF header. */
+export interface Classification {
+  group: ModelGroup;
+  /** Shared with Discover's filters. */
+  categories: ModelCategory[];
+  /** GGUF `general.architecture`, e.g. `qwen3moe`, `gpt-oss`, `llama`. */
+  architecture: string;
+  isMoe: boolean;
+  expertCount: number;
+  /** Experts consulted per token — why a large MoE stays responsive. */
+  expertUsedCount: number;
+  blockCount: number;
+  parameterCount?: number | null;
+  contextLength?: number | null;
+  /** As the file declares it, which is not always what the filename says. */
+  quantization?: string | null;
+  /** Why this cannot be loaded, when it cannot. */
+  notLoadableReason?: string | null;
 }
 
 /**

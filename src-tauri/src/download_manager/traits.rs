@@ -74,6 +74,14 @@ pub struct InstalledModel {
     pub is_ready: bool,
     pub checksum: Option<String>,
     pub adapters: Option<std::collections::HashMap<String, crate::adapter_manager::AdapterManifestInfo>>,
+    /// What the file on disk actually is, read from its GGUF header.
+    ///
+    /// Everything above this line comes from the manifest, which records what
+    /// was *requested* when the model was downloaded. That is why it is not
+    /// enough on its own: a request that fetched the wrong file is recorded just
+    /// as faithfully as one that did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<crate::model_manager::classify::Classification>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -49,6 +49,31 @@ impl ModelManager {
                                         let quantization = manifest.base_model.quantization.clone();
                                         let size_bytes = manifest.base_model.size_bytes;
 
+                                        // Read once per listing, from the file
+                                        // itself. Only the header is touched —
+                                        // a few kilobytes — so this stays cheap
+                                        // even with a shelf full of models.
+                                        let classification = match crate::ai_engine::gguf_meta::read_gguf_metadata(&full_gguf_path) {
+                                            Ok(meta) => crate::model_manager::classify::classify(&meta, &model_name),
+                                            Err(e) => {
+                                                log::warn!(
+                                                    "[MODEL_MGR] Could not classify '{}': {e:#}",
+                                                    full_gguf_path.display()
+                                                );
+                                                crate::model_manager::classify::Classification::unreadable(
+                                                    format!("Sarathi could not read this file's header: {e}"),
+                                                )
+                                            }
+                                        };
+
+                                        // The header's quantization wins over
+                                        // the manifest's, which records what was
+                                        // asked for rather than what arrived.
+                                        let quantization = classification
+                                            .quantization
+                                            .clone()
+                                            .unwrap_or(quantization);
+
                                         installed.push(InstalledModel {
                                             id: format!("{}_{}", model_id.replace('/', "_"), quantization),
                                             model_id,
@@ -61,9 +86,13 @@ impl ModelManager {
                                             file_path: full_gguf_path.to_string_lossy().to_string(),
                                             size_bytes,
                                             installed_at: chrono::Utc::now().to_rfc3339(),
-                                            is_ready: size_bytes > 0,
+                                            // Present on disk is not the same as
+                                            // usable: a helper file is complete
+                                            // and still cannot be loaded.
+                                            is_ready: size_bytes > 0 && classification.group.is_loadable(),
                                             checksum: None,
                                             adapters: Some(manifest.adapters),
+                                            classification: Some(classification),
                                         });
                                     }
                                 }
