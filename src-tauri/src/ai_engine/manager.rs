@@ -804,7 +804,9 @@ fn usable_vram_bytes(gpu: &crate::system_analyzer::traits::GpuInfo) -> u64 {
 /// kind. Any backend the build can drive is eligible; a card with no usable
 /// memory is not a candidate at all, which is what leaves CPU as the fallback
 /// rather than a broken GPU path.
-pub(crate) fn select_inference_gpu(
+/// Public so a verification harness can report the same choice the loader makes.
+/// Nothing outside the crate should be *deciding* placement — only observing it.
+pub fn select_inference_gpu(
     gpus: &[crate::system_analyzer::traits::GpuInfo],
 ) -> Option<crate::system_analyzer::traits::GpuInfo> {
     gpus.iter()
