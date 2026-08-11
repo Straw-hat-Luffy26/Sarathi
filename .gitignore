@@ -39,3 +39,15 @@ __pycache__/
 # Toolchain installers people download into the repo root while setting up.
 # They are multi-megabyte binaries that belong on the machine, not in history.
 rustup-init.exe
+
+# MCP registry and research data.
+#
+# These normally live in the app data folder, not here. They are listed anyway
+# because mcp.json carries local service tokens and a copy dropped in the repo
+# to try something out must not be committable. The same goes for a Python
+# environment: the sidecars are written against the system interpreter, and a
+# venv appearing here means something was set up the wrong way.
+mcp.json
+research/
+.venv/
+venv/

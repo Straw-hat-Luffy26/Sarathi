@@ -6,12 +6,25 @@ Tauri 2 desktop app for running local LLMs. React 19 + TypeScript + Vite fronten
 Build variants: `npm run tauri:dev:gpu` (CUDA), `npm run tauri:dev:vulkan` (Vulkan),
 or `npm run dev:auto` to let `scripts/select-backend.mjs` pick.
 
+## Agent capability layer (MCP)
+
+MCP servers are declared once in `%APPDATA%\com.sarathi.app\mcp.json` and handed
+to every launched tool by `src-tauri/src/launcher/mcp.rs`. Research/search/crawl
+sidecar lives in `sidecars/mcp/sarathi_research/`. Services:
+`.\scripts\mcp-services.ps1 status`. Details in
+[docs/agent-capabilities.md](docs/agent-capabilities.md).
+
+Python here targets the **system interpreter**. Do not create a venv,
+virtualenv, conda env, or any project-local Python environment — global `pip`,
+or `uv tool install` for a package that needs isolation.
+
 ## Skill routing
 
 - Changes to the Rust launcher/model logic (`src-tauri/src/launcher/`) → `/review` before merge
 - UI or design changes (`src/`) → `/design-review`
 - Verifying the app actually runs → `/qa`
 - Model download / hardware sizing bugs → `/investigate`
+- MCP server or capability-layer changes → `/review`, then re-run `.\scripts\mcp-services.ps1 status`
 
 ## gstack (REQUIRED — global install)
 

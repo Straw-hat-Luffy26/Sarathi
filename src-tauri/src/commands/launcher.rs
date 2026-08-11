@@ -34,6 +34,19 @@ pub struct LaunchOverview {
     pub blocked_reason: Option<String>,
 }
 
+/// Path of the file where MCP servers are defined, so the UI can point at it.
+///
+/// One file for every tool: this is what makes a server added once available
+/// in Claude Code, opencode and anything else Sarathi launches.
+#[tauri::command]
+pub async fn user_mcp_file(app: AppHandle) -> Result<String, String> {
+    let dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve the app data folder: {e}"))?;
+    Ok(launcher::mcp::user_mcp_path(&dir).to_string_lossy().to_string())
+}
+
 fn resolve_registry(app: &AppHandle) -> registry::Registry {
     match app.path().app_data_dir() {
         Ok(dir) => registry::load(&dir),
@@ -201,12 +214,21 @@ pub async fn launch_tool(
     // port was taken and the gateway bound elsewhere. Model likewise comes from
     // what is loaded right now, so the tool cannot open on a stale one.
     let port = gateway.port();
+    // Loaded per launch rather than cached: a server added to mcp.json should
+    // reach the next tool started, without restarting Sarathi.
+    let mcp = launcher::mcp::load(&data_dir);
+    for warning in &mcp.warnings {
+        log::warn!("[LAUNCH] {warning}");
+    }
+    log::info!("[LAUNCH] Handing '{tool_id}' {} MCP server(s)", mcp.servers.len());
+
     let ctx = launcher::spec::LaunchContext {
         port,
         model_id: model.model_id.clone(),
         model_name: model.model_name.clone(),
         client_dir: client_dir.to_string_lossy().to_string(),
         context_length: model.context_length,
+        mcp,
     };
     let model_label = model.model_name.clone();
 

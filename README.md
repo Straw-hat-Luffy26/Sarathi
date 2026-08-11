@@ -83,6 +83,15 @@ graph TD
 - **Strict Storage Ownership**: Frameworks act strictly as pure processors. Sarathi owns 100% of storage, transactions, and schema migrations in `sqlite:sarathi.db`.
 - **Model-Switch Context Preservation**: User context, user profiles, project memories, and summaries persist across model switches (e.g. Qwen $\rightarrow$ Mistral) and application restarts.
 
+### 🔎 6. Agent Capability Layer (MCP)
+
+- **One Shared Registry**: Every MCP server is declared once in `mcp.json` and written into each launched tool's config in that tool's own dialect. A server added once reaches Claude Code, opencode and anything else — and the same file works for clients Sarathi never launched.
+- **No External API Keys**: Self-hosted **SearxNG** for search, **Crawl4AI** for static-first scraping with a headless browser only when a page demands it, plain `git clone` for repositories. Nothing is billed and nothing leaves the machine.
+- **Source-Grounded Research**: Web pages and repository files land in one local `sqlite-vec` index over ONNX embeddings, so a single query spans both and every passage cites back to a URL or a file and line range.
+- **Real Tool Calls**: The gateway carries `tools` through to the chat template and parses ChatML, Llama 3.1 and Mistral tool-call syntax back into `tool_calls` / `tool_use`, so a registered server is actually invoked rather than merely listed.
+
+See [docs/agent-capabilities.md](docs/agent-capabilities.md).
+
 ---
 
 ## 🛠 Tech Stack

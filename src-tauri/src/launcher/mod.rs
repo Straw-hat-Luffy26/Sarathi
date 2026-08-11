@@ -8,6 +8,7 @@
 //! of the user's is modified and there is nothing to undo. The trade-off is
 //! deliberate: opening the tool by other means will not be connected.
 
+pub mod mcp;
 pub mod registry;
 pub mod spec;
 
@@ -20,7 +21,8 @@ use std::sync::Mutex;
 use serde::{Deserialize, Serialize};
 
 use crate::launcher::spec::{
-    fill_placeholders, output_identifies_tool, resolve_env, LaunchContext, PackageManager, ToolSpec,
+    fill_placeholders_with, output_identifies_tool, resolve_args, resolve_env, LaunchContext,
+    PackageManager, ToolSpec,
 };
 use crate::system_analyzer::process_utils::create_hidden_command;
 
@@ -281,12 +283,14 @@ pub fn launch(spec: &ToolSpec, ctx: &LaunchContext, workspace: &std::path::Path)
 
     // Written fresh on every launch, so a model changed in Sarathi is picked up
     // the next time the tool starts rather than persisting from a stale file.
+    // The same applies to MCP servers: a server added to `mcp.json` reaches
+    // every tool on its next launch without either being reconfigured.
     if let Some(config) = &spec.launch.client_config {
         let dir = std::path::Path::new(&ctx.client_dir);
         std::fs::create_dir_all(dir)
             .map_err(|e| format!("could not prepare {}'s config directory: {e}", spec.name))?;
 
-        let body = fill_placeholders(&config.contents, ctx, true);
+        let body = fill_placeholders_with(&config.contents, ctx, true, config.mcp_dialect);
         std::fs::write(dir.join(&config.file_name), body)
             .map_err(|e| format!("could not write {}'s config: {e}", spec.name))?;
     }
@@ -295,7 +299,9 @@ pub fn launch(spec: &ToolSpec, ctx: &LaunchContext, workspace: &std::path::Path)
         .map_err(|e| format!("could not prepare the Sarathi workspace: {e}")) ?;
 
     let mut cmd = std::process::Command::new(&program);
-    cmd.args(&spec.launch.args);
+    // Filled, not passed raw: an argument may name a generated config file, and
+    // that path is only known once the client directory is.
+    cmd.args(resolve_args(&spec.launch.args, ctx));
     cmd.current_dir(workspace);
 
     // Stripped before setting ours: a tool that reads a provider key from the
@@ -395,6 +401,7 @@ mod tests {
             model_name: "Qwen2.5-3B".into(),
             client_dir: std::env::temp_dir().join("sarathi-test-client").to_string_lossy().into(),
             context_length: 8192,
+            mcp: crate::launcher::mcp::McpRegistry::default(),
         };
         let err = launch(&spec, &ctx, &std::env::temp_dir()).unwrap_err();
         assert!(err.contains("could not start"), "got: {err}");

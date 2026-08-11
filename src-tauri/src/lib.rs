@@ -319,6 +319,7 @@ pub fn run() {
             commands::launcher::launch_tool,
             commands::launcher::forget_tool_process,
             commands::launcher::user_tools_file,
+            commands::launcher::user_mcp_file,
 
             // Model browsing by category
             commands::catalog::browse_model_cards,

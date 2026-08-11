@@ -107,6 +107,12 @@ pub struct ClientConfig {
     /// Contents, with the same placeholders as [`LaunchSpec::env`]. Values are
     /// JSON-escaped on substitution, so a Windows path cannot break the file.
     pub contents: String,
+    /// How `{mcpServers}` should be written for this client.
+    ///
+    /// Every client agrees what an MCP server is and disagrees on how to spell
+    /// it; see [`crate::launcher::mcp`].
+    #[serde(default)]
+    pub mcp_dialect: crate::launcher::mcp::McpDialect,
 }
 
 /// How to start a tool, already connected.
@@ -204,6 +210,12 @@ pub const PLACEHOLDER_CONTEXT: &str = "{contextLength}";
 /// A client told it may generate as many tokens as the context holds has left
 /// no room for the conversation that prompted them.
 pub const PLACEHOLDER_MAX_OUTPUT: &str = "{maxOutputTokens}";
+/// The shared MCP servers, as a JSON object in this client's dialect.
+///
+/// Unlike every other placeholder this substitutes *structure*, not a value, so
+/// it is never escaped — escaping it would turn the object into a string and
+/// the client would find no servers at all.
+pub const PLACEHOLDER_MCP: &str = "{mcpServers}";
 
 /// Everything Sarathi knows at the moment a tool is started.
 ///
@@ -220,6 +232,8 @@ pub struct LaunchContext {
     pub client_dir: String,
     /// Context length the model is loaded with, in tokens.
     pub context_length: u32,
+    /// MCP servers to hand this tool, shared by every tool Sarathi launches.
+    pub mcp: crate::launcher::mcp::McpRegistry,
 }
 
 impl LaunchContext {
@@ -258,11 +272,30 @@ pub fn resolve_env(env: &HashMap<String, String>, ctx: &LaunchContext) -> HashMa
         .collect()
 }
 
+/// Fills placeholders in a tool's command-line arguments.
+///
+/// Needed because some clients take their MCP config as a path on the command
+/// line rather than reading it from a fixed location — Claude Code is one, and
+/// that path is only known once the client directory is.
+pub fn resolve_args(args: &[String], ctx: &LaunchContext) -> Vec<String> {
+    args.iter().map(|a| fill_placeholders(a, ctx, false)).collect()
+}
+
 /// Substitutes placeholders in `template`.
 ///
 /// `json` escapes the substituted values, because generated config files are
 /// JSON and a Windows client directory is full of backslashes.
 pub fn fill_placeholders(template: &str, ctx: &LaunchContext, json: bool) -> String {
+    fill_placeholders_with(template, ctx, json, crate::launcher::mcp::McpDialect::default())
+}
+
+/// As [`fill_placeholders`], naming the dialect `{mcpServers}` renders in.
+pub fn fill_placeholders_with(
+    template: &str,
+    ctx: &LaunchContext,
+    json: bool,
+    dialect: crate::launcher::mcp::McpDialect,
+) -> String {
     let base = format!("http://127.0.0.1:{}", ctx.port);
     let v1 = format!("{base}/v1");
 
@@ -277,6 +310,9 @@ pub fn fill_placeholders(template: &str, ctx: &LaunchContext, json: bool) -> Str
     // The v1 placeholder is replaced first: the shorter one is a prefix of it,
     // and the other order would leave a stray "V1" on the end of the address.
     template
+        // Not passed through `esc`: this one substitutes a JSON object, and
+        // escaping it would hand the client a string where it expects a map.
+        .replace(PLACEHOLDER_MCP, &ctx.mcp.render(dialect))
         .replace(PLACEHOLDER_BASE_V1, &esc(&v1))
         .replace(PLACEHOLDER_BASE, &esc(&base))
         .replace(PLACEHOLDER_MODEL_NAME, &esc(&ctx.model_name))
@@ -342,7 +378,16 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
             }),
             launch: LaunchSpec {
                 command: "claude".into(),
-                args: vec![],
+                // Claude Code keeps its own MCP servers in `.claude.json`,
+                // alongside session state Sarathi has no business rewriting.
+                // `--mcp-config` points it at a file Sarathi does own, and
+                // `--strict-mcp-config` stops the user's own servers being
+                // merged in — the tool gets Sarathi's set, exactly.
+                args: vec![
+                    "--mcp-config".into(),
+                    format!("{PLACEHOLDER_CLIENT_DIR}/mcp.json"),
+                    "--strict-mcp-config".into(),
+                ],
                 env: HashMap::from([
                     ("ANTHROPIC_BASE_URL".to_string(), PLACEHOLDER_BASE.to_string()),
                     // Exactly one credential is set. Claude Code warns when it
@@ -378,7 +423,11 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     "CLAUDE_CODE_HOST_SESSION_ID".into(),
                     "CLAUDE_CODE_CHILD_SESSION".into(),
                 ],
-                client_config: None,
+                client_config: Some(ClientConfig {
+                    file_name: "mcp.json".into(),
+                    contents: format!("{{\n  \"mcpServers\": {PLACEHOLDER_MCP}\n}}\n"),
+                    mcp_dialect: crate::launcher::mcp::McpDialect::Standard,
+                }),
             },
             user_defined: false,
         },
@@ -429,10 +478,12 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                 ],
                 client_config: Some(ClientConfig {
                     file_name: "opencode.json".into(),
+                    mcp_dialect: crate::launcher::mcp::McpDialect::Opencode,
                     contents: format!(
                         r#"{{
   "$schema": "https://opencode.ai/config.json",
   "model": "sarathi/{PLACEHOLDER_MODEL}",
+  "mcp": {PLACEHOLDER_MCP},
   "provider": {{
     "sarathi": {{
       "npm": "@ai-sdk/openai-compatible",
@@ -502,6 +553,11 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                 ],
                 client_config: Some(ClientConfig {
                     file_name: "config.yaml".into(),
+                    // Hermes keeps its config in YAML and has no documented
+                    // `mcpServers` key, so nothing is injected here; the
+                    // dialect is stated rather than defaulted so a future
+                    // change is a one-line edit, not an archaeology exercise.
+                    mcp_dialect: crate::launcher::mcp::McpDialect::Standard,
                     // Values are JSON-escaped on substitution; a double-quoted
                     // YAML scalar accepts the same \" and \\ escapes, so the
                     // shared escaping is correct here too.
@@ -574,6 +630,7 @@ model:
                 ],
                 client_config: Some(ClientConfig {
                     file_name: "openclaw.json".into(),
+                    mcp_dialect: crate::launcher::mcp::McpDialect::Standard,
                     // `mode: merge` keeps OpenClaw's built-in provider list and
                     // adds Sarathi to it, rather than replacing the set.
                     //
@@ -629,6 +686,7 @@ mod tests {
             model_name: "Qwen2.5-3B".into(),
             client_dir: r"C:\data\clients\opencode".into(),
             context_length: 32768,
+            mcp: crate::launcher::mcp::McpRegistry::default(),
         }
     }
 
@@ -976,6 +1034,127 @@ mod tests {
     fn openclaw_is_launched_with_the_subcommand_that_actually_runs_something() {
         let tool = builtin_tools().into_iter().find(|t| t.id == "openclaw").unwrap();
         assert_eq!(tool.launch.args, vec!["gateway".to_string()]);
+    }
+
+    /// A context carrying two MCP servers, for the wiring tests below.
+    fn ctx_with_mcp(port: u16) -> LaunchContext {
+        use crate::launcher::mcp::{McpRegistry, McpServerSpec};
+        use std::collections::BTreeMap;
+
+        let mut servers = BTreeMap::new();
+        servers.insert(
+            "searxng".to_string(),
+            McpServerSpec {
+                command: "mcp-searxng".into(),
+                args: vec![],
+                env: BTreeMap::from([(
+                    "SEARXNG_URL".to_string(),
+                    "http://127.0.0.1:8888".to_string(),
+                )]),
+                disabled: false,
+                description: None,
+            },
+        );
+        servers.insert(
+            "research".to_string(),
+            McpServerSpec {
+                command: "python".into(),
+                args: vec![r"C:\repo\server.py".into()],
+                env: BTreeMap::new(),
+                disabled: false,
+                description: None,
+            },
+        );
+
+        let mut ctx = ctx_on(port);
+        ctx.mcp = McpRegistry { servers, warnings: vec![] };
+        ctx
+    }
+
+    fn rendered_config(tool_id: &str, ctx: &LaunchContext) -> serde_json::Value {
+        let tool = builtin_tools().into_iter().find(|t| t.id == tool_id).unwrap();
+        let cfg = tool.launch.client_config.expect("tool should generate a config");
+        let body = fill_placeholders_with(&cfg.contents, ctx, true, cfg.mcp_dialect);
+        serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("{tool_id} config is not valid JSON: {e}\n{body}"))
+    }
+
+    #[test]
+    fn opencode_receives_the_shared_mcp_servers_in_its_own_dialect() {
+        let parsed = rendered_config("opencode", &ctx_with_mcp(11435));
+
+        let searxng = &parsed["mcp"]["searxng"];
+        assert_eq!(searxng["type"], "local");
+        assert_eq!(searxng["command"][0], "mcp-searxng", "opencode nests the command");
+        assert_eq!(searxng["environment"]["SEARXNG_URL"], "http://127.0.0.1:8888");
+        assert_eq!(searxng["enabled"], true);
+
+        // The command and its arguments arrive as one array, not two keys.
+        assert_eq!(parsed["mcp"]["research"]["command"][1], r"C:\repo\server.py");
+
+        // Adding MCP must not have disturbed the provider wiring.
+        assert_eq!(parsed["provider"]["sarathi"]["options"]["baseURL"], "http://127.0.0.1:11435/v1");
+    }
+
+    #[test]
+    fn claude_code_gets_a_standalone_mcp_file_it_can_be_pointed_at() {
+        let parsed = rendered_config("claude-code", &ctx_with_mcp(11435));
+
+        assert_eq!(parsed["mcpServers"]["searxng"]["command"], "mcp-searxng");
+        assert_eq!(parsed["mcpServers"]["searxng"]["args"], serde_json::json!([]));
+        assert_eq!(
+            parsed["mcpServers"]["searxng"]["env"]["SEARXNG_URL"],
+            "http://127.0.0.1:8888"
+        );
+        // A Windows path in a generated JSON file must survive escaping.
+        assert_eq!(parsed["mcpServers"]["research"]["args"][0], r"C:\repo\server.py");
+    }
+
+    #[test]
+    fn claude_code_is_launched_pointing_at_that_file_and_told_to_use_only_it() {
+        let tool = builtin_tools().into_iter().find(|t| t.id == "claude-code").unwrap();
+        let ctx = ctx_with_mcp(11435);
+        let args = resolve_args(&tool.launch.args, &ctx);
+
+        let i = args.iter().position(|a| a == "--mcp-config").expect("must pass --mcp-config");
+        assert_eq!(args[i + 1], format!("{}/mcp.json", ctx.client_dir), "path must be resolved");
+        assert!(!args[i + 1].contains('{'), "an unfilled placeholder would name no file");
+
+        // Without this, the user's own MCP servers merge in and the tool no
+        // longer has the set Sarathi gave it.
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
+
+        // The file the flag names is the one the client config writes.
+        let cfg = tool.launch.client_config.as_ref().unwrap();
+        assert_eq!(cfg.file_name, "mcp.json");
+    }
+
+    #[test]
+    fn a_tool_with_no_mcp_servers_still_gets_valid_config() {
+        // The empty case is the common one on a fresh install; it must not
+        // produce `"mcp": ` with nothing after it.
+        for id in ["opencode", "claude-code"] {
+            let parsed = rendered_config(id, &ctx_on(11435));
+            let key = if id == "opencode" { "mcp" } else { "mcpServers" };
+            assert!(parsed[key].is_object(), "{id} should have an empty object, got {:?}", parsed[key]);
+            assert_eq!(parsed[key].as_object().unwrap().len(), 0);
+        }
+    }
+
+    #[test]
+    fn the_mcp_placeholder_is_substituted_as_structure_not_as_a_string() {
+        // Escaped like an ordinary value, the object would arrive as a quoted
+        // string and every client would find no servers at all.
+        let ctx = ctx_with_mcp(11435);
+        let filled = fill_placeholders_with(
+            r#"{"servers": {mcpServers}}"#,
+            &ctx,
+            true,
+            crate::launcher::mcp::McpDialect::Standard,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&filled).expect("valid JSON");
+        assert!(parsed["servers"].is_object(), "got: {filled}");
+        assert!(!filled.contains("\\\""), "the object must not be escaped: {filled}");
     }
 
     #[test]
