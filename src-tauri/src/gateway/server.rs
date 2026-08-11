@@ -310,9 +310,58 @@ async fn openai_chat(
         return Json(ChatCompletionResponse::new(id, created, model, text, &finish, tokens)).into_response();
     }
 
+    // A tool call cannot be recognised until the whole of it has arrived — it is
+    // JSON inside a tag, and half of it is not a call. So when the client has
+    // offered tools, the answer is collected and then emitted as one correct
+    // stream. The latency this costs is real, but it only applies to the
+    // agentic path, where no one is watching tokens appear anyway.
+    if !req.tools.is_empty() {
+        let (text, finish, tokens) = collect(&mut handle).await;
+        state.finish_request();
+        return Sse::new(openai_buffered_stream(text, finish, tokens, id, created, model))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
     Sse::new(openai_stream(state.clone(), handle, id, created, model))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Replays a completed answer as a well-formed OpenAI stream.
+///
+/// Used when tools were offered; see [`openai_chat`].
+fn openai_buffered_stream(
+    text: String,
+    finish: String,
+    _tokens: u32,
+    id: String,
+    created: u64,
+    model: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    let parsed = crate::gateway::toolcall::parse(&text);
+    let reason = parsed.finish_reason(&finish).to_string();
+
+    let mut events = vec![Ok(Event::default()
+        .data(json_of(&ChatCompletionChunk::opening(&id, created, &model))))];
+
+    if !parsed.text.is_empty() {
+        events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::text(
+            &id, created, &model, parsed.text.clone(),
+        )))));
+    }
+    if !parsed.calls.is_empty() {
+        events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::tool_calls(
+            &id, created, &model, &parsed.calls,
+        )))));
+    }
+
+    events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::closing(
+        &id, created, &model, &reason,
+    )))));
+    events.push(Ok(Event::default().data("[DONE]")));
+
+    stream::iter(events)
 }
 
 /// `opening chunk` → `text chunk`* → `closing chunk` → `[DONE]`.
@@ -402,9 +451,70 @@ async fn anthropic_messages(
         return Json(MessagesResponse::new(id, model, text, stop, tokens)).into_response();
     }
 
+    // Same reasoning as the OpenAI path: a tool call is only recognisable whole.
+    if !req.tools.is_empty() {
+        let (text, finish, tokens) = collect(&mut handle).await;
+        state.finish_request();
+        let stop = anthropic::map_stop_reason(&finish);
+        return Sse::new(anthropic_buffered_stream(text, stop, tokens, id, model))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
     Sse::new(anthropic_stream(state.clone(), handle, id, model))
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Replays a completed answer as the exact event sequence Anthropic clients
+/// require, with a `tool_use` block per call the model made.
+fn anthropic_buffered_stream(
+    text: String,
+    stop_reason: &'static str,
+    tokens: u32,
+    id: String,
+    model: String,
+) -> impl Stream<Item = Result<Event, Infallible>> {
+    fn sse((name, data): (&'static str, String)) -> Result<Event, Infallible> {
+        Ok(Event::default().event(name).data(data))
+    }
+
+    let parsed = crate::gateway::toolcall::parse(&text);
+    let stop = if parsed.calls.is_empty() { stop_reason } else { "tool_use" };
+
+    let mut events = vec![sse(StreamEvents::message_start(&id, &model))];
+
+    // Blocks are indexed across the whole message, so text and tool_use share
+    // one counter — a client keys its assembly on that index.
+    let mut index = 0u32;
+    if !parsed.text.is_empty() {
+        events.push(sse(StreamEvents::content_block_start_at(index)));
+        events.push(sse(StreamEvents::content_block_delta_at(index, &parsed.text)));
+        events.push(sse(StreamEvents::content_block_stop_at(index)));
+        index += 1;
+    }
+
+    for call in &parsed.calls {
+        let input: serde_json::Value =
+            serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+        events.push(sse(StreamEvents::tool_use_start(index, &call.id, &call.name)));
+        // Sent whole rather than as partial JSON: Sarathi has the complete
+        // arguments by this point, and splitting them would only give the
+        // client something to reassemble.
+        events.push(sse(StreamEvents::tool_use_delta(index, &input.to_string())));
+        events.push(sse(StreamEvents::content_block_stop_at(index)));
+        index += 1;
+    }
+
+    if index == 0 {
+        events.push(sse(StreamEvents::content_block_start_at(0)));
+        events.push(sse(StreamEvents::content_block_stop_at(0)));
+    }
+
+    events.push(sse(StreamEvents::message_delta(stop, tokens)));
+    events.push(sse(StreamEvents::message_stop()));
+
+    stream::iter(events)
 }
 
 /// The exact event order Anthropic clients require:

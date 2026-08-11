@@ -580,7 +580,7 @@ impl LlamaCppRuntime {
         // Render the prompt with the model's own template when it has one, and
         // only fall back to the hand-written approximations otherwise.
         let (prompt, template_source) = match native_template.as_ref() {
-            Some(tmpl) => match render_with_native_template(model, tmpl, messages) {
+            Some(tmpl) => match render_with_native_template(model, tmpl, messages, &params.tools) {
                 Ok(p) => (p, "gguf"),
                 Err(e) => {
                     log::warn!(
@@ -1016,13 +1016,25 @@ fn render_with_native_template(
     model: &LlamaModel,
     tmpl: &NativeChatTemplate,
     messages: &[ChatMessage],
+    tools: &[serde_json::Value],
 ) -> Result<String> {
     if let Some(src) = &tmpl.source {
-        match render_jinja_chat_template(src, messages, &tmpl.bos_token, &tmpl.eos_token) {
+        match render_jinja_chat_template(src, messages, &tmpl.bos_token, &tmpl.eos_token, tools) {
             Ok(prompt) if !prompt.trim().is_empty() => return Ok(prompt),
             Ok(_) => log::warn!("[RUNTIME] Jinja chat template rendered an empty prompt; trying llama.cpp's engine"),
             Err(e) => log::warn!("[RUNTIME] Jinja chat template failed to render ({e:#}); trying llama.cpp's engine"),
         }
+    }
+
+    if !tools.is_empty() {
+        // llama.cpp's own template engine takes messages only, so a fallback to
+        // it silently drops the tools. Saying so is what separates "the model
+        // chose not to call anything" from "the model was never told it could".
+        log::warn!(
+            "[RUNTIME] Falling back to llama.cpp's template engine, which cannot carry \
+             the {} tool definition(s) in this request; the model will not see them.",
+            tools.len()
+        );
     }
 
     let chat: Vec<LlamaChatMessage> = messages
@@ -1103,6 +1115,7 @@ pub fn render_jinja_chat_template(
     messages: &[ChatMessage],
     bos_token: &str,
     eos_token: &str,
+    tools: &[serde_json::Value],
 ) -> Result<String> {
     use minijinja::{context, Environment};
 
@@ -1127,14 +1140,21 @@ pub fn render_jinja_chat_template(
         })
         .collect();
 
+    // Tool definitions go in as plain data, which is the shape templates expect:
+    // they subscript `tool.function.name` and `.parameters` directly. An empty
+    // list still has to be *declared* so templates that branch on it take the
+    // plain-chat path rather than failing on an undefined name.
+    let tool_values: Vec<minijinja::value::Value> = tools
+        .iter()
+        .map(minijinja::value::Value::from_serialize)
+        .collect();
+
     tmpl.render(context! {
         messages => msgs,
         bos_token => bos_token,
         eos_token => eos_token,
         add_generation_prompt => true,
-        // Declared so templates that branch on them take the plain-chat path
-        // rather than failing on an undefined name.
-        tools => Vec::<minijinja::value::Value>::new(),
+        tools => tool_values,
         enable_thinking => false,
     })
     .map_err(|e| anyhow!("chat template failed to render: {e}"))
@@ -1364,7 +1384,7 @@ mod tests {
                    {%- for m in messages -%}<|turn>{{ m['role'] }}\n{{ m['content'] }}<turn|>\n{%- endfor -%}\
                    {%- if add_generation_prompt -%}<|turn>model\n{%- endif -%}";
 
-        let out = render_jinja_chat_template(src, &sample_messages(), "<bos>", "<eos>").unwrap();
+        let out = render_jinja_chat_template(src, &sample_messages(), "<bos>", "<eos>", &[]).unwrap();
 
         // `{%-` trims the preceding newline, so the turns run together — which
         // is exactly the whitespace handling a chat template depends on.
@@ -1383,16 +1403,54 @@ mod tests {
                    {{ m.get('role') }}:{{ m.get('tool_calls', 'none') }};\
                    {%- endfor -%}";
 
-        let out = render_jinja_chat_template(src, &sample_messages(), "<bos>", "<eos>").unwrap();
+        let out = render_jinja_chat_template(src, &sample_messages(), "<bos>", "<eos>", &[]).unwrap();
 
         assert_eq!(out, "system:none;user:none;");
+    }
+
+    #[test]
+    fn tool_definitions_reach_the_template() {
+        // The gap this closes: `tools` was hardcoded to an empty list, so a
+        // tool-capable template took its plain-chat branch every time and the
+        // model was never told any tool existed.
+        let src = "{%- if tools -%}\
+                   TOOLS:{% for t in tools %}{{ t.function.name }},{% endfor %}\
+                   {%- else -%}NO_TOOLS{%- endif -%}";
+
+        let tools = vec![
+            serde_json::json!({"type":"function","function":{"name":"searxng_web_search"}}),
+            serde_json::json!({"type":"function","function":{"name":"research_ask"}}),
+        ];
+
+        let with = render_jinja_chat_template(src, &sample_messages(), "<b>", "<e>", &tools).unwrap();
+        assert_eq!(with, "TOOLS:searxng_web_search,research_ask,");
+
+        let without = render_jinja_chat_template(src, &sample_messages(), "<b>", "<e>", &[]).unwrap();
+        assert_eq!(without, "NO_TOOLS", "an empty list must still take the plain branch");
+    }
+
+    #[test]
+    fn a_tool_parameter_schema_survives_into_the_template() {
+        // Templates render the schema verbatim into the prompt; a value that
+        // arrives stringified or flattened gives the model an unusable spec.
+        let src = "{{ tools[0].function.parameters.properties.query.type }}";
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "s",
+                "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+            }
+        })];
+
+        let out = render_jinja_chat_template(src, &sample_messages(), "<b>", "<e>", &tools).unwrap();
+        assert_eq!(out, "string");
     }
 
     #[test]
     fn a_broken_jinja_template_errors_rather_than_panicking() {
         // Callers fall back to a hand-written template on error, so this must
         // surface as Err rather than taking the process down.
-        let out = render_jinja_chat_template("{% for %}", &sample_messages(), "<bos>", "<eos>");
+        let out = render_jinja_chat_template("{% for %}", &sample_messages(), "<bos>", "<eos>", &[]);
         assert!(out.is_err());
     }
 
@@ -1480,7 +1538,7 @@ mod tests {
             eos_token: piece(model.token_eos()),
         };
 
-        let rendered = render_with_native_template(&model, &tmpl, &sample_messages())
+        let rendered = render_with_native_template(&model, &tmpl, &sample_messages(), &[])
             .expect("the model's own template must render");
         println!("--- rendered prompt ---\n{rendered}\n-----------------------");
 

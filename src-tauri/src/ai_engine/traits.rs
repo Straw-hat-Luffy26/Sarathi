@@ -105,6 +105,15 @@ pub struct GenerationParams {
     /// Mirostat sampling (0 = disabled, 1 = v1, 2 = v2). Default: 0
     #[serde(default = "default_mirostat")]
     pub mirostat: u32,
+    /// Tool definitions the model may call, in OpenAI's `{type, function}` shape.
+    ///
+    /// Carried alongside sampling rather than as its own argument so it reaches
+    /// the runtime through the existing `generate(messages, params, cb)` path.
+    /// Chat templates that support tool use read a `tools` variable; leaving it
+    /// empty is what made every MCP server registered against Sarathi list its
+    /// tools and never be called.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<serde_json::Value>,
 }
 
 fn default_temperature() -> f32 { 0.7 }
@@ -125,6 +134,7 @@ impl Default for GenerationParams {
             max_tokens: default_max_tokens(),
             repeat_penalty: default_repeat_penalty(),
             mirostat: default_mirostat(),
+            tools: Vec::new(),
         }
     }
 }

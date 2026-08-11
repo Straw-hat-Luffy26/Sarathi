@@ -47,6 +47,9 @@ impl SamplingOverrides {
             repeat_penalty: self.repeat_penalty.unwrap_or(base.repeat_penalty),
             max_tokens: base.max_tokens,
             mirostat: base.mirostat,
+            // Sampling overrides say nothing about tools; carrying them through
+            // is what keeps a capability profile from silently disarming them.
+            tools: base.tools.clone(),
         }
     }
 

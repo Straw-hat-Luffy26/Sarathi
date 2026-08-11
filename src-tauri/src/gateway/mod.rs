@@ -16,6 +16,7 @@ pub mod guard;
 pub mod openai;
 pub mod server;
 pub mod state;
+pub mod toolcall;
 
 pub use server::{start_gateway, GatewayHandle};
 pub use state::{GatewayConfig, GatewayState, GatewayStats, ClientActivity};
