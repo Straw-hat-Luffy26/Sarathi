@@ -8,12 +8,14 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "dev:auto": "node scripts/select-backend.mjs dev",
+    "dev:auto": "node scripts/select-backend.mjs dev --release",
     "build:auto": "node scripts/select-backend.mjs build",
-    "tauri:dev:gpu": "tauri dev --features cuda",
-    "tauri:build:gpu": "tauri build --features cuda",
-    "tauri:dev:vulkan": "tauri dev --features vulkan",
-    "tauri:build:vulkan": "tauri build --features vulkan"
+    "start": "node scripts/select-backend.mjs dev --release",
+    "dev:debug-cpu": "tauri dev",
+    "dev:cuda": "tauri dev --release --features cuda",
+    "dev:vulkan": "tauri dev --release --features vulkan",
+    "build:cuda": "tauri build --features cuda",
+    "build:vulkan": "tauri build --features vulkan"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

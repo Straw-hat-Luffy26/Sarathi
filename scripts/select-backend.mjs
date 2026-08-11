@@ -151,6 +151,23 @@ const tauriArgs = [mode, ...(feature ? ['--features', feature] : []), ...rest];
 console.log(`[sarathi] backend: ${feature ?? 'cpu'} — ${why}`);
 console.log(`[sarathi] tauri ${tauriArgs.join(' ')}`);
 
+// Building CPU-only on a machine with a GPU is almost always an accident, and
+// the resulting binary is indistinguishable from a working one until someone
+// watches a model saturate the CPU. Saying so here is cheaper than discovering
+// it during inference.
+if (!feature && probe('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'])) {
+  console.warn('');
+  console.warn('[sarathi] ####################################################################');
+  console.warn('[sarathi] #  An NVIDIA GPU is present, but this build will be CPU-ONLY.      #');
+  console.warn('[sarathi] #  GPU support in llama.cpp is compiled in, not detected at run    #');
+  console.warn('[sarathi] #  time, so this binary cannot use the card no matter what it      #');
+  console.warn('[sarathi] #  later finds. Models will load into system RAM and run on CPU.   #');
+  console.warn('[sarathi] #                                                                  #');
+  console.warn('[sarathi] #  Install the CUDA Toolkit (nvcc) and run this command again.     #');
+  console.warn('[sarathi] ####################################################################');
+  console.warn('');
+}
+
 // A CUDA build on Windows needs the MSVC environment and the Ninja generator;
 // everywhere else the default toolchain is already correct.
 if (isWindows && feature === 'cuda') {

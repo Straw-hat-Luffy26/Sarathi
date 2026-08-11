@@ -269,6 +269,7 @@ pub fn run() {
             commands::system::log_activity,
             commands::system::get_hardware_profile,
             commands::system::analyze_system,
+            commands::system::get_runtime_capability,
             commands::system::override_hardware_value,
             commands::system::revert_hardware_override,
             commands::system::validate_system,
