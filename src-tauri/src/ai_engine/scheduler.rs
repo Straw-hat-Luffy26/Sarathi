@@ -228,7 +228,7 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
     };
 
     let started = std::time::Instant::now();
-    log::info!("[SCHEDULER] Starting job from '{}'", job.origin.label());
+    log::info!("[SCHEDULER] Job starting from: {}, messages: {}", job.origin.label(), job.messages.len());
 
     // Bridges the scheduler's cancel flag into the runtime's while the prompt is
     // still being decoded.

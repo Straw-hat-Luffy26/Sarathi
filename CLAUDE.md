@@ -3,8 +3,10 @@
 Tauri 2 desktop app for running local LLMs. React 19 + TypeScript + Vite frontend
 (`src/`), Rust backend (`src-tauri/`), Python sidecars (`sidecars/`).
 
-Build variants: `npm run tauri:dev:gpu` (CUDA), `npm run tauri:dev:vulkan` (Vulkan),
-or `npm run dev:auto` to let `scripts/select-backend.mjs` pick.
+Build variants: `npm run dev:cuda` (CUDA), `npm run dev:vulkan` (Vulkan), or
+`npm start` / `npm run dev:auto` to let `scripts/select-backend.mjs` pick.
+Prefer the selector — a CPU-only binary cannot use a GPU later, because backend
+selection in llama.cpp is compile-time.
 
 ## Agent capability layer (MCP)
 

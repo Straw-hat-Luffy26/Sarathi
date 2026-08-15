@@ -156,6 +156,9 @@
   align-content: start;
   overflow-y: auto;
   padding-right: var(--space-2);
+  /* Expand to fill available height so loading state can center vertically */
+  align-self: stretch;
+  min-height: 0;
 }
 
 /* Headings inside the card grid span every column, so the cards below them
@@ -207,9 +210,11 @@
   display: flex;
   flex-direction: column;
   align-items: center;
+  justify-content: center;
   gap: var(--space-3);
   padding: var(--space-6);
   color: var(--text-secondary);
+  min-height: 100%;
 }
 
 /* Loading the library --------------------------------------------------- */
