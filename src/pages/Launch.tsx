@@ -9,6 +9,7 @@ import {
   Server,
   Terminal,
   FileJson,
+  Boxes,
 } from 'lucide-react';
 import { Button, Spinner } from '../components/ui';
 import { useToast } from '../hooks/useToast';
@@ -20,10 +21,12 @@ import {
   launchTool,
   listenToolInstallProgress,
   previewToolInstall,
+  redetectTools,
   userToolsFile,
   type LaunchOverview,
   type ToolStatus,
 } from '../services/launcher.service';
+import { NotebookLmCard } from '../components/NotebookLmCard';
 import styles from './Launch.module.css';
 
 /** How often the server panel refreshes while the screen is open. */
@@ -57,9 +60,18 @@ export const Launch: React.FC = () => {
   /** Latest line the package manager printed, per tool, while installing. */
   const [installLine, setInstallLine] = useState<Record<string, string>>({});
 
-  const refresh = useCallback(async (showSpinner = false) => {
+  /**
+   * Reads the current overview.
+   *
+   * `deep` is the difference between the two-second poll and the Refresh
+   * button: the poll reads cached tool detection, the button throws it away
+   * and looks again. Making every poll a deep refresh is what turned this
+   * screen into twenty seconds of subprocess a minute.
+   */
+  const refresh = useCallback(async (showSpinner = false, deep = false) => {
     if (showSpinner) setLoading(true);
     try {
+      if (deep) await redetectTools();
       setOverview(await getLaunchOverview());
       setPollError(null);
     } catch (err) {
@@ -161,7 +173,7 @@ export const Launch: React.FC = () => {
         <AlertTriangle size={22} />
         <p>Could not read tool status.</p>
         {pollError && <p className={styles.muted}>{pollError}</p>}
-        <Button variant="secondary" size="sm" onClick={() => refresh(true)}>
+        <Button variant="secondary" size="sm" onClick={() => refresh(true, true)}>
           <RefreshCw size={14} /> Try again
         </Button>
       </div>
@@ -179,7 +191,7 @@ export const Launch: React.FC = () => {
             Start a coding tool already connected to your local model.
           </p>
         </div>
-        <Button variant="ghost" size="sm" onClick={() => refresh(true)}>
+        <Button variant="ghost" size="sm" onClick={() => refresh(true, true)}>
           <RefreshCw size={14} /> Refresh
         </Button>
       </header>
@@ -207,6 +219,13 @@ export const Launch: React.FC = () => {
         </div>
       ))}
 
+      <div className={styles.sectionHead}>
+        <h2 className={styles.sectionTitle}>
+          <Terminal size={16} /> Providers
+        </h2>
+        <p className={styles.sectionNote}>Coding tools Sarathi can start against your model.</p>
+      </div>
+
       <section className={styles.grid}>
         {tools.map((tool) => (
           <article key={tool.id} className={styles.card}>
@@ -232,6 +251,14 @@ export const Launch: React.FC = () => {
             </div>
 
             <div className={styles.cardFoot}>
+              {/* Detection has not answered yet. Saying so beats offering an
+                * Install button for something that is probably already here. */}
+              {tool.state === 'checking' && (
+                <span className={styles.muted}>
+                  <Spinner /> Checking…
+                </span>
+              )}
+
               {tool.state === 'notInstalled' && (
                 tool.installCommand ? (
                   <div className={styles.installing}>
@@ -283,6 +310,22 @@ export const Launch: React.FC = () => {
             </div>
           </article>
         ))}
+      </section>
+
+      {/* Capabilities, not providers. NotebookLM is a tool source that every
+        * MCP-capable provider above receives; showing it in the grid with them
+        * said it was a fifth thing to launch, which it is not. */}
+      <div className={styles.sectionHead}>
+        <h2 className={styles.sectionTitle}>
+          <Boxes size={16} /> Tools &amp; capabilities
+        </h2>
+        <p className={styles.sectionNote}>
+          Shared with every provider that speaks MCP. Not launched on their own.
+        </p>
+      </div>
+
+      <section>
+        <NotebookLmCard />
       </section>
 
       <section className={styles.server}>

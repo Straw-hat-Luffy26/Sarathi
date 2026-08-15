@@ -83,11 +83,7 @@ fn exercise(path: &Path, gpu_layers: u32) -> Outcome {
     };
     let backend = loaded.backend_used.clone();
 
-    let messages = vec![ChatMessage {
-        role: "user".to_string(),
-        content: PROMPT.to_string(),
-        timestamp: None,
-    }];
+    let messages = vec![ChatMessage::new("user", PROMPT)];
     let params = GenerationParams { max_tokens: MAX_TOKENS, ..Default::default() };
 
     let reply = match runtime.generate(&messages, &params, |_| {}) {

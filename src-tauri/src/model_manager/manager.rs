@@ -4,105 +4,24 @@
 //! and computes storage usage metrics.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use anyhow::Result;
-use sysinfo::{Disks, System};
 
 use crate::download_manager::traits::{InstalledModel, StorageSummary};
 
 pub struct ModelManager;
 
 impl ModelManager {
-    /// Recursively scans <app_data_dir>/models/ for model packages
+    /// Scans `<app_data_dir>/models/` for model packages, on this thread.
+    ///
+    /// Kept as the plain blocking entry point for tests and the headless
+    /// verification binaries. The running app goes through
+    /// [`ModelStore`](crate::model_manager::ModelStore) instead, which shares one
+    /// scan between callers, caches the header reads, and — the part that
+    /// matters — never runs on the thread that draws the window. There is only
+    /// one implementation of the walk; this delegates to it.
     pub fn list_installed_models(app_data_dir: &Path) -> Vec<InstalledModel> {
-        let mut installed = Vec::new();
-        let models_dir = app_data_dir.join("models");
-
-        if !models_dir.exists() {
-            return installed;
-        }
-
-        // Iterate over provider directories: models/<provider>/<sanitized_model_id>/
-        if let Ok(providers) = fs::read_dir(&models_dir) {
-            for provider_entry in providers.flatten() {
-                let provider_path = provider_entry.path();
-                if provider_path.is_dir() {
-                    let provider_id = provider_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-
-                    if let Ok(packages) = fs::read_dir(&provider_path) {
-                        for pkg_entry in packages.flatten() {
-                            let pkg_path = pkg_entry.path();
-                            if pkg_path.is_dir() {
-                                let folder_name = pkg_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                let inferred_model_id = folder_name.replace('_', "/");
-
-                                if let Ok(manifest) = crate::adapter_manager::AdapterRegistry::ensure_valid_manifest(
-                                    &pkg_path,
-                                    &provider_id,
-                                    &inferred_model_id,
-                                ) {
-                                    let full_gguf_path = pkg_path.join(&manifest.base_model.file_path);
-                                    if full_gguf_path.exists() && full_gguf_path.is_file() {
-                                        let file_name = full_gguf_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                        let model_id = manifest.base_model.model_id.clone();
-                                        let model_name = manifest.base_model.model_name.clone();
-                                        let quantization = manifest.base_model.quantization.clone();
-                                        let size_bytes = manifest.base_model.size_bytes;
-
-                                        // Read once per listing, from the file
-                                        // itself. Only the header is touched —
-                                        // a few kilobytes — so this stays cheap
-                                        // even with a shelf full of models.
-                                        let classification = match crate::ai_engine::gguf_meta::read_gguf_metadata(&full_gguf_path) {
-                                            Ok(meta) => crate::model_manager::classify::classify(&meta, &model_name),
-                                            Err(e) => {
-                                                log::warn!(
-                                                    "[MODEL_MGR] Could not classify '{}': {e:#}",
-                                                    full_gguf_path.display()
-                                                );
-                                                crate::model_manager::classify::Classification::unreadable(
-                                                    format!("Sarathi could not read this file's header: {e}"),
-                                                )
-                                            }
-                                        };
-
-                                        // The header's quantization wins over
-                                        // the manifest's, which records what was
-                                        // asked for rather than what arrived.
-                                        let quantization = classification
-                                            .quantization
-                                            .clone()
-                                            .unwrap_or(quantization);
-
-                                        installed.push(InstalledModel {
-                                            id: format!("{}_{}", model_id.replace('/', "_"), quantization),
-                                            model_id,
-                                            model_name,
-                                            provider_id: manifest.provider_id,
-                                            quantization,
-                                            format: "GGUF".to_string(),
-                                            backend: "llama.cpp (GGUF)".to_string(),
-                                            file_name,
-                                            file_path: full_gguf_path.to_string_lossy().to_string(),
-                                            size_bytes,
-                                            installed_at: chrono::Utc::now().to_rfc3339(),
-                                            // Present on disk is not the same as
-                                            // usable: a helper file is complete
-                                            // and still cannot be loaded.
-                                            is_ready: size_bytes > 0 && classification.group.is_loadable(),
-                                            checksum: None,
-                                            adapters: Some(manifest.adapters),
-                                            classification: Some(classification),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        installed
+        crate::model_manager::ModelStore::scan_now(app_data_dir)
     }
 
     /// Deletes an installed model directory and files from disk
@@ -126,37 +45,20 @@ impl ModelManager {
         Ok(())
     }
 
-    /// Computes summary of storage usage
+    /// Storage usage, on this thread. See [`list_installed_models`] on why the
+    /// running app uses `ModelStore::summary` instead.
+    ///
+    /// [`list_installed_models`]: Self::list_installed_models
     pub fn get_storage_summary(app_data_dir: &Path) -> StorageSummary {
         let installed = Self::list_installed_models(app_data_dir);
-        let total_models_bytes: u64 = installed.iter().map(|m| m.size_bytes).sum();
-
-        let disks = Disks::new_with_refreshed_list();
-
-        let mut available_disk_space_bytes = 0;
-        let mut total_disk_space_bytes = 0;
-
         let models_dir = app_data_dir.join("models");
-        let path_str = models_dir.to_string_lossy();
-        let drive_prefix = if path_str.len() >= 3 && &path_str[1..3] == ":\\" {
-            &path_str[0..3]
-        } else {
-            "C:\\"
-        };
-
-        for disk in &disks {
-            let mount = disk.mount_point().to_string_lossy();
-            if mount.eq_ignore_ascii_case(drive_prefix) || path_str.starts_with(mount.as_ref()) {
-                available_disk_space_bytes = disk.available_space();
-                total_disk_space_bytes = disk.total_space();
-                break;
-            }
-        }
+        let (available_disk_space_bytes, total_disk_space_bytes) =
+            crate::model_manager::store::disk_space_for(&models_dir);
 
         StorageSummary {
             models_directory: models_dir.to_string_lossy().to_string(),
             total_installed_models: installed.len(),
-            total_models_bytes,
+            total_models_bytes: installed.iter().map(|m| m.size_bytes).sum(),
             available_disk_space_bytes,
             total_disk_space_bytes,
         }

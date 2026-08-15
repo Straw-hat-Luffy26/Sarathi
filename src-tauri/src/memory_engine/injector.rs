@@ -51,9 +51,8 @@ impl PromptInjector {
                 has_system = true;
                 let combined_content = format!("{}\n\n{}", memory_section, msg.content);
                 final_messages.push(ChatMessage {
-                    role: "system".to_string(),
                     content: combined_content,
-                    timestamp: msg.timestamp.clone(),
+                    ..msg.clone()
                 });
             } else {
                 final_messages.push(msg.clone());
@@ -64,11 +63,10 @@ impl PromptInjector {
             let memory_directive = "\nInstructions:\n- You are Sarathi, an intelligent local AI companion.\n- Use the Known User Information & Preferences and Recalled Context above to personalize your responses.\n- When the user asks about themselves, their name, preferences, or past context, directly answer using the stored user information provided above.";
             final_messages.insert(
                 0,
-                ChatMessage {
-                    role: "system".to_string(),
-                    content: format!("{}\n{}", memory_section, memory_directive),
-                    timestamp: None,
-                },
+                ChatMessage::new(
+                    "system",
+                    format!("{}\n{}", memory_section, memory_directive),
+                ),
             );
         }
 

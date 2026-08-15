@@ -92,12 +92,13 @@ impl MessageContent {
 impl ChatCompletionRequest {
     /// Converts to Sarathi's internal message list.
     ///
-    /// Tool turns are flattened into content rather than carried as structured
-    /// fields: an assistant turn that called something is re-rendered in the
-    /// same `<tool_call>` syntax the model emitted, and a tool result keeps its
-    /// `tool` role, which every tool-capable chat template already handles.
-    /// The alternative — threading structured tool fields through the whole
-    /// engine — buys fidelity the local templates do not use.
+    /// Tool turns are carried **both** ways. The structured `tool_calls`,
+    /// `tool_call_id` and `name` travel through to the chat template, which is
+    /// how a tool-aware model reads its own previous calls and ties a result
+    /// back to the call it answers. The same calls are also rendered into the
+    /// content as `<tool_call>{…}</tool_call>`, so a template that only knows
+    /// about text still sees a coherent conversation instead of an assistant
+    /// turn that says nothing.
     pub fn to_chat_messages(&self) -> Vec<ChatMessage> {
         self.messages
             .iter()
@@ -133,7 +134,14 @@ impl ChatCompletionRequest {
                     }
                 }
 
-                ChatMessage { role: m.role.clone(), content, timestamp: None }
+                ChatMessage {
+                    role: m.role.clone(),
+                    content,
+                    timestamp: None,
+                    tool_calls: m.tool_calls.clone(),
+                    tool_call_id: m.tool_call_id.clone(),
+                    name: m.name.clone(),
+                }
             })
             .collect()
     }

@@ -78,7 +78,7 @@ safetensors = "0.4"
 # `llama_chat_apply_template` only recognises a fixed set of well-known formats
 # and returns -1 for anything else, which leaves newer or custom-format models
 # with no correct prompt framing at all.
-minijinja = { version = "2", features = ["macros", "loop_controls", "adjacent_loop_items"] }
+minijinja = { version = "2", features = ["macros", "loop_controls", "adjacent_loop_items", "json"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.52.0", features = ["Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common", "Win32_Graphics_Direct3D12", "Win32_Graphics_Direct3D", "Win32_Foundation"] }

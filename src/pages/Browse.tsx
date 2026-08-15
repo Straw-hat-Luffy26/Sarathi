@@ -209,20 +209,24 @@ export const Browse: React.FC = () => {
     []
   );
 
-  useEffect(() => {
-    load();
-  }, [load]);
-
   // Progress arrives from the sweep itself, which is the only thing that knows
   // how many repositories there are to read. Subscribed for the life of the
   // page rather than per request, so a background refresh started by an earlier
   // visit still reports into this one.
+  //
+  // CRITICAL: Subscribe BEFORE calling load() to avoid race condition where
+  // progress events fire before the subscription is ready. Without this, the
+  // loading UI may not receive progress updates on the first load.
   useEffect(() => {
     const pending = onCatalogProgress(setProgress);
     return () => {
       void pending.then((off) => off());
     };
   }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
 
   // A background refresh replaces the stored library. Re-reading it here is
   // what turns "we will check for updates" into the updates actually appearing,

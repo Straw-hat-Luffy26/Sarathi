@@ -41,11 +41,7 @@ async fn test_real_world_model_switching_memory_persistence() {
 
     println!("[TEST A SUCCESS] Model A loaded: {} (template='{}')", model_a_info.model_name, model_a_info.chat_template);
 
-    let user_msg = ChatMessage {
-        role: "user".to_string(),
-        content: "What is my name?".to_string(),
-        timestamp: None,
-    };
+    let user_msg = ChatMessage::new("user", "What is my name?");
     let messages = vec![user_msg.clone()];
 
     // Process turn through Memory Engine (extract + inject)

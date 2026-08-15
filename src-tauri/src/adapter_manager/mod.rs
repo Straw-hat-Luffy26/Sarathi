@@ -117,7 +117,33 @@ impl AdapterRegistry {
 
     /// Self-healing manifest validator and repair function.
     /// Ensures manifest exists, points to a valid primary GGUF file, and reports true size_bytes > 0.
+    ///
+    /// Writes the repaired manifest back. Callers that are only *reading* the
+    /// store should use [`resolve_manifest`](Self::resolve_manifest) instead —
+    /// see the note there.
     pub fn ensure_valid_manifest(package_dir: &Path, provider_id: &str, model_id: &str) -> Result<ModelPackageManifest> {
+        let (manifest, needs_write) = Self::resolve_manifest(package_dir, provider_id, model_id)?;
+        if needs_write {
+            let _ = Self::write_manifest(package_dir, &manifest);
+        }
+        Ok(manifest)
+    }
+
+    /// Works out a package's manifest without touching the disk to do it.
+    ///
+    /// Returns the manifest and whether it differs from what is stored, so the
+    /// caller decides whether a write is warranted.
+    ///
+    /// This exists because listing the store is a read. A package whose weight
+    /// file is genuinely missing can never be repaired into validity, so the
+    /// repair path rewrote its `manifest.json` — with a fresh `updated_at` — on
+    /// every single listing. Opening the Storage screen therefore dirtied files,
+    /// woke the virus scanner on each one, and did it twice per refresh.
+    pub fn resolve_manifest(
+        package_dir: &Path,
+        provider_id: &str,
+        model_id: &str,
+    ) -> Result<(ModelPackageManifest, bool)> {
         let existing = Self::read_manifest(package_dir).ok();
         let base_dir = package_dir.join("base");
 
@@ -155,7 +181,7 @@ impl AdapterRegistry {
                 && package_dir.join(&manifest.base_model.file_path).is_file();
 
             if file_valid && manifest.base_model.size_bytes > 0 {
-                return Ok(manifest);
+                return Ok((manifest, false));
             }
 
             // Repair manifest values
@@ -163,8 +189,7 @@ impl AdapterRegistry {
             manifest.base_model.size_bytes = if total_gguf_bytes > 0 { total_gguf_bytes } else { manifest.base_model.size_bytes };
             manifest.updated_at = chrono::Utc::now().to_rfc3339();
 
-            let _ = Self::write_manifest(package_dir, &manifest);
-            return Ok(manifest);
+            return Ok((manifest, true));
         }
 
         // Generate brand new manifest if missing
@@ -195,8 +220,7 @@ impl AdapterRegistry {
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        let _ = Self::write_manifest(package_dir, &new_manifest);
-        Ok(new_manifest)
+        Ok((new_manifest, true))
     }
 
     /// Finds the loadable weight file in an adapter directory, with its size.

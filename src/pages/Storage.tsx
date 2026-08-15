@@ -96,7 +96,33 @@ export const Storage: React.FC = () => {
     );
   }, [models]);
 
+  /**
+   * Identifies the newest refresh, so an older one cannot overwrite it.
+   *
+   * A ref rather than state: it is read and written inside `refresh` and must
+   * not itself cause a render, which would start another refresh.
+   */
+  const latestRefresh = React.useRef(0);
+  /** Set when the screen unmounts, so a reply that arrives after cannot set state. */
+  const alive = React.useRef(true);
+
+  React.useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+      // Anything still in flight is now stale by definition: bumping the token
+      // makes it lose the check below rather than land on an unmounted screen.
+      latestRefresh.current += 1;
+    };
+  }, []);
+
   const refresh = useCallback(async () => {
+    const ticket = (latestRefresh.current += 1);
+    // Not a cancellation of the backend work — the backend shares one scan
+    // between callers, so a second open costs nothing to leave running. This
+    // discards its *result*, which is what makes rapid open/close safe.
+    const current = () => alive.current && latestRefresh.current === ticket;
+
     setError(null);
     try {
       const [installed, sum, status] = await Promise.all([
@@ -104,13 +130,15 @@ export const Storage: React.FC = () => {
         getStorageSummary().catch(() => null),
         getInferenceStatus().catch(() => null),
       ]);
+      if (!current()) return;
       setModels(installed ?? []);
       setSummary(sum);
       setLoadedModelId(status?.model?.modelId ?? null);
     } catch (err) {
+      if (!current()) return;
       setError(String(err));
     } finally {
-      setLoading(false);
+      if (current()) setLoading(false);
     }
   }, []);
 

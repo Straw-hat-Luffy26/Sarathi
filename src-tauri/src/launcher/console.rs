@@ -118,12 +118,25 @@ pub fn title_for(tool_name: &str) -> String {
 pub fn script_for(spec: &ToolSpec, ctx: &LaunchContext, program: &Path, args: &[String]) -> String {
     let r = &ctx.runtime;
 
-    let astra: Vec<String> = ctx
-        .mcp
-        .servers
-        .keys()
-        .map(|name| ps_literal(name))
-        .collect();
+    // What this provider was actually given, not what the registry holds.
+    //
+    // Reading the registry here is how the screen came to announce five MCP
+    // servers "CONNECTED" to providers whose generated config contained none:
+    // the two are the same list right up until a provider cannot be handed
+    // them, which is exactly the case worth reporting.
+    let delivery = spec.mcp_delivery(&ctx.mcp);
+    let astra: Vec<String> = delivery.delivered.iter().map(|name| ps_literal(name)).collect();
+    // Stated separately so the screen can distinguish "none configured" from
+    // "configured, and this provider cannot take them".
+    let astra_note = ps_literal(&match (&delivery.supported, delivery.dropped.len()) {
+        (false, 0) => String::new(),
+        (false, _) => delivery
+            .reason
+            .clone()
+            .unwrap_or_else(|| "this provider takes no MCP servers".to_string()),
+        (true, 0) => String::new(),
+        (true, n) => format!("{n} configured server(s) this provider cannot read"),
+    });
 
     let mut s = String::new();
 
@@ -145,6 +158,7 @@ $GpuName    = {gpu}
 $Vram       = {vram}
 $Placement  = {placement}
 $Astra      = @({astra})
+$AstraNote  = {astra_note}
 
 # ── Terminal capability ───────────────────────────────────────────────────
 # VT processing is enabled on Windows 10+ consoles but not guaranteed: a
@@ -218,6 +232,7 @@ function Dot($ok) {{ if ($ok) {{ C $Good ([char]0x25CF) }} else {{ C $Dim ([char
         vram = ps_vram(r.vram_total_bytes),
         placement = ps_opt(placement_line(ctx).as_deref()),
         astra = astra.join(", "),
+        astra_note = astra_note,
     ));
 
     s.push_str(
@@ -264,9 +279,13 @@ $senaLines += (Dot $gpuActive)       + ' ' + (C $Dim $(if ($Placement) { $Placem
 
 $astraLines = @()
 if ($Astra.Count -eq 0) {
-    $astraLines += (Dot $false) + ' ' + (C $Dim 'no MCP servers configured')
+    $astraLines += (Dot $false) + ' ' + (C $Dim $(if ($AstraNote) { $AstraNote } else { 'no MCP servers configured' }))
 } else {
+    # Handed over, not connected: this provider was given these servers in its
+    # config. Whether it starts them and lists their tools is its own business,
+    # and Sarathi does not claim to know from here.
     foreach ($a in $Astra) { $astraLines += (Dot $true) + ' ' + (C $Warm $a) }
+    if ($AstraNote) { $astraLines += (Dot $false) + ' ' + (C $Dim $AstraNote) }
 }
 
 $rows = [Math]::Max($astraLines.Count, $senaLines.Count)
@@ -289,7 +308,9 @@ function Step($name, $ok, $note) {
 
 Step 'Ratha'  $true        'ONLINE'
 Step 'Yoddha' $modelKnown  $(if ($modelKnown) { 'LOADED' } else { 'NOT LOADED' })
-Step 'Astra'  ($Astra.Count -gt 0) $(if ($Astra.Count -gt 0) { "$($Astra.Count) CONNECTED" } else { 'NONE' })
+# "HANDED OVER", not "CONNECTED". Sarathi writes the config; the provider makes
+# the connection, and only it knows whether the server started and answered.
+Step 'Astra'  ($Astra.Count -gt 0) $(if ($Astra.Count -gt 0) { "$($Astra.Count) HANDED OVER" } else { 'NONE' })
 Step 'Sena'   ([bool]$Backend) $(if ($Backend) { 'READY' } else { 'UNKNOWN' })
 Write-Host ''
 

@@ -192,11 +192,7 @@ pub fn apply_directive(messages: &[ChatMessage], spec: &CapabilitySpec) -> Vec<C
 
     if !has_system {
         let mut out = Vec::with_capacity(messages.len() + 1);
-        out.push(ChatMessage {
-            role: "system".to_string(),
-            content: spec.directive.clone(),
-            timestamp: None,
-        });
+        out.push(ChatMessage::new("system", spec.directive.clone()));
         out.extend(messages.iter().cloned());
         return out;
     }
@@ -206,9 +202,8 @@ pub fn apply_directive(messages: &[ChatMessage], spec: &CapabilitySpec) -> Vec<C
         .map(|m| {
             if m.role == "system" {
                 ChatMessage {
-                    role: m.role.clone(),
                     content: format!("{}\n\n{}", m.content, spec.directive),
-                    timestamp: m.timestamp.clone(),
+                    ..m.clone()
                 }
             } else {
                 m.clone()
@@ -227,11 +222,7 @@ mod tests {
     use super::*;
 
     fn msg(role: &str, content: &str) -> ChatMessage {
-        ChatMessage {
-            role: role.to_string(),
-            content: content.to_string(),
-            timestamp: None,
-        }
+        ChatMessage::new(role, content)
     }
 
     #[test]

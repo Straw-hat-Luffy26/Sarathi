@@ -510,7 +510,29 @@ fn skip_array<R: Read + Seek>(r: &mut R) -> Result<()> {
     }
 }
 
-fn seek_forward<R: Seek>(r: &mut R, bytes: u64) -> Result<()> {
+/// Largest skip worth reading through the buffer rather than seeking.
+///
+/// `Seek` on a `BufReader` throws the buffer away, because the implementation
+/// cannot know the target is inside it. That is the right trade for a long jump
+/// and a disaster for a short one: the tokenizer's `merges` array is ~293k
+/// strings of a few bytes each, and seeking past them one at a time turned a
+/// header read into ~400k `ReadFile` calls — 950 ms on an already-warm file.
+/// Reading a short skip through the buffer instead answers it from memory.
+///
+/// 64 KiB is comfortably above any single token or merge and far below the
+/// tensor data a real seek is for.
+const DISCARD_LIMIT: u64 = 64 << 10;
+
+fn seek_forward<R: Read + Seek>(r: &mut R, bytes: u64) -> Result<()> {
+    if bytes <= DISCARD_LIMIT {
+        let skipped = std::io::copy(&mut r.by_ref().take(bytes), &mut std::io::sink())
+            .context("GGUF header ended unexpectedly")?;
+        if skipped != bytes {
+            bail!("GGUF header ended after {skipped} of {bytes} skipped bytes");
+        }
+        return Ok(());
+    }
+
     let offset = i64::try_from(bytes)
         .map_err(|_| anyhow!("GGUF skip of {bytes} bytes overflows a file offset"))?;
     r.seek(SeekFrom::Current(offset))

@@ -68,11 +68,7 @@ mod tests {
 
     #[test]
     fn test_prompt_injector_preserves_context() {
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "What is my favorite language?".to_string(),
-            timestamp: None,
-        }];
+        let messages = vec![ChatMessage::new("user", "What is my favorite language?")];
 
         let user_profile = "- language: Rust\n- editor: VSCode";
         let project_name = "TrackOcean";

@@ -103,11 +103,7 @@ fn main() {
                 println!("  cpu_moe_layers: {}", info.cpu_moe_layers);
                 println!("  context      : {}", info.context_length);
 
-                let messages = vec![ChatMessage {
-                    role: "user".into(),
-                    content: "Reply with exactly one short sentence: what is 2 + 2?".into(),
-                    timestamp: None,
-                }];
+                let messages = vec![ChatMessage::new("user", "Reply with exactly one short sentence: what is 2 + 2?")];
                 let params = GenerationParams { max_tokens: 24, ..Default::default() };
 
                 match manager.generate_direct(&messages, &params, |_| {}) {

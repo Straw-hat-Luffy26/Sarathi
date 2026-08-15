@@ -187,19 +187,15 @@ impl MessagesRequest {
         if let Some(system) = &self.system {
             let text = system.to_text();
             if !text.trim().is_empty() {
-                out.push(ChatMessage {
-                    role: "system".to_string(),
-                    content: text,
-                    timestamp: None,
-                });
+                out.push(ChatMessage::new("system", text));
             }
         }
 
-        out.extend(self.messages.iter().map(|m| ChatMessage {
-            role: m.role.clone(),
-            content: m.content.to_text(),
-            timestamp: None,
-        }));
+        out.extend(
+            self.messages
+                .iter()
+                .map(|m| ChatMessage::new(m.role.clone(), m.content.to_text())),
+        );
 
         out
     }

@@ -36,7 +36,9 @@ impl SessionManager {
             model_id: model_id.to_string(),
             quantization: quantization.to_string(),
             loaded_at: chrono::Utc::now().to_rfc3339(),
-            auto_restore_enabled: true,
+            // Never auto-restore. Persisting last-selected model for UI convenience is OK,
+            // but automatic loading commits VRAM and hides the decision from the user.
+            auto_restore_enabled: false,
         };
 
         fs::create_dir_all(app_data_dir)?;
@@ -88,7 +90,7 @@ mod tests {
         assert_eq!(loaded.provider_id, "huggingface");
         assert_eq!(loaded.model_id, "meta-llama/Llama-3.2-1B");
         assert_eq!(loaded.quantization, "Q8_0");
-        assert!(loaded.auto_restore_enabled);
+        assert!(!loaded.auto_restore_enabled, "session should never enable auto-restore");
 
         SessionManager::clear_session(path).unwrap();
         assert!(SessionManager::load_session(path).unwrap().is_none());

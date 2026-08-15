@@ -117,6 +117,8 @@ mod tests {
                 env_remove: vec![],
                 client_config: None,
             },
+            mcp: crate::launcher::spec::McpSupport::default(),
+            min_context: None,
             user_defined: false,
         }
     }

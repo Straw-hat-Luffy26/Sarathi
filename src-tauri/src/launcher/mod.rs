@@ -31,6 +31,11 @@ use crate::system_analyzer::process_utils::create_hidden_command;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "state", rename_all = "camelCase")]
 pub enum ToolState {
+    /// Nobody has looked yet. Distinct from `NotInstalled` because "we do not
+    /// know" and "it is not there" put different things on the card, and
+    /// showing the second while meaning the first offers an Install button for
+    /// something already installed.
+    Checking,
     /// Checked and absent — offer Install.
     NotInstalled,
     /// Present and identified — offer Launch.
@@ -107,6 +112,140 @@ impl LaunchedProcesses {
         self.forget(tool_id);
         None
     }
+}
+
+/// Tool detection, remembered between refreshes of the Launch screen.
+///
+/// Detecting one tool costs a `where` scan and a `--version` run: on the
+/// machine this was measured on, 1.8s and 3.2s respectively, per tool, because
+/// each of these programs is a Node or Bun bundle that has to boot before it
+/// will say its own version. Four shipped tools made that roughly twenty
+/// seconds — and the Launch screen was re-running all of it every two seconds,
+/// so refreshes overlapped, the blocking pool filled with `where` processes,
+/// and the first paint the user was waiting for never arrived. That is the
+/// "Checking what's installed…" that lasted minutes.
+///
+/// Nothing about the answer changes on a two-second timescale, so it is
+/// computed once — in the background, at startup, before anyone opens the
+/// screen — and re-computed only when it goes stale or when Sarathi does
+/// something that could have changed it.
+pub struct DetectionCache {
+    entries: Mutex<HashMap<String, (std::time::Instant, ToolState)>>,
+    /// Set while a background refresh is running, so a burst of polls produces
+    /// one sweep rather than one each.
+    refreshing: std::sync::atomic::AtomicBool,
+}
+
+/// How long a detection stands before it is refreshed in the background. Long
+/// enough that polling is free, short enough that an install done in a terminal
+/// shows up without restarting Sarathi.
+const DETECTION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Default for DetectionCache {
+    fn default() -> Self {
+        Self { entries: Mutex::new(HashMap::new()), refreshing: false.into() }
+    }
+}
+
+impl DetectionCache {
+    /// The best answer available right now, with no waiting.
+    ///
+    /// Returns `Checking` for a tool never yet detected and the previous answer
+    /// for one whose detection has gone stale, and starts a background sweep
+    /// when either is true. It never runs a subprocess on the caller's thread.
+    pub fn states(&self, specs: &[ToolSpec]) -> (Vec<ToolState>, bool) {
+        let now = std::time::Instant::now();
+        let entries = self.entries.lock().expect("detection cache poisoned");
+
+        let mut stale = false;
+        let states = specs
+            .iter()
+            .map(|spec| match entries.get(&spec.id) {
+                Some((at, state)) if now.duration_since(*at) < DETECTION_TTL => state.clone(),
+                Some((_, state)) => {
+                    stale = true;
+                    state.clone()
+                }
+                None => {
+                    stale = true;
+                    ToolState::Checking
+                }
+            })
+            .collect();
+
+        (states, stale)
+    }
+
+    /// Detects every tool, concurrently, and stores the results.
+    ///
+    /// Concurrent because the four probes share nothing: run one after another
+    /// they add up, run together they cost whatever the slowest one costs.
+    pub fn refresh(&self, specs: &[ToolSpec]) {
+        use std::sync::atomic::Ordering;
+        if self.refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _release = scopeguard(|| self.refreshing.store(false, Ordering::SeqCst));
+        let _stage = crate::diagnostics::Stage::new("launcher: detect every tool");
+
+        let detected: Vec<(String, ToolState)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = specs
+                .iter()
+                .map(|spec| scope.spawn(move || (spec.id.clone(), detect(spec))))
+                .collect();
+            handles.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+
+        let now = std::time::Instant::now();
+        let mut entries = self.entries.lock().expect("detection cache poisoned");
+        for (id, state) in detected {
+            entries.insert(id, (now, state));
+        }
+    }
+
+    /// Forgets one tool, so the next look re-detects it.
+    ///
+    /// Called after an install or a launch: those are the moments the cached
+    /// answer is known to be wrong, and waiting out the TTL would show the user
+    /// the state before the thing they just did.
+    pub fn invalidate(&self, tool_id: &str) {
+        self.entries.lock().expect("detection cache poisoned").remove(tool_id);
+    }
+
+    /// Forgets everything, for the Refresh button.
+    ///
+    /// Refresh has to mean refresh. Serving the cache to somebody who pressed
+    /// it would be the same lie in the other direction from the one the cache
+    /// fixes.
+    pub fn forget_all(&self) {
+        self.entries.lock().expect("detection cache poisoned").clear();
+    }
+
+    /// Runs the first sweep at startup, off the UI thread.
+    pub fn warm(app: &tauri::AppHandle) {
+        use tauri::Manager;
+        let app = app.clone();
+        tauri::async_runtime::spawn(async move {
+            let Some(cache) = app.try_state::<std::sync::Arc<DetectionCache>>() else { return };
+            let cache = cache.inner().clone();
+            let specs = match app.path().app_data_dir() {
+                Ok(dir) => registry::load(&dir).tools,
+                Err(_) => spec::builtin_tools(),
+            };
+            let _ = tokio::task::spawn_blocking(move || cache.refresh(&specs)).await;
+        });
+    }
+}
+
+/// Runs a closure on the way out of a scope, whatever happens in it.
+fn scopeguard<F: FnMut()>(f: F) -> impl Drop {
+    struct Guard<F: FnMut()>(F);
+    impl<F: FnMut()> Drop for Guard<F> {
+        fn drop(&mut self) {
+            (self.0)();
+        }
+    }
+    Guard(f)
 }
 
 /// Locates a real executable for `command`.
@@ -200,8 +339,23 @@ pub fn detect(spec: &ToolSpec) -> ToolState {
 }
 
 /// True when the package manager an entry needs is available.
+///
+/// Memoised for the life of the process. This is a `where` scan, and it was
+/// running once per tool on every refresh of a screen that refreshes every two
+/// seconds — asking, four times over, whether npm is still installed. A package
+/// manager appearing while Sarathi is open is worth a restart; twenty seconds
+/// of subprocess a minute is not.
 pub fn manager_available(manager: PackageManager) -> bool {
-    resolve_executable(manager.program()).is_some()
+    static KNOWN: Mutex<Option<Vec<(PackageManager, bool)>>> = Mutex::new(None);
+
+    let mut known = KNOWN.lock().expect("manager cache poisoned");
+    let cache = known.get_or_insert_with(Vec::new);
+    if let Some((_, found)) = cache.iter().find(|(m, _)| *m == manager) {
+        return *found;
+    }
+    let found = resolve_executable(manager.program()).is_some();
+    cache.push((manager, found));
+    found
 }
 
 /// Installs a tool through its package manager.
@@ -429,6 +583,8 @@ mod tests {
                 env_remove: vec![],
                 client_config: None,
             },
+            mcp: crate::launcher::spec::McpSupport::default(),
+            min_context: None,
             user_defined: false,
         }
     }

@@ -84,8 +84,14 @@ pub async fn unload_active_model(
         .map_err(|e| e.to_string())
 }
 
+/// What the runtime is doing right now.
+///
+/// `async` even though the body is two lock-free reads: a plain `fn` command
+/// runs on the main thread, and this is called by every screen on mount. Both
+/// reads are answered from the manager's status mirror rather than the runtime
+/// mutex, which a generation holds from its first token to its last.
 #[tauri::command]
-pub fn get_inference_status(
+pub async fn get_inference_status(
     inference_mgr: State<'_, Arc<InferenceManager>>,
 ) -> Result<InferenceStatusPayload, String> {
     let status = inference_mgr.get_status();

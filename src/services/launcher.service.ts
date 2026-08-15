@@ -15,6 +15,9 @@ export type ToolProtocol = 'openai' | 'anthropic';
  * from a Rust enum, flattened into the same object as the tool's details.
  */
 export type ToolState =
+  /** Detection has not answered yet. Distinct from `notInstalled`, which would
+   *  offer an Install button for something that may already be there. */
+  | { state: 'checking' }
   | { state: 'notInstalled' }
   | { state: 'ready'; version: string }
   | { state: 'running'; pid: number }
@@ -57,9 +60,20 @@ export interface LaunchOverview {
   blockedReason?: string | null;
 }
 
-/** Tools and live server status in one call, so the two cannot disagree. */
+/**
+ * Tools and live server status in one call, so the two cannot disagree.
+ *
+ * Cheap on purpose: tool detection is cached in the backend, so the poll that
+ * keeps the server panel live no longer re-runs a `where` and a `--version`
+ * for every tool. Use {@link redetectTools} when the user asks for a refresh.
+ */
 export function getLaunchOverview(): Promise<LaunchOverview> {
   return invoke<LaunchOverview>('get_launch_overview');
+}
+
+/** Throws away cached detection and looks again. The Refresh button. */
+export function redetectTools(): Promise<void> {
+  return invoke<void>('redetect_tools');
 }
 
 /**

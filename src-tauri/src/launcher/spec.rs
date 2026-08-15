@@ -150,6 +150,68 @@ pub struct LaunchSpec {
     pub client_config: Option<ClientConfig>,
 }
 
+/// Whether a provider receives Sarathi's MCP servers, and in which spelling.
+///
+/// This is the whole of the provider-side MCP contract. A provider declares
+/// *that* it can read MCP config and *which dialect* it wants; it never names a
+/// server. Adding a server to `mcp.json` therefore reaches every provider that
+/// declares support, with no provider touched — and adding a provider is one
+/// variant of [`crate::launcher::mcp::McpDialect`] plus a placeholder in its
+/// config template, with no server touched.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum McpSupport {
+    /// This provider has no MCP client, or Sarathi has no way to configure it.
+    /// The reason is recorded so the UI can say why rather than showing an
+    /// unexplained blank.
+    Unsupported { reason: String },
+    /// The servers are substituted into the provider's own generated config
+    /// through `{mcpServers}`, in `dialect`.
+    Config {
+        dialect: crate::launcher::mcp::McpDialect,
+        /// What the provider calls the key they land under, for the UI and for
+        /// the launch log — `mcpServers`, `mcp`, `mcp.servers`, `mcp_servers`.
+        key: String,
+    },
+}
+
+impl Default for McpSupport {
+    fn default() -> Self {
+        // A user-defined tool says nothing about MCP until it does. Defaulting
+        // to unsupported keeps the claim honest rather than promising servers
+        // that were never written anywhere.
+        Self::Unsupported {
+            reason: "this tool does not declare MCP support".to_string(),
+        }
+    }
+}
+
+impl McpSupport {
+    /// Shorthand for the common case.
+    fn config(dialect: crate::launcher::mcp::McpDialect, key: &str) -> Self {
+        Self::Config { dialect, key: key.to_string() }
+    }
+
+    pub fn is_supported(&self) -> bool {
+        matches!(self, Self::Config { .. })
+    }
+
+    pub fn dialect(&self) -> Option<crate::launcher::mcp::McpDialect> {
+        match self {
+            Self::Config { dialect, .. } => Some(*dialect),
+            Self::Unsupported { .. } => None,
+        }
+    }
+
+    /// The config key the servers land under, for reporting.
+    pub fn key(&self) -> Option<&str> {
+        match self {
+            Self::Config { key, .. } => Some(key),
+            Self::Unsupported { .. } => None,
+        }
+    }
+}
+
 /// A complete tool definition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -166,6 +228,31 @@ pub struct ToolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub install: Option<InstallSpec>,
     pub launch: LaunchSpec,
+    /// Whether this provider can be handed Sarathi's MCP servers, and how.
+    ///
+    /// Declared rather than inferred. A provider that simply omitted the
+    /// `{mcpServers}` placeholder from its config template looked identical, in
+    /// the source, to one that had no MCP support — which is how Hermes and
+    /// OpenClaw silently received no servers for as long as they did while the
+    /// startup screen reported them connected. Stating it makes the omission a
+    /// decision someone has to write down, and lets [`ToolSpec::validate`]
+    /// refuse a provider that claims support and then does not substitute it.
+    #[serde(default)]
+    pub mcp: McpSupport,
+    /// Smallest context window this tool will start at, in tokens.
+    ///
+    /// Most agents work with whatever they are given. A few refuse below a
+    /// floor of their own rather than degrading — OpenClaw blocks any model
+    /// under 16000 tokens — and a launch against Sarathi's smaller working
+    /// context then opens a terminal that exits on its own error message.
+    ///
+    /// Declaring the floor here keeps it a property of the tool that has it:
+    /// nothing else in a launch consults it, so tools without one are
+    /// unaffected. When set, the launch raises the loaded model's context to
+    /// meet it — as far as that model and this machine allow, never past the
+    /// model's own maximum.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_context: Option<u32>,
     /// True for entries the user added, so the UI can mark them unverified.
     #[serde(default)]
     pub user_defined: bool,
@@ -193,8 +280,128 @@ impl ToolSpec {
         if self.launch.command.trim().is_empty() {
             return Err(format!("tool '{}' has no command to start", self.id));
         }
+
+        // A declaration nobody honours is worse than no declaration: the UI
+        // reports servers as delivered while the generated config carries none.
+        // This is the check that stops that shipping again.
+        if self.mcp.is_supported() && !self.substitutes_mcp() {
+            return Err(format!(
+                "tool '{}' declares MCP support but its generated config never substitutes \
+                 {PLACEHOLDER_MCP} (or {PLACEHOLDER_MCP_YAML}), so no server would reach it",
+                self.id
+            ));
+        }
+        if !self.mcp.is_supported() && self.substitutes_mcp() {
+            return Err(format!(
+                "tool '{}' substitutes MCP servers into its config but declares no MCP \
+                 support, so the UI would not know they were delivered",
+                self.id
+            ));
+        }
+
         Ok(())
     }
+
+    /// Whether this tool's generated config actually places the servers.
+    ///
+    /// Checked against the config body and the launch arguments both: a client
+    /// pointed at a separate MCP file takes the path on its command line, and
+    /// the servers land in the file that path names.
+    pub fn substitutes_mcp(&self) -> bool {
+        let in_config = self
+            .launch
+            .client_config
+            .as_ref()
+            .is_some_and(|c| {
+                c.contents.contains(PLACEHOLDER_MCP) || c.contents.contains(PLACEHOLDER_MCP_YAML)
+            });
+        let in_args = self.launch.args.iter().any(|a| a.contains(PLACEHOLDER_MCP));
+        in_config || in_args
+    }
+
+    /// The MCP servers this tool would be given, as its config will spell them.
+    ///
+    /// The single place anything asks "what did this provider actually get?".
+    /// Reporting reads this rather than the registry, so a provider that
+    /// receives nothing cannot be displayed as though it received everything.
+    /// How much context this tool will plausibly need, given what Sarathi is
+    /// about to hand it.
+    ///
+    /// Not a guess about the tool: a measurement of the payload. An agentic
+    /// client sends its whole system prompt, its own tool definitions and every
+    /// MCP tool it was given, on **every** turn. Measured against Claude Code
+    /// with the six servers this machine exports: 122 tools, 174 KB of JSON
+    /// schema, 43 000 tokens of definitions on top of 5 000 tokens of actual
+    /// conversation.
+    ///
+    /// So the figure has to move with the registry. It was static — absent, in
+    /// fact, for every tool but OpenClaw — which is why adding MCP servers
+    /// silently broke every provider: the request grew by 40 000 tokens and the
+    /// context it had to fit in stayed at 8192.
+    ///
+    /// Returns `None` for a tool that receives no tools at all; there is nothing
+    /// to make room for.
+    pub fn preferred_context(&self, registry: &crate::launcher::mcp::McpRegistry) -> Option<u32> {
+        /// Room for the client's own system prompt, its built-in tools and a
+        /// few turns of conversation, before any MCP server is added.
+        const AGENT_BASE: u32 = 16_384;
+        /// Per MCP server. Averaged over the six measured here, whose schemas
+        /// run from a few hundred tokens (git) to several thousand (playwright,
+        /// notebooklm); rounding up is cheaper than rounding down, because
+        /// under-provisioning fails the request outright.
+        const PER_SERVER: u32 = 8_192;
+
+        let delivery = self.mcp_delivery(registry);
+        if !delivery.supported {
+            return None;
+        }
+        Some(AGENT_BASE + PER_SERVER * delivery.delivered.len() as u32)
+    }
+
+    pub fn mcp_delivery(&self, registry: &crate::launcher::mcp::McpRegistry) -> McpDelivery {
+        match &self.mcp {
+            McpSupport::Unsupported { reason } => McpDelivery {
+                supported: false,
+                key: None,
+                delivered: Vec::new(),
+                dropped: registry.names(),
+                reason: Some(reason.clone()),
+            },
+            McpSupport::Config { dialect, key } => {
+                let dropped = registry.unrepresentable(*dialect);
+                let delivered: Vec<String> = registry
+                    .names()
+                    .into_iter()
+                    .filter(|n| !dropped.contains(n))
+                    .collect();
+                McpDelivery {
+                    supported: true,
+                    key: Some(key.clone()),
+                    delivered,
+                    dropped,
+                    reason: None,
+                }
+            }
+        }
+    }
+}
+
+/// What one provider was actually handed, as opposed to what exists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct McpDelivery {
+    pub supported: bool,
+    /// The provider's own config key, e.g. `mcp.servers`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+    /// Servers written into this provider's config.
+    pub delivered: Vec<String>,
+    /// Servers the registry has that this provider will not receive, either
+    /// because it has no MCP client or because its dialect cannot express them.
+    pub dropped: Vec<String>,
+    /// Why nothing was delivered, when nothing was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 /// Placeholders available in [`LaunchSpec::env`] values.
@@ -227,6 +434,13 @@ pub const PLACEHOLDER_MAX_OUTPUT: &str = "{maxOutputTokens}";
 /// it is never escaped — escaping it would turn the object into a string and
 /// the client would find no servers at all.
 pub const PLACEHOLDER_MCP: &str = "{mcpServers}";
+/// The shared MCP servers as an indented YAML block, for a client whose config
+/// is YAML rather than JSON.
+///
+/// A JSON object is technically valid YAML, but only as a one-line flow mapping
+/// — which turns a file the user is invited to edit into an unreadable line.
+/// This renders block style at the indentation the placeholder sits at.
+pub const PLACEHOLDER_MCP_YAML: &str = "{mcpServersYaml}";
 
 /// Everything Sarathi knows at the moment a tool is started.
 ///
@@ -351,12 +565,19 @@ pub fn fill_placeholders_with(
         }
     };
 
+    // OpenClaw's `mcp` key holds `{"servers": …}` rather than the bare map, so
+    // the dialect decides the shape as well as the spelling.
+    let mcp_json = match dialect {
+        crate::launcher::mcp::McpDialect::OpenClaw => ctx.mcp.render_openclaw_mcp(),
+        other => ctx.mcp.render(other),
+    };
+
     // The v1 placeholder is replaced first: the shorter one is a prefix of it,
     // and the other order would leave a stray "V1" on the end of the address.
-    template
+    let filled = template
         // Not passed through `esc`: this one substitutes a JSON object, and
         // escaping it would hand the client a string where it expects a map.
-        .replace(PLACEHOLDER_MCP, &ctx.mcp.render(dialect))
+        .replace(PLACEHOLDER_MCP, &mcp_json)
         .replace(PLACEHOLDER_BASE_V1, &esc(&v1))
         .replace(PLACEHOLDER_BASE, &esc(&base))
         .replace(PLACEHOLDER_MODEL_NAME, &esc(&ctx.model_name))
@@ -364,7 +585,35 @@ pub fn fill_placeholders_with(
         .replace(PLACEHOLDER_CLIENT_DIR, &esc(&ctx.client_dir))
         // Numbers need no escaping in either JSON or YAML.
         .replace(PLACEHOLDER_MAX_OUTPUT, &ctx.max_output_tokens().to_string())
-        .replace(PLACEHOLDER_CONTEXT, &ctx.context_length.to_string())
+        .replace(PLACEHOLDER_CONTEXT, &ctx.context_length.to_string());
+
+    fill_yaml_mcp(&filled, ctx, dialect)
+}
+
+/// Replaces `{mcpServersYaml}` with a block mapping indented to where it sits.
+///
+/// Done line-wise rather than by `str::replace` because the indentation is
+/// whatever the surrounding document uses, and a block emitted at column zero
+/// under an indented key is a different document.
+fn fill_yaml_mcp(
+    template: &str,
+    ctx: &LaunchContext,
+    dialect: crate::launcher::mcp::McpDialect,
+) -> String {
+    if !template.contains(PLACEHOLDER_MCP_YAML) {
+        return template.to_string();
+    }
+
+    let mut out = String::with_capacity(template.len());
+    for line in template.split_inclusive('\n') {
+        match line.find(PLACEHOLDER_MCP_YAML) {
+            Some(col) if line[..col].trim().is_empty() => {
+                out.push_str(&ctx.mcp.render_yaml_block(dialect, col));
+            }
+            _ => out.push_str(line),
+        }
+    }
+    out
 }
 
 /// Decides whether version output proves this is the expected tool.
@@ -473,6 +722,8 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     mcp_dialect: crate::launcher::mcp::McpDialect::Standard,
                 }),
             },
+            mcp: McpSupport::config(crate::launcher::mcp::McpDialect::Standard, "mcpServers"),
+            min_context: None,
             user_defined: false,
         },
         ToolSpec {
@@ -548,6 +799,8 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                     ),
                 }),
             },
+            mcp: McpSupport::config(crate::launcher::mcp::McpDialect::Opencode, "mcp"),
+            min_context: None,
             user_defined: false,
         },
         ToolSpec {
@@ -597,11 +850,13 @@ pub fn builtin_tools() -> Vec<ToolSpec> {
                 ],
                 client_config: Some(ClientConfig {
                     file_name: "config.yaml".into(),
-                    // Hermes keeps its config in YAML and has no documented
-                    // `mcpServers` key, so nothing is injected here; the
-                    // dialect is stated rather than defaulted so a future
-                    // change is a one-line edit, not an archaeology exercise.
-                    mcp_dialect: crate::launcher::mcp::McpDialect::Standard,
+                    // Hermes does have an MCP client — `hermes_cli/mcp_config.py`
+                    // reads `mcp_servers` from this very file, and ships a whole
+                    // `hermes mcp` command group around it. An earlier note here
+                    // said it had no such key, and on that basis Hermes was
+                    // handed no servers at all while the startup screen reported
+                    // them connected.
+                    mcp_dialect: crate::launcher::mcp::McpDialect::Hermes,
                     // Values are JSON-escaped on substitution; a double-quoted
                     // YAML scalar accepts the same \" and \\ escapes, so the
                     // shared escaping is correct here too.
@@ -612,10 +867,14 @@ model:
   model: "{PLACEHOLDER_MODEL}"
   base_url: "{PLACEHOLDER_BASE_V1}"
   api_key: "sarathi-local"
+mcp_servers:
+  {PLACEHOLDER_MCP_YAML}
 "#
                     ),
                 }),
             },
+            mcp: McpSupport::config(crate::launcher::mcp::McpDialect::Hermes, "mcp_servers"),
+            min_context: None,
             user_defined: false,
         },
         ToolSpec {
@@ -674,7 +933,11 @@ model:
                 ],
                 client_config: Some(ClientConfig {
                     file_name: "openclaw.json".into(),
-                    mcp_dialect: crate::launcher::mcp::McpDialect::Standard,
+                    // OpenClaw reads `mcp.servers`, not `mcpServers` — see
+                    // `McpConfig` in its plugin-sdk. Writing the outer key
+                    // wrongly, or omitting it as this template used to, is
+                    // indistinguishable from writing nothing at all.
+                    mcp_dialect: crate::launcher::mcp::McpDialect::OpenClaw,
                     // `mode: merge` keeps OpenClaw's built-in provider list and
                     // adds Sarathi to it, rather than replacing the set.
                     //
@@ -687,6 +950,7 @@ model:
   "gateway": {{
     "mode": "local"
   }},
+  "mcp": {PLACEHOLDER_MCP},
   "models": {{
     "mode": "merge",
     "providers": {{
@@ -714,6 +978,16 @@ model:
                     ),
                 }),
             },
+            // OpenClaw's embedded agent refuses to run a model whose context is
+            // below its own hard floor of 16000 tokens — it reads the figure
+            // straight out of the `contextTokens` above and exits with
+            // "Model context window too small" before the first turn. It also
+            // warns below 32000, so this is a floor, not a target.
+            //
+            // 16384 is the first power of two clear of the floor, and small
+            // enough to stay affordable on the cards Sarathi targets.
+            mcp: McpSupport::config(crate::launcher::mcp::McpDialect::OpenClaw, "mcp.servers"),
+            min_context: Some(16384),
             user_defined: false,
         },
     ]
@@ -1022,11 +1296,22 @@ mod tests {
         assert_eq!(env.get("HERMES_HOME").unwrap(), &ctx.client_dir);
 
         let cfg = tool.launch.client_config.as_ref().unwrap();
-        let body = fill_placeholders(&cfg.contents, &ctx, true);
+        let body = fill_placeholders_with(&cfg.contents, &ctx, true, cfg.mcp_dialect);
         assert_eq!(cfg.file_name, "config.yaml", "hermes reads config.yaml from HERMES_HOME");
         assert!(body.contains("base_url: \"http://127.0.0.1:11435/v1\""), "got: {body}");
         assert!(body.contains("provider: \"custom\""), "got: {body}");
-        assert!(!body.contains('{'), "every placeholder should be filled: {body}");
+        // No placeholder left behind. Checked by name rather than by looking
+        // for a brace: an empty MCP block renders as `{}`, which is a filled
+        // placeholder and not an unfilled one.
+        for placeholder in [
+            PLACEHOLDER_MCP,
+            PLACEHOLDER_MCP_YAML,
+            PLACEHOLDER_MODEL,
+            PLACEHOLDER_BASE_V1,
+            PLACEHOLDER_CLIENT_DIR,
+        ] {
+            assert!(!body.contains(placeholder), "{placeholder} was not filled: {body}");
+        }
 
         // An inherited OpenAI key would win over the generated config.
         assert!(tool.launch.env_remove.contains(&"OPENAI_API_KEY".to_string()));
@@ -1073,6 +1358,57 @@ mod tests {
         assert_eq!(parsed["gateway"]["mode"], "local", "gateway.mode is mandatory");
     }
 
+    /// OpenClaw's agent reads `contextTokens` and blocks below 16000, so a
+    /// launch at Sarathi's 8192-token working context opened a window that
+    /// exited on "Model context window too small (8192 tokens)".
+    #[test]
+    fn openclaw_declares_the_context_floor_its_own_agent_enforces() {
+        let tool = builtin_tools().into_iter().find(|t| t.id == "openclaw").unwrap();
+
+        let floor = tool.min_context.expect("openclaw refuses to run below a floor");
+        assert!(floor >= 16_000, "below OpenClaw's hard minimum, got {floor}");
+        assert_eq!(floor, 16_384, "the first power of two clear of the floor");
+    }
+
+    /// The floor belongs to the tool that has one. Declaring it globally would
+    /// re-plan every other tool's model for a context none of them asked for.
+    #[test]
+    fn no_other_shipped_tool_carries_a_context_floor() {
+        for tool in builtin_tools().into_iter().filter(|t| t.id != "openclaw") {
+            assert!(
+                tool.min_context.is_none(),
+                "'{}' should take whatever the model is loaded with, got {:?}",
+                tool.id,
+                tool.min_context
+            );
+        }
+    }
+
+    /// The config states the context the model is really loaded with, so the
+    /// floor is only met once the load has been raised to match it. Both keys
+    /// have to carry it: OpenClaw reads `contextTokens` first and only falls
+    /// back to `contextWindow`.
+    #[test]
+    fn a_raised_load_reaches_openclaws_config_in_both_keys() {
+        let tool = builtin_tools().into_iter().find(|t| t.id == "openclaw").unwrap();
+        let floor = tool.min_context.unwrap();
+
+        let mut ctx = ctx_on(11435);
+        ctx.context_length = floor;
+
+        let cfg = tool.launch.client_config.as_ref().unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(&fill_placeholders(&cfg.contents, &ctx, true)).unwrap();
+        let model = &parsed["models"]["providers"]["sarathi"]["models"][0];
+
+        assert_eq!(model["contextTokens"], floor, "the key OpenClaw reads first");
+        assert_eq!(model["contextWindow"], floor, "and the one it falls back to");
+        assert!(
+            model["maxTokens"].as_u64().unwrap() < u64::from(floor),
+            "a reply budget equal to the context leaves no room for the prompt"
+        );
+    }
+
     /// Started bare, `openclaw` prints its help and exits — the launch looked
     /// like a console window that opened and closed. It needs a subcommand.
     #[test]
@@ -1090,25 +1426,22 @@ mod tests {
         servers.insert(
             "searxng".to_string(),
             McpServerSpec {
-                command: "mcp-searxng".into(),
-                args: vec![],
                 env: BTreeMap::from([(
                     "SEARXNG_URL".to_string(),
                     "http://127.0.0.1:8888".to_string(),
                 )]),
-                disabled: false,
-                description: None,
+                ..McpServerSpec::stdio("mcp-searxng")
             },
         );
         servers.insert(
             "research".to_string(),
             McpServerSpec {
-                command: "python".into(),
-                args: vec![r"C:\repo\server.py".into()],
-                env: BTreeMap::new(),
-                disabled: false,
-                description: None,
-            },
+                    args: vec![r"C:\repo\server.py".into()],
+                    env: BTreeMap::new(),
+                    disabled: false,
+                    description: None,
+                    ..McpServerSpec::stdio("python")
+                },
         );
 
         let mut ctx = ctx_on(port);

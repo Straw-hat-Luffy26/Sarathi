@@ -1,4 +1,12 @@
 //! Phase 4 Tauri Commands for Model Downloads & Storage Management
+//!
+//! **Every command here that touches the disk is `async fn` deliberately.**
+//! Tauri runs a command declared as a plain `fn` inline on the thread that
+//! received the IPC message — the main thread, which on Windows also pumps the
+//! window's message loop. A synchronous `get_installed_models` therefore stopped
+//! the window answering Windows for as long as the scan took, which is what
+//! `Sarathi (Not Responding)` is. Async commands run on the async runtime
+//! instead, and the blocking work inside them goes to `spawn_blocking`.
 
 use tauri::{AppHandle, Manager, State};
 use std::sync::Arc;
@@ -6,7 +14,7 @@ use anyhow::Result;
 
 use crate::download_manager::traits::{DownloadTask, InstalledModel, StorageSummary};
 use crate::download_manager::DownloadManager;
-use crate::model_manager::ModelManager;
+use crate::model_manager::{ModelManager, ModelStore};
 
 #[tauri::command]
 pub async fn start_model_download(
@@ -84,20 +92,25 @@ pub fn get_active_downloads(
 }
 
 #[tauri::command]
-pub fn get_installed_models(
+pub async fn get_installed_models(
     app_handle: AppHandle,
+    store: State<'_, Arc<ModelStore>>,
 ) -> Result<Vec<InstalledModel>, String> {
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve AppData directory: {}", e))?;
 
-    Ok(ModelManager::list_installed_models(&app_data_dir))
+    // Cloned out of the shared listing rather than returned by reference: the
+    // result is about to be serialised to the webview anyway, and holding the
+    // `Arc` no longer would keep a scan alive past its usefulness.
+    Ok(store.inner().listing(&app_data_dir).await.as_ref().clone())
 }
 
 #[tauri::command]
-pub fn delete_installed_model(
+pub async fn delete_installed_model(
     app_handle: AppHandle,
+    store: State<'_, Arc<ModelStore>>,
     provider_id: String,
     model_id: String,
     quantization: String,
@@ -107,18 +120,31 @@ pub fn delete_installed_model(
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve AppData directory: {}", e))?;
 
-    ModelManager::delete_installed_model(&app_data_dir, &provider_id, &model_id, &quantization)
-        .map_err(|e| e.to_string())
+    // Removing gigabytes is filesystem work; it does not belong on the UI thread
+    // any more than reading them does.
+    let dir = app_data_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        ModelManager::delete_installed_model(&dir, &provider_id, &model_id, &quantization)
+    })
+    .await
+    .map_err(|e| format!("delete task failed: {e}"))?
+    .map_err(|e| e.to_string())?;
+
+    // Sarathi changed the store itself, so the next look must not be answered
+    // from the scan taken before the deletion.
+    store.invalidate();
+    Ok(())
 }
 
 #[tauri::command]
-pub fn get_storage_summary(
+pub async fn get_storage_summary(
     app_handle: AppHandle,
+    store: State<'_, Arc<ModelStore>>,
 ) -> Result<StorageSummary, String> {
     let app_data_dir = app_handle
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve AppData directory: {}", e))?;
 
-    Ok(ModelManager::get_storage_summary(&app_data_dir))
+    Ok(store.inner().summary(&app_data_dir).await)
 }

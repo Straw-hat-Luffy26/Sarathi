@@ -4,6 +4,7 @@
 pub mod core;
 pub mod database;
 pub mod config;
+pub mod diagnostics;
 pub mod logging;
 pub mod commands;
 
@@ -23,6 +24,7 @@ pub mod lora;
 pub mod installer;
 pub mod plugins;
 pub mod memory_engine;
+pub mod notebooklm;
 
 use std::sync::Arc;
 use tauri::Manager;
@@ -68,7 +70,17 @@ pub fn run() {
         .manage(download_manager)
         .manage(inference_manager)
         .setup(|app| {
+            // Runs on the main thread, before the window starts pumping. From
+            // here on, anything expensive that lands on this thread is a bug the
+            // diagnostics module will name rather than a freeze a user has to
+            // describe. See `diagnostics`.
+            diagnostics::mark_ui_thread();
+
             info!("Sarathi application starting...");
+
+            // One reader for the model store, shared by every screen that asks
+            // what is installed. Owns the scan, its cache and its single-flight.
+            app.manage(Arc::new(model_manager::ModelStore::new()));
 
             // Resolve app_data_dir dynamically from Tauri app handle
             let app_data_dir = app
@@ -120,6 +132,28 @@ pub fn run() {
 
             // Tracks tools the Launch screen started, so cards can show Running.
             app.manage(Arc::new(launcher::LaunchedProcesses::default()));
+            app.manage(Arc::new(launcher::DetectionCache::default()));
+
+            // NotebookLM's connection belongs to the application, not to the
+            // Launch page. Held here it survives every tab switch, model load
+            // and re-render — which is the whole reason a signed-in user is no
+            // longer asked to sign in again.
+            let notebooklm = Arc::new(notebooklm::manager::NotebookLmManager::new(
+                app_data_dir.clone(),
+                Arc::new(app.handle().clone()),
+            ));
+            app.manage(notebooklm.clone());
+
+            // Detect once at startup, off the UI thread, so the answer is ready
+            // before the user opens Launch — and drop a registry entry whose
+            // server has since been uninstalled. Nothing is added here, and
+            // nothing here can open a browser.
+            commands::notebooklm::reconcile_at_startup(notebooklm);
+
+            // Warm the provider probe too: `where` plus a `--version` for each
+            // tool is seconds of subprocess, and paying for it here means the
+            // Launch page renders from cache instead of waiting for it.
+            launcher::DetectionCache::warm(app.handle());
 
             let app_for_gateway = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -183,6 +217,9 @@ pub fn run() {
                 tauri::async_runtime::spawn(async move {
                     let Some(dir) = app_data else { return };
 
+                    // CRITICAL: Double safety check. Sessions now always have auto_restore_enabled=false,
+                    // so this filter will reject all sessions. Combined with the config default of false,
+                    // this means auto-load is disabled by default and cannot accidentally trigger.
                     let restore = ai_engine::session::SessionManager::load_session(&dir)
                         .ok()
                         .flatten()
@@ -315,12 +352,26 @@ pub fn run() {
 
             // Launch section — start coding tools already connected
             commands::launcher::get_launch_overview,
+            commands::launcher::redetect_tools,
             commands::launcher::preview_tool_install,
             commands::launcher::install_tool,
             commands::launcher::launch_tool,
             commands::launcher::forget_tool_process,
             commands::launcher::user_tools_file,
             commands::launcher::user_mcp_file,
+
+            // NotebookLM, as a detected capability rather than a provider.
+            // Nothing here is NotebookLM-specific downstream: once registered,
+            // its MCP server reaches providers through the generic path.
+            commands::notebooklm::notebooklm_state,
+            commands::notebooklm::notebooklm_redetect,
+            commands::notebooklm::notebooklm_providers,
+            commands::notebooklm::notebooklm_health_check,
+            commands::notebooklm::notebooklm_install,
+            commands::notebooklm::notebooklm_login,
+            commands::notebooklm::notebooklm_logout,
+            commands::notebooklm::notebooklm_set_registered,
+            commands::notebooklm::mcp_delivery_report,
 
             // Model browsing by category
             commands::catalog::browse_model_cards,

@@ -52,6 +52,35 @@ pub struct ChatMessage {
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
+    /// Calls this assistant turn made, as the client reported them.
+    ///
+    /// Carried structurally rather than only as text because the *next* turn's
+    /// prompt has to re-render them in the model's own syntax — a chat template
+    /// reads `message.tool_calls` to do that. Flattening them into content and
+    /// nothing else made every tool conversation malformed from its second turn
+    /// on, which reads as the model ignoring results it was given.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<serde_json::Value>,
+    /// For a `tool` turn: which call this is the result of.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// For a `tool` turn: which tool produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ChatMessage {
+    /// A plain turn, which is most of them.
+    pub fn new(role: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            timestamp: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,6 +105,82 @@ pub struct StreamChunk {
     /// Reason generation finished (e.g., "stop", "length", "cancelled")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Why generation produced nothing, when it did.
+    ///
+    /// A field of its own rather than a prefix on `finish_reason`. Errors used
+    /// to travel as `finish_reason: "error: …"`, which every consumer forwarded
+    /// faithfully into a response field that no OpenAI or Anthropic client
+    /// renders: the client saw `content: null`, a `finish_reason` it did not
+    /// recognise, and HTTP 200, so it displayed nothing at all. The message was
+    /// in the payload the whole time, in the one place nobody looks. That is
+    /// what "Worked for 11s" and no output was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<GenerationError>,
+}
+
+/// A generation failure, in a shape the gateway can turn into a real HTTP
+/// error with a code clients branch on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GenerationError {
+    /// Machine-readable kind, mapped to the dialect's own error type.
+    pub kind: GenerationErrorKind,
+    /// One sentence the user can act on.
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationErrorKind {
+    /// The prompt does not fit the loaded context. The caller's problem, and
+    /// the one thing they can actually do something about.
+    ContextLengthExceeded,
+    /// The model cannot be given tools at all.
+    ToolsUnsupported,
+    /// Anything else the runtime reported.
+    Inference,
+}
+
+impl GenerationError {
+    /// Classifies a runtime failure from what it says.
+    ///
+    /// String matching, because the runtime's errors are `anyhow` chains built
+    /// for people to read. The two cases singled out here are the two a client
+    /// can respond to differently: shorten the request, or stop sending tools.
+    pub fn classify(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let lower = message.to_lowercase();
+        let kind = if lower.contains("token context") || lower.contains("context length") {
+            GenerationErrorKind::ContextLengthExceeded
+        } else if lower.contains("cannot be given tools") || lower.contains("tool definitions") {
+            GenerationErrorKind::ToolsUnsupported
+        } else {
+            GenerationErrorKind::Inference
+        };
+        Self { kind, message }
+    }
+
+    /// The HTTP status a client should see.
+    ///
+    /// Both singled-out kinds are 400: the request as sent cannot be served, and
+    /// retrying it unchanged will fail again. A 500 would invite exactly that
+    /// retry.
+    pub fn status(&self) -> u16 {
+        match self.kind {
+            GenerationErrorKind::ContextLengthExceeded
+            | GenerationErrorKind::ToolsUnsupported => 400,
+            GenerationErrorKind::Inference => 500,
+        }
+    }
+
+    /// The `type` field, named as each dialect's own documentation names it.
+    pub fn code(&self) -> &'static str {
+        match self.kind {
+            GenerationErrorKind::ContextLengthExceeded => "context_length_exceeded",
+            GenerationErrorKind::ToolsUnsupported => "tools_unsupported",
+            GenerationErrorKind::Inference => "inference_error",
+        }
+    }
 }
 
 // ─── Generation Parameters ───────────────────────────────────────────────────

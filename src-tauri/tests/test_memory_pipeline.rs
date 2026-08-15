@@ -90,7 +90,7 @@ async fn test_memory_pipeline_end_to_end() {
     println!("[STAGE 3] Query: \"{}\"", query);
 
     let messages: Vec<ChatMessage> = vec![
-        ChatMessage { role: "user".to_string(), content: query.to_string(), timestamp: None },
+        ChatMessage::new("user", query),
     ];
 
     match mgr.prepare_injected_messages(&messages, query).await {
@@ -151,7 +151,7 @@ async fn test_memory_pipeline_end_to_end() {
 
     // Verify injection with second MemoryManager
     let messages2: Vec<ChatMessage> = vec![
-        ChatMessage { role: "user".to_string(), content: "What is my name?".to_string(), timestamp: None },
+        ChatMessage::new("user", "What is my name?"),
     ];
     match mgr2.prepare_injected_messages(&messages2, "What is my name?").await {
         Ok(injected) => {

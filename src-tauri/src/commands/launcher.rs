@@ -59,12 +59,12 @@ fn resolve_registry(app: &AppHandle) -> registry::Registry {
     }
 }
 
-fn status_for(spec: &ToolSpec, procs: &LaunchedProcesses) -> ToolStatus {
+fn status_for(spec: &ToolSpec, procs: &LaunchedProcesses, detected: ToolState) -> ToolStatus {
     // A process Sarathi started takes precedence: it is the most specific thing
     // we know, and re-detecting would only report "installed".
     let state = match procs.pid_of(&spec.id) {
         Some(pid) => ToolState::Running { pid },
-        None => launcher::detect(spec),
+        None => detected,
     };
 
     // Only offer an install command when it could actually run.
@@ -88,14 +88,36 @@ pub async fn get_launch_overview(
     app: AppHandle,
     gateway: State<'_, Arc<GatewayState>>,
     procs: State<'_, Arc<LaunchedProcesses>>,
+    detection: State<'_, Arc<launcher::DetectionCache>>,
 ) -> Result<LaunchOverview, String> {
+    // The screen polls this every two seconds. If it ever costs more than a
+    // frame, the log says so before a user has to call it "frozen".
+    let _stage = crate::diagnostics::Stage::new("launcher: launch overview");
+
     let reg = resolve_registry(&app);
     let procs = procs.inner().clone();
+    let detection = detection.inner().clone();
 
-    // Detection runs external programs, so keep it off the async runtime.
+    // Answer from what is already known, and refresh behind the call when that
+    // has gone stale. The screen polls every couple of seconds; a poll that
+    // waited on `where` and `--version` for every tool is what made the first
+    // paint take minutes, and made each late reply overlap the next.
     let specs = reg.tools.clone();
+    let (states, stale) = detection.states(&specs);
+
+    if stale {
+        let cache = detection.clone();
+        let for_refresh = specs.clone();
+        tokio::task::spawn_blocking(move || cache.refresh(&for_refresh));
+    }
+
+    // Cheap: a `tasklist` per tool Sarathi actually started, and normally none.
     let tools = tokio::task::spawn_blocking(move || {
-        specs.iter().map(|s| status_for(s, &procs)).collect::<Vec<_>>()
+        specs
+            .iter()
+            .zip(states)
+            .map(|(s, state)| status_for(s, &procs, state))
+            .collect::<Vec<_>>()
     })
     .await
     .map_err(|e| format!("could not check installed tools: {e}"))?;
@@ -120,6 +142,26 @@ pub async fn get_launch_overview(
         blocked_reason: (!can_launch)
             .then(|| "Load a model first — tools would connect but get no answer.".to_string()),
     })
+}
+
+/// Re-detects every tool, ignoring what was cached. The Refresh button.
+///
+/// Blocks until it has an answer, because the user asked a direct question and
+/// a Refresh that returned instantly with the old answer would be worse than a
+/// slow one.
+#[tauri::command]
+pub async fn redetect_tools(
+    app: AppHandle,
+    detection: State<'_, Arc<launcher::DetectionCache>>,
+) -> Result<(), String> {
+    let specs = resolve_registry(&app).tools;
+    let detection = detection.inner().clone();
+    tokio::task::spawn_blocking(move || {
+        detection.forget_all();
+        detection.refresh(&specs);
+    })
+    .await
+    .map_err(|e| format!("detection task failed: {e}"))
 }
 
 /// The exact command an install would run, for the confirmation prompt.
@@ -152,7 +194,11 @@ pub async fn preview_tool_install(app: AppHandle, tool_id: String) -> Result<Str
 }
 
 #[tauri::command]
-pub async fn install_tool(app: AppHandle, tool_id: String) -> Result<(), String> {
+pub async fn install_tool(
+    app: AppHandle,
+    detection: State<'_, Arc<launcher::DetectionCache>>,
+    tool_id: String,
+) -> Result<(), String> {
     let reg = resolve_registry(&app);
     let spec = reg
         .tools
@@ -167,7 +213,7 @@ pub async fn install_tool(app: AppHandle, tool_id: String) -> Result<(), String>
     let emitter = app.clone();
     let progress_id = tool_id.clone();
 
-    tokio::task::spawn_blocking(move || {
+    let outcome = tokio::task::spawn_blocking(move || {
         launcher::install(&spec, |line| {
             let _ = emitter.emit(
                 "tool:install-progress",
@@ -176,7 +222,13 @@ pub async fn install_tool(app: AppHandle, tool_id: String) -> Result<(), String>
         })
     })
     .await
-    .map_err(|e| format!("install task failed: {e}"))?
+    .map_err(|e| format!("install task failed: {e}"))?;
+
+    // Only now: detecting mid-install would have cached "not installed" and
+    // held that answer for the whole TTL, right after the user watched it
+    // install.
+    detection.invalidate(&tool_id);
+    outcome
 }
 
 #[tauri::command]
@@ -212,6 +264,87 @@ pub async fn launch_tool(
         .path()
         .app_data_dir()
         .map_err(|e| format!("could not locate the Sarathi data directory: {e}"))?;
+
+    // A tool that refuses to run below a context floor of its own gets it met
+    // before anything is written or started.
+    //
+    // The generated config states the context the model is really loaded with,
+    // so this cannot be satisfied by writing a larger number: the runtime
+    // rejects a prompt longer than its context, and an agent sized against a
+    // figure Sarathi cannot honour fails on its first real turn instead of at
+    // startup. Raising the load is the only version of this that is true.
+    let model = match spec.min_context {
+        Some(min) if model.context_length < min => {
+            log::info!(
+                "[LAUNCH] '{tool_id}' will not start below {min} tokens; the model is loaded with {}",
+                model.context_length
+            );
+            let inference = gateway.inference.clone();
+            let dir = data_dir.clone();
+            let tool_name = spec.name.clone();
+            // The model really is unloaded while this runs, so the rest of the
+            // app is told rather than left showing a model that is not there.
+            let app_for_status = app.clone();
+            let status = move |status: &str, step: Option<&str>| {
+                let _ = app_for_status.emit(
+                    "inference:status",
+                    crate::ai_engine::traits::InferenceStatusPayload {
+                        status: status.to_string(),
+                        step: step.map(|s| s.to_string()),
+                        model: None,
+                        error: None,
+                    },
+                );
+            };
+            tokio::task::spawn_blocking(move || {
+                inference.ensure_context_at_least(&dir, min, &tool_name, Some(status))
+            })
+            .await
+            .map_err(|e| format!("context reload task failed: {e}"))?
+            .map_err(|e| format!("{e:#}"))?
+        }
+        _ => model,
+    };
+
+    // Then make room for the tool definitions this launch is about to hand it.
+    //
+    // A preference, not a floor: the model gives what it can and the launch goes
+    // ahead either way. Without it, every MCP server Sarathi added made every
+    // request larger while the context stayed where it was, until the prompt no
+    // longer fit and every turn failed with nothing on screen to say why.
+    let model = match spec.preferred_context(&crate::launcher::mcp::load(&data_dir)) {
+        Some(wanted) if model.context_length < wanted => {
+            log::info!(
+                "[LAUNCH] '{tool_id}' is being handed MCP tool definitions; asking for {wanted} \
+                 tokens of context (loaded with {})",
+                model.context_length
+            );
+            let inference = gateway.inference.clone();
+            let dir = data_dir.clone();
+            let tool_name = spec.name.clone();
+            let app_for_status = app.clone();
+            let status = move |status: &str, step: Option<&str>| {
+                let _ = app_for_status.emit(
+                    "inference:status",
+                    crate::ai_engine::traits::InferenceStatusPayload {
+                        status: status.to_string(),
+                        step: step.map(|s| s.to_string()),
+                        model: None,
+                        error: None,
+                    },
+                );
+            };
+            tokio::task::spawn_blocking(move || {
+                inference.grow_context_towards(&dir, wanted, &tool_name, Some(status))
+            })
+            .await
+            .map_err(|e| format!("context reload task failed: {e}"))?
+            // Falling short is not a launch failure; the tool still runs, and a
+            // request that does not fit now says so clearly.
+            .unwrap_or(model)
+        }
+        _ => model,
+    };
 
     // One workspace shared by every tool, and a private config directory per
     // tool. Two tools launched together therefore open on the same files while

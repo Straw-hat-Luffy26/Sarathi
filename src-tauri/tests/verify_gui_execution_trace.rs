@@ -52,7 +52,7 @@ async fn test_full_production_gui_execution_trace() {
         .load_installed_model_direct(&app_data, "huggingface", "Qwen/Qwen2.5-Coder-7B", "Q4_0")
         .expect("Failed to load Qwen 2.5 Coder 7B");
 
-    let user_msg_1 = ChatMessage { role: "user".to_string(), content: "What is my name?".to_string(), timestamp: None };
+    let user_msg_1 = ChatMessage::new("user", "What is my name?");
     let input_messages_1 = vec![user_msg_1.clone()];
 
     // 1. Retrieval
@@ -90,7 +90,7 @@ async fn test_full_production_gui_execution_trace() {
         .load_installed_model_direct(&app_data, "huggingface", "Qwen/Qwen2.5-Coder-7B", "Q4_0")
         .expect("Failed to reload Qwen 2.5 Coder 7B");
 
-    let user_msg_2 = ChatMessage { role: "user".to_string(), content: "What is my name and preferred programming language?".to_string(), timestamp: None };
+    let user_msg_2 = ChatMessage::new("user", "What is my name and preferred programming language?");
     let input_messages_2 = vec![user_msg_2.clone()]; // New session message list
 
     let injected_2 = memory_mgr.prepare_injected_messages(&input_messages_2, &user_msg_2.content).await.expect("Injection failed");

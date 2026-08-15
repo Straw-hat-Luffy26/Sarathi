@@ -217,6 +217,11 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
                 is_final: true,
                 tokens_generated: Some(0),
                 finish_reason: Some("no_model".to_string()),
+                error: Some(crate::ai_engine::traits::GenerationError {
+                    kind: crate::ai_engine::traits::GenerationErrorKind::Inference,
+                    message: "No model is loaded. Open Sarathi and load a model, then retry."
+                        .to_string(),
+                }),
             });
             return;
         }
@@ -282,12 +287,23 @@ fn run_job(manager: &Arc<InferenceManager>, envelope: Envelope) {
             started.elapsed().as_millis()
         ),
         Err(e) => {
-            log::error!("[SCHEDULER] Job from '{}' failed: {:#}", job.origin.label(), e);
+            // Carried as a typed error, not as `finish_reason: "error: …"`.
+            // The old form was forwarded verbatim into a response field clients
+            // do not render, so a failed request arrived as HTTP 200 with empty
+            // content: a blank answer where an explanation should have been.
+            let failure = crate::ai_engine::traits::GenerationError::classify(format!("{e:#}"));
+            log::error!(
+                "[SCHEDULER] Job from '{}' failed [{}]: {:#}",
+                job.origin.label(),
+                failure.code(),
+                e
+            );
             let _ = out.send(StreamChunk {
                 text: String::new(),
                 is_final: true,
                 tokens_generated: Some(0),
-                finish_reason: Some(format!("error: {}", e)),
+                finish_reason: Some("error".to_string()),
+                error: Some(failure),
             });
         }
     }
@@ -355,11 +371,7 @@ mod tests {
 
         let mut handle = scheduler
             .submit(GenerationJob {
-                messages: vec![ChatMessage {
-                    role: "user".into(),
-                    content: "hello".into(),
-                    timestamp: None,
-                }],
+                messages: vec![ChatMessage::new("user", "hello")],
                 params: GenerationParams::default(),
                 capability: None,
                 origin: JobOrigin::Gateway { client: "test".into() },
@@ -382,11 +394,7 @@ mod tests {
         let scheduler = GenerationScheduler::start(manager);
 
         let make = || GenerationJob {
-            messages: vec![ChatMessage {
-                role: "user".into(),
-                content: "hi".into(),
-                timestamp: None,
-            }],
+            messages: vec![ChatMessage::new("user", "hi")],
             params: GenerationParams::default(),
             capability: None,
             origin: JobOrigin::Desktop,

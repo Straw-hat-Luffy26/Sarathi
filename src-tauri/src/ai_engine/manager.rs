@@ -4,7 +4,7 @@
 //! provides streaming generation via Tauri events, and tracks the last used model.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tauri::Manager;
 
 use anyhow::{anyhow, Result};
@@ -25,6 +25,18 @@ use crate::system_analyzer;
 /// it per model in Settings.
 const DEFAULT_WORKING_CONTEXT: u32 = 8192;
 
+/// The context to load with, given what the model asks for and any floor a
+/// waiting client declared.
+///
+/// A floor raises the working cap and nothing more. The model's own request
+/// still wins the `min`, so a client that will not run below 16K cannot inflate
+/// a 4K model into claiming it does — the load comes back short and the launch
+/// says so, rather than advertising a window the runtime would then refuse to
+/// fill.
+fn plan_context(requested: u32, context_floor: Option<u32>) -> u32 {
+    requested.min(DEFAULT_WORKING_CONTEXT.max(context_floor.unwrap_or(0)))
+}
+
 /// The installed package backing the currently loaded model.
 ///
 /// Captured at load time so each turn can resolve capabilities without
@@ -41,6 +53,18 @@ pub struct ActivePackage {
 /// from multiple Tauri command handlers.
 pub struct InferenceManager {
     runtime: Arc<Mutex<LlamaCppRuntime>>,
+    /// What is loaded, readable without the runtime mutex.
+    ///
+    /// `runtime` is held for the *whole* of a generation — see `generate_direct`
+    /// — so anything that locked it to answer "is a model loaded?" waited for
+    /// the answer as long as the reply took. Asking that question is exactly
+    /// what every screen does when it opens, and the UI thread asking it during
+    /// a gateway request is a freeze for the length of that request.
+    ///
+    /// This mirror is written only on load and unload, and read under an
+    /// uncontended lock, so status is answered in microseconds whatever the
+    /// model is doing.
+    status: Arc<RwLock<StatusMirror>>,
     last_used_model_id: Arc<Mutex<Option<String>>>,
     /// Package context for the loaded model, used to resolve LoRA adapters.
     active_package: Arc<Mutex<Option<ActivePackage>>>,
@@ -48,14 +72,55 @@ pub struct InferenceManager {
     capability: Arc<CapabilityLayer>,
 }
 
+/// The lock-free view of the runtime, kept in step by load and unload.
+#[derive(Default)]
+struct StatusMirror {
+    loaded: Option<LoadedModelInfo>,
+    /// The runtime's own generating flag, cloned at load. `None` when nothing is
+    /// loaded, which is already `NotLoaded` regardless.
+    generating: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl StatusMirror {
+    fn status(&self) -> RuntimeStatus {
+        match (&self.loaded, &self.generating) {
+            (Some(_), Some(flag)) if flag.load(std::sync::atomic::Ordering::Relaxed) => {
+                RuntimeStatus::Generating
+            }
+            (Some(_), _) => RuntimeStatus::Ready,
+            (None, _) => RuntimeStatus::NotLoaded,
+        }
+    }
+}
+
 impl InferenceManager {
     /// Creates a new InferenceManager with no model loaded
     pub fn new() -> Self {
         Self {
             runtime: Arc::new(Mutex::new(LlamaCppRuntime::new())),
+            status: Arc::new(RwLock::new(StatusMirror::default())),
             last_used_model_id: Arc::new(Mutex::new(None)),
             active_package: Arc::new(Mutex::new(None)),
             capability: Arc::new(CapabilityLayer::default()),
+        }
+    }
+
+    /// Publishes what the runtime now holds, for the lock-free readers.
+    ///
+    /// Called from the load and unload paths, which are the only two things that
+    /// change the answer. `generating` is the runtime's own flag, taken by the
+    /// caller while it still holds the runtime lock.
+    fn publish_status(
+        &self,
+        loaded: Option<LoadedModelInfo>,
+        generating: Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) {
+        match self.status.write() {
+            Ok(mut mirror) => {
+                mirror.loaded = loaded;
+                mirror.generating = generating;
+            }
+            Err(e) => log::error!("[INFERENCE_MGR] Status mirror is poisoned: {e}"),
         }
     }
 
@@ -72,16 +137,17 @@ impl InferenceManager {
             .and_then(|guard| guard.clone())
     }
 
-    /// Returns the current runtime status
+    /// Returns the current runtime status.
+    ///
+    /// Answered from the mirror, never from the runtime mutex — a status query
+    /// must not queue behind a reply that is still being generated.
     pub fn get_status(&self) -> RuntimeStatus {
-        let runtime = self.runtime.lock().unwrap();
-        runtime.status()
+        self.status.read().map(|m| m.status()).unwrap_or(RuntimeStatus::NotLoaded)
     }
 
-    /// Returns info about the currently loaded model
+    /// Returns info about the currently loaded model. Also from the mirror.
     pub fn get_loaded_model_info(&self) -> Option<LoadedModelInfo> {
-        let runtime = self.runtime.lock().unwrap();
-        runtime.loaded_model_info().cloned()
+        self.status.read().ok().and_then(|m| m.loaded.clone())
     }
 
     /// Returns the last used model identifier (persisted across sessions)
@@ -120,7 +186,7 @@ impl InferenceManager {
             });
         };
 
-        self.load_installed_model_internal(app_data_dir, provider_id, model_id, quantization, Some(status_cb))
+        self.load_installed_model_internal(app_data_dir, provider_id, model_id, quantization, Some(status_cb), None)
     }
 
     /// Loads an installed model without requiring a Tauri AppHandle (for tests & backend validation).
@@ -131,7 +197,209 @@ impl InferenceManager {
         model_id: &str,
         quantization: &str,
     ) -> Result<LoadedModelInfo> {
-        self.load_installed_model_internal::<fn(&str, Option<&str>)>(app_data_dir, provider_id, model_id, quantization, None)
+        self.load_installed_model_internal::<fn(&str, Option<&str>)>(app_data_dir, provider_id, model_id, quantization, None, None)
+    }
+
+    /// Reloads the active model at a larger context, for a client that needs one.
+    ///
+    /// Sarathi plans every model around [`DEFAULT_WORKING_CONTEXT`], which is
+    /// smaller than the floor some agents refuse to start below. The generated
+    /// client config states the context the model is actually loaded with, so
+    /// the number cannot simply be raised on paper: the runtime rejects a prompt
+    /// longer than the context it holds, and the agent would fail on its second
+    /// breath instead of its first.
+    ///
+    /// The floor is a request, not an override. The model's own profile still
+    /// decides its maximum, and a model that cannot reach `wanted` is left
+    /// loaded exactly as it was, with an error saying why.
+    ///
+    /// `status_cb` is reported to because the model is genuinely unloaded for
+    /// the duration: a caller that stayed silent would leave the app claiming a
+    /// model is ready while it is not.
+    pub fn ensure_context_at_least<F>(
+        &self,
+        app_data_dir: &std::path::Path,
+        wanted: u32,
+        requested_by: &str,
+        status_cb: Option<F>,
+    ) -> Result<LoadedModelInfo>
+    where
+        F: Fn(&str, Option<&str>) + Clone,
+    {
+        let Some(info) = self.get_loaded_model_info() else {
+            return Err(anyhow!("no model is loaded"));
+        };
+
+        if info.context_length >= wanted {
+            return Ok(info);
+        }
+
+        let Some(package) = self.active_package() else {
+            return Err(anyhow!(
+                "{requested_by} needs a context of at least {wanted} tokens, but the loaded model \
+                 has no package on record to reload from"
+            ));
+        };
+
+        // The model's trained context is a hard ceiling — asking llama.cpp for
+        // more makes it extrapolate RoPE past anything the weights saw. A header
+        // we cannot read is not fatal; the profile below bounds the request too.
+        let trained = crate::ai_engine::gguf_meta::read_gguf_metadata(std::path::Path::new(&info.file_path))
+            .map(|m| m.context_length)
+            .unwrap_or(0);
+        if trained > 0 && trained < wanted {
+            return Err(anyhow!(
+                "{requested_by} needs at least {wanted} tokens of context, but {} was trained for \
+                 {trained}. Load a longer-context model, or use a client that runs at {}.",
+                info.model_name,
+                info.context_length
+            ));
+        }
+
+        log::info!(
+            "[INFERENCE_MGR] Reloading '{}' at a {}-token context: {} will not run at the {} it is loaded with",
+            info.model_id,
+            wanted,
+            requested_by,
+            info.context_length
+        );
+
+        let reloaded = self.load_installed_model_internal(
+            app_data_dir,
+            &package.manifest.provider_id,
+            &info.model_id,
+            &info.quantization,
+            status_cb.clone(),
+            Some(wanted),
+        );
+
+        match reloaded {
+            Ok(new_info) if new_info.context_length >= wanted => Ok(new_info),
+            Ok(new_info) => Err(anyhow!(
+                "{requested_by} needs {wanted} tokens of context; {} could only be loaded with {}",
+                new_info.model_name,
+                new_info.context_length
+            )),
+            Err(e) => {
+                // A load unloads before it loads, so a failure here has left the
+                // user with no model at all. Put back what they had.
+                log::error!(
+                    "[INFERENCE_MGR] Reload at {wanted} tokens failed ({e:#}); restoring the previous load"
+                );
+                match self.load_installed_model_internal(
+                    app_data_dir,
+                    &package.manifest.provider_id,
+                    &info.model_id,
+                    &info.quantization,
+                    status_cb,
+                    None,
+                ) {
+                    Ok(_) => Err(anyhow!(
+                        "could not reload at {wanted} tokens ({e:#}); the previous {}-token load was restored",
+                        info.context_length
+                    )),
+                    Err(restore_err) => Err(anyhow!(
+                        "could not reload at {wanted} tokens ({e:#}), and restoring the previous \
+                         load failed too ({restore_err:#}) — load the model again from the Models screen"
+                    )),
+                }
+            }
+        }
+    }
+
+    /// Grows the context towards `wanted`, as far as the model allows, and
+    /// never fails the caller for falling short.
+    ///
+    /// The difference from [`Self::ensure_context_at_least`] is the difference
+    /// between a floor and a preference. OpenClaw refuses to start below 16000
+    /// tokens, so failing to reach that has to stop the launch. An agentic
+    /// client carrying MCP tool definitions has no such threshold — it simply
+    /// needs as much room as it can get, and half of what it wants is far
+    /// better than not launching.
+    ///
+    /// This exists because the payload changed and the sizing did not. Six MCP
+    /// servers put 122 tool definitions — 174 KB, about 43 000 tokens — into
+    /// every request Claude Code makes, against models loaded with 8192. Every
+    /// real turn overflowed. Nothing was wrong with the model, the template or
+    /// the tools; there was simply no room.
+    pub fn grow_context_towards<F>(
+        &self,
+        app_data_dir: &std::path::Path,
+        wanted: u32,
+        requested_by: &str,
+        status_cb: Option<F>,
+    ) -> Result<LoadedModelInfo>
+    where
+        F: Fn(&str, Option<&str>) + Clone,
+    {
+        let Some(info) = self.get_loaded_model_info() else {
+            return Err(anyhow!("no model is loaded"));
+        };
+        if info.context_length >= wanted {
+            return Ok(info);
+        }
+
+        // The trained context is a hard ceiling: asking llama.cpp for more makes
+        // it extrapolate RoPE past anything the weights saw, which produces
+        // fluent nonsense rather than an error.
+        let trained =
+            crate::ai_engine::gguf_meta::read_gguf_metadata(std::path::Path::new(&info.file_path))
+                .map(|m| m.context_length)
+                .unwrap_or(0);
+        let target = if trained > 0 { wanted.min(trained) } else { wanted };
+
+        if target <= info.context_length {
+            log::info!(
+                "[INFERENCE_MGR] {requested_by} would use {wanted} tokens; {} is trained for {} \
+                 and is already loaded with {}. Leaving it alone.",
+                info.model_name,
+                trained,
+                info.context_length
+            );
+            return Ok(info);
+        }
+
+        let Some(package) = self.active_package() else {
+            log::warn!(
+                "[INFERENCE_MGR] Cannot grow the context for {requested_by}: no package on record"
+            );
+            return Ok(info);
+        };
+
+        log::info!(
+            "[INFERENCE_MGR] Growing '{}' from {} to {target} tokens for {requested_by}",
+            info.model_id,
+            info.context_length
+        );
+
+        match self.load_installed_model_internal(
+            app_data_dir,
+            &package.manifest.provider_id,
+            &info.model_id,
+            &info.quantization,
+            status_cb.clone(),
+            Some(target),
+        ) {
+            Ok(grown) => Ok(grown),
+            Err(e) => {
+                // A load unloads first, so a failure here has left no model at
+                // all. Put back what was there and carry on: a smaller context
+                // is a worse experience, no model is a broken one.
+                log::warn!(
+                    "[INFERENCE_MGR] Could not grow to {target} tokens ({e:#}); restoring the \
+                     previous {}-token load",
+                    info.context_length
+                );
+                self.load_installed_model_internal(
+                    app_data_dir,
+                    &package.manifest.provider_id,
+                    &info.model_id,
+                    &info.quantization,
+                    status_cb,
+                    None,
+                )
+            }
+        }
     }
 
     fn load_installed_model_internal<F>(
@@ -141,6 +409,7 @@ impl InferenceManager {
         model_id: &str,
         quantization: &str,
         status_cb: Option<F>,
+        context_floor: Option<u32>,
     ) -> Result<LoadedModelInfo>
     where
         F: Fn(&str, Option<&str>),
@@ -191,6 +460,7 @@ impl InferenceManager {
             &manifest,
             quantization,
             &profile,
+            context_floor,
         ).map_err(|e| {
             let err = anyhow!("[STAGE 3 MANAGER ERROR] Failed to build load config: {:#}", e);
             log::error!("{}", err);
@@ -203,12 +473,23 @@ impl InferenceManager {
         );
 
         // Perform the actual load (auto-unloads previous model)
-        let info_res = {
+        //
+        // The generating flag is taken here, under the same lock, so the status
+        // mirror below never has to reach for the runtime a second time.
+        let (info_res, generating) = {
             let mut runtime = self.runtime.lock().unwrap();
-            runtime.load_model(&config, |step| {
+            let res = runtime.load_model(&config, |step| {
                 log::info!("[STAGE 3 MANAGER PROGRESS] Step: {}", step);
-            })
+            });
+            let flag = runtime.cancel_flag();
+            (res, flag)
         };
+
+        // A failed load leaves nothing loaded, and the mirror has to say so —
+        // `load_model` unloads the previous model before it tries.
+        if info_res.is_err() {
+            self.publish_status(None, None);
+        }
 
         let info = info_res.map_err(|e| {
             let err = anyhow!("[STAGE 3 MANAGER ERROR] Runtime load_model failed: {:#}", e);
@@ -217,6 +498,11 @@ impl InferenceManager {
         })?;
 
         log::info!("[STAGE 3 MANAGER SUCCESS] Model loaded cleanly: {:?}", info);
+
+        // Published before anything else observable happens, so a screen that
+        // reacts to the load event never reads a mirror that still says the
+        // previous model — or nothing at all.
+        self.publish_status(Some(info.clone()), Some(generating));
 
         // Record package context for per-turn capability resolution, and clear
         // any capability stickiness carried over from the previous model.
@@ -241,6 +527,7 @@ impl InferenceManager {
     /// Direct unload without requiring Tauri AppHandle
     pub fn unload_active_model_direct(&self) -> Result<()> {
         self.clear_package_context();
+        self.publish_status(None, None);
         let mut runtime = self.runtime.lock().unwrap();
         runtime.unload_model()
     }
@@ -263,6 +550,7 @@ impl InferenceManager {
         }
 
         self.clear_package_context();
+        self.publish_status(None, None);
 
         let _ = app_handle.emit("inference:status", InferenceStatusPayload {
             status: "Unloading".to_string(),
@@ -432,8 +720,23 @@ impl InferenceManager {
         runtime.generate(messages, params, token_cb)
     }
 
-    /// Stops the current token generation
+    /// Stops the current token generation.
+    ///
+    /// Goes through the mirror's copy of the flag rather than the runtime,
+    /// which is the whole point: the runtime mutex is held for the length of the
+    /// generation, so a Stop that waited for it could only ever arrive after the
+    /// thing it was cancelling had finished — and blocked its caller until then.
     pub fn stop_generation(&self) {
+        if let Ok(mirror) = self.status.read() {
+            if let Some(flag) = &mirror.generating {
+                log::info!("[INFERENCE_MGR] Stop requested; clearing the generation flag");
+                flag.store(false, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        }
+
+        // Nothing loaded, so nothing to stop. Fall through to the runtime only
+        // to keep the previous behaviour for a mirror that was never published.
         let runtime = self.runtime.lock().unwrap();
         runtime.stop_generation();
     }
@@ -445,12 +748,11 @@ impl InferenceManager {
     /// of `generate_direct`, so `stop_generation` would deadlock if called from
     /// inside a token callback.
     pub fn cancel_handle(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
-        let runtime = self.runtime.lock().unwrap();
-        if runtime.loaded_model_info().is_some() {
-            Some(runtime.cancel_flag())
-        } else {
-            None
-        }
+        // From the mirror for the same reason as `stop_generation`: obtaining a
+        // cancellation handle must not itself wait on the thing to be cancelled.
+        let mirror = self.status.read().ok()?;
+        mirror.loaded.as_ref()?;
+        mirror.generating.clone()
     }
 
     /// Builds a `ModelLoadConfig` from the manifest and hardware profile.
@@ -458,6 +760,10 @@ impl InferenceManager {
     /// Context length comes from the Phase 3 recommendation (via manifest) or
     /// is calculated dynamically from available RAM/VRAM.
     /// GPU layers and thread count come from the Phase 2 hardware profile.
+    ///
+    /// `context_floor` is the smallest context a waiting client will accept, if
+    /// there is one. It raises the working cap this load plans against; it is
+    /// never allowed to exceed what the model itself supports.
     pub(crate) fn build_load_config(
         app_data_dir: &std::path::Path,
         gguf_path: &str,
@@ -465,6 +771,7 @@ impl InferenceManager {
         manifest: &ModelPackageManifest,
         quantization: &str,
         profile: &crate::model_intelligence::ModelProfile,
+        context_floor: Option<u32>,
     ) -> Result<ModelLoadConfig> {
         let analyzer = system_analyzer::get_system_analyzer_manager();
 
@@ -534,13 +841,20 @@ impl InferenceManager {
         // So the context is held at something usable and the layer count is
         // what gives. Partial offload degrades smoothly; a context too small to
         // hold the first message does not.
-        let planned_context = requested_context.min(DEFAULT_WORKING_CONTEXT);
+        let planned_context = plan_context(requested_context, context_floor);
 
         if planned_context < requested_context {
             log::info!(
                 "[INFERENCE_MGR] Planning against a {}-token working context, not the model's advertised {}",
                 planned_context,
                 requested_context
+            );
+        }
+        if let Some(floor) = context_floor {
+            log::info!(
+                "[INFERENCE_MGR] A client asked for at least {} tokens; planning at {}",
+                floor,
+                planned_context
             );
         }
 
@@ -665,6 +979,12 @@ impl InferenceManager {
                 .map(|gpu| usable_vram_bytes(gpu))
                 .unwrap_or(0);
 
+            // No `context_floor` here on purpose. A certified profile is the
+            // model configuration Sarathi already ships, and it is authoritative
+            // for maximum context — a client's floor is not allowed to argue
+            // with it. A profile that caps below the floor means the launch
+            // reports the model cannot serve that client, which is the truth.
+            //
             // The model's advertised context is an upper bound, not an entitlement.
             let affordable_context = crate::ai_engine::vram_planner::max_affordable_context(
                 detected_vram,
@@ -885,7 +1205,7 @@ mod tests {
         // leaves nothing for weights, which sent a 12B that partially offloads
         // fine to pure CPU; shrinking the context until it fully offloaded gave
         // 2265 tokens, too small for a coding agent's opening message.
-        let planned = 262_144u32.min(DEFAULT_WORKING_CONTEXT);
+        let planned = plan_context(262_144, None);
         assert_eq!(planned, 8192);
 
         // With that context the planner places most of a 6.09 GB model on an
@@ -906,7 +1226,33 @@ mod tests {
     #[test]
     fn a_model_asking_for_less_than_the_working_context_keeps_its_own() {
         // The cap is a ceiling, not a floor — a 4K model must not be inflated.
-        assert_eq!(4096u32.min(DEFAULT_WORKING_CONTEXT), 4096);
+        assert_eq!(plan_context(4096, None), 4096);
+    }
+
+    /// OpenClaw refuses to start below 16000 tokens, and the model it was
+    /// launched against advertises 128000 — so the only thing standing between
+    /// them was Sarathi's own 8192-token working cap.
+    #[test]
+    fn a_clients_floor_raises_the_working_cap_for_a_model_that_can_reach_it() {
+        assert_eq!(plan_context(128_000, Some(16_384)), 16_384);
+        assert_eq!(plan_context(32_768, Some(16_384)), 16_384);
+    }
+
+    /// The floor may not invent context the weights do not have. A short model
+    /// comes back short, which the launch reports rather than papering over.
+    #[test]
+    fn a_clients_floor_never_exceeds_what_the_model_supports() {
+        assert_eq!(plan_context(4096, Some(16_384)), 4096);
+        assert_eq!(plan_context(8192, Some(16_384)), 8192);
+    }
+
+    /// A floor under the working cap changes nothing — it is a minimum, not a
+    /// target, so a tool asking for less than Sarathi already plans for must
+    /// not shrink the context every other client is sharing.
+    #[test]
+    fn a_floor_below_the_working_cap_leaves_the_plan_alone() {
+        assert_eq!(plan_context(128_000, Some(4096)), DEFAULT_WORKING_CONTEXT);
+        assert_eq!(plan_context(128_000, None), DEFAULT_WORKING_CONTEXT);
     }
 
     #[test]

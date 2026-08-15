@@ -2,6 +2,7 @@
 
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
@@ -17,7 +18,9 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use crate::ai_engine::scheduler::{
     CancelOnDrop, Canceller, GenerationHandle, GenerationJob, JobOrigin,
 };
-use crate::ai_engine::traits::{ChatMessage, GenerationParams, StreamChunk};
+use crate::ai_engine::traits::{
+    ChatMessage, GenerationError, GenerationParams, StreamChunk,
+};
 use crate::gateway::anthropic::{self, MessagesRequest, MessagesResponse, StreamEvents};
 use crate::gateway::guard::origin_guard;
 use crate::gateway::openai::{ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ModelList};
@@ -208,6 +211,47 @@ fn active_model(state: &GatewayState) -> Result<String, Response> {
     }
 }
 
+/// What arrived, in numbers, before anything is done with it.
+///
+/// Sarathi could see that a request had failed but not why it was so large,
+/// because nothing recorded the shape of what clients send. An agentic client
+/// carrying six MCP servers sends tool definitions that dwarf the conversation
+/// — and that is invisible unless it is counted. Sizes only: no message
+/// content, no tool arguments, nothing a user typed.
+#[derive(Clone, Copy)]
+struct Shape {
+    tools: usize,
+    tool_chars: usize,
+}
+
+fn log_request_shape(
+    client: &str,
+    dialect: &str,
+    stream: bool,
+    messages: &[ChatMessage],
+    params: &GenerationParams,
+) -> Shape {
+    let message_chars: usize = messages.iter().map(|m| m.content.len()).sum();
+    let tool_chars: usize =
+        params.tools.iter().map(|t| serde_json::to_string(t).map_or(0, |s| s.len())).sum();
+
+    // A rough token estimate, four characters to the token. The real count
+    // comes from the tokenizer a moment later; this is here so the *split*
+    // between conversation and tool definitions is visible at a glance.
+    log::info!(
+        "[GATEWAY] REQUEST_START client={client} dialect={dialect} stream={stream} \
+         messages={} message_chars={message_chars} tools={} tool_schema_chars={tool_chars} \
+         (~{}k tokens of conversation, ~{}k of tool definitions) max_tokens={}",
+        messages.len(),
+        params.tools.len(),
+        message_chars / 4000,
+        tool_chars / 4000,
+        params.max_tokens,
+    );
+
+    Shape { tools: params.tools.len(), tool_chars }
+}
+
 fn submit(
     state: &GatewayState,
     messages: Vec<ChatMessage>,
@@ -236,25 +280,129 @@ fn submit(
         })
 }
 
+/// A finished generation, or the reason there isn't one.
+struct Answer {
+    text: String,
+    finish: String,
+    tokens: u32,
+    failure: Option<GenerationError>,
+}
+
 /// Drains the whole answer for non-streaming requests.
-async fn collect(handle: &mut GenerationHandle) -> (String, String, u32) {
-    let mut text = String::new();
-    let mut finish = "stop".to_string();
-    let mut tokens = 0u32;
+async fn collect(handle: &mut GenerationHandle) -> Answer {
+    let mut answer =
+        Answer { text: String::new(), finish: "stop".to_string(), tokens: 0, failure: None };
 
     while let Some(chunk) = handle.chunks.recv().await {
-        text.push_str(&chunk.text);
+        answer.text.push_str(&chunk.text);
         if let Some(n) = chunk.tokens_generated {
-            tokens = n;
+            answer.tokens = n;
         }
         if chunk.is_final {
             if let Some(reason) = chunk.finish_reason {
-                finish = reason;
+                answer.finish = reason;
             }
+            answer.failure = chunk.error;
             break;
         }
     }
-    (text, finish, tokens)
+    answer
+}
+
+/// How long the gateway will wait for the first chunk before committing to a
+/// streaming response.
+///
+/// Every failure worth reporting — a prompt that does not fit, a model that
+/// cannot take tools, no model at all — is decided during prefill, before a
+/// single token exists. Waiting for that decision means it can be answered with
+/// a real HTTP status, which every client displays, instead of an empty 200 that
+/// every client renders as nothing.
+///
+/// Bounded because the alternative failure is worse: on a slow CPU prefill the
+/// first token can be a minute away, and holding the response headers back that
+/// long denies the client the keep-alive that tells it the connection is live.
+/// Past this point the stream starts, and a later failure is reported in-band.
+const FIRST_CHUNK_BUDGET: Duration = Duration::from_secs(20);
+
+/// Waits for the first chunk, so an immediate failure is still an HTTP error.
+async fn peek(handle: &mut GenerationHandle) -> Option<StreamChunk> {
+    tokio::time::timeout(FIRST_CHUNK_BUDGET, handle.chunks.recv()).await.ok().flatten()
+}
+
+/// The dialect an error has to be phrased in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dialect {
+    OpenAi,
+    Anthropic,
+}
+
+/// Says what filled the context, when it was mostly tool definitions.
+///
+/// "Send a shorter prompt" is not advice anybody can act on: the prompt belongs
+/// to the agent, and the user never saw it. What they can act on is the fact
+/// that 122 tool definitions from their MCP servers took 43 000 of the 48 000
+/// tokens — because the remedy is to hand this provider fewer servers, or to
+/// use a model with more room.
+fn explain_overflow(failure: &GenerationError, tools: usize, tool_chars: usize) -> GenerationError {
+    if failure.kind != crate::ai_engine::traits::GenerationErrorKind::ContextLengthExceeded
+        || tools == 0
+    {
+        return failure.clone();
+    }
+
+    GenerationError {
+        kind: failure.kind,
+        message: format!(
+            "{} Most of it is tool definitions: this request carried {tools} tools \
+             (~{}k tokens of schema) from the MCP servers Sarathi gave this provider. \
+             Remove servers from mcp.json, or load a model with a longer context.",
+            failure.message,
+            tool_chars / 4000,
+        ),
+    }
+}
+
+/// A failure, in the shape the calling client's own SDK expects.
+///
+/// Both dialects document an error envelope and both sets of clients render it.
+/// What neither renders is a 200 whose content is null, which is what Sarathi
+/// used to send.
+fn error_response(dialect: Dialect, failure: &GenerationError) -> Response {
+    let status =
+        StatusCode::from_u16(failure.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    log::warn!("[GATEWAY] Returning HTTP {} [{}]: {}", status, failure.code(), failure.message);
+
+    let body = match dialect {
+        Dialect::OpenAi => serde_json::json!({
+            "error": {
+                "message": failure.message,
+                "type": "invalid_request_error",
+                "code": failure.code(),
+            }
+        }),
+        Dialect::Anthropic => serde_json::json!({
+            "type": "error",
+            "error": { "type": failure.code(), "message": failure.message },
+        }),
+    };
+    (status, Json(body)).into_response()
+}
+
+/// The same failure, for a stream that has already sent its headers.
+///
+/// Second best, and only reached when generation ran past
+/// [`FIRST_CHUNK_BUDGET`] before failing. Both dialects define this frame, so
+/// the client sees the reason rather than a stream that simply stops.
+fn error_event(dialect: Dialect, failure: &GenerationError) -> Event {
+    match dialect {
+        Dialect::OpenAi => Event::default().data(json_of(&serde_json::json!({
+            "error": { "message": failure.message, "type": "invalid_request_error", "code": failure.code() }
+        }))),
+        Dialect::Anthropic => Event::default().event("error").data(json_of(&serde_json::json!({
+            "type": "error",
+            "error": { "type": failure.code(), "message": failure.message },
+        }))),
+    }
 }
 
 /// How a generation ended, shared between the body and tail of a stream.
@@ -293,7 +441,10 @@ async fn openai_chat(
         }
     };
 
-    let mut handle = match submit(&state, req.to_chat_messages(), req.to_generation_params(), &client) {
+    let (messages, params) = (req.to_chat_messages(), req.to_generation_params());
+    let shape = log_request_shape(&client, "openai", req.stream, &messages, &params);
+
+    let mut handle = match submit(&state, messages, params, &client) {
         Ok(h) => h,
         Err(resp) => {
             state.finish_request();
@@ -301,13 +452,35 @@ async fn openai_chat(
         }
     };
 
+    // Armed for the whole handler, not just the response stream.
+    //
+    // Nothing else notices a client that hangs up during prefill: the
+    // scheduler only learns of a dropped receiver when it next emits a token,
+    // and prefill emits none. A 48 000-token prompt therefore ran to
+    // completion — minutes of CPU, blocking every request queued behind it —
+    // for a client that had already gone. Holding the guard here means the
+    // handler future being dropped is itself the signal.
+    let mut guard = CancelOnDrop::new(handle.canceller());
+
     let id = short_id("chatcmpl-");
     let created = now_secs();
 
     if !req.stream {
-        let (text, finish, tokens) = collect(&mut handle).await;
+        let answer = collect(&mut handle).await;
+        guard.disarm();
         state.finish_request();
-        return Json(ChatCompletionResponse::new(id, created, model, text, &finish, tokens)).into_response();
+        if let Some(failure) = &answer.failure {
+            return error_response(Dialect::OpenAi, &explain_overflow(failure, shape.tools, shape.tool_chars));
+        }
+        return Json(ChatCompletionResponse::new(
+            id,
+            created,
+            model,
+            answer.text,
+            &answer.finish,
+            answer.tokens,
+        ))
+        .into_response();
     }
 
     // A tool call cannot be recognised until the whole of it has arrived — it is
@@ -315,15 +488,39 @@ async fn openai_chat(
     // offered tools, the answer is collected and then emitted as one correct
     // stream. The latency this costs is real, but it only applies to the
     // agentic path, where no one is watching tokens appear anyway.
+    //
+    // It also means a failure on the agentic path — the path where prompts are
+    // largest and overflow likeliest — is always known before anything is sent,
+    // so it can always be a real HTTP error.
     if !req.tools.is_empty() {
-        let (text, finish, tokens) = collect(&mut handle).await;
+        let answer = collect(&mut handle).await;
+        guard.disarm();
         state.finish_request();
-        return Sse::new(openai_buffered_stream(text, finish, tokens, id, created, model))
-            .keep_alive(KeepAlive::default())
-            .into_response();
+        if let Some(failure) = &answer.failure {
+            return error_response(Dialect::OpenAi, &explain_overflow(failure, shape.tools, shape.tool_chars));
+        }
+        return Sse::new(openai_buffered_stream(
+            answer.text,
+            answer.finish,
+            answer.tokens,
+            id,
+            created,
+            model,
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
     }
 
-    Sse::new(openai_stream(state.clone(), handle, id, created, model))
+    // Wait for the first chunk before committing to a 200, so a request that
+    // fails during prefill is answered rather than left blank.
+    let first = peek(&mut handle).await;
+    if let Some(failure) = first.as_ref().and_then(|c| c.error.as_ref()) {
+        guard.disarm();
+        state.finish_request();
+        return error_response(Dialect::OpenAi, &explain_overflow(failure, shape.tools, shape.tool_chars));
+    }
+
+    Sse::new(openai_stream(state.clone(), handle, guard, first, id, created, model))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -370,16 +567,18 @@ fn openai_buffered_stream(
 fn openai_stream(
     state: Arc<GatewayState>,
     handle: GenerationHandle,
+    mut guard: CancelOnDrop,
+    first: Option<StreamChunk>,
     id: String,
     created: u64,
     model: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let canceller: Canceller = handle.canceller();
-    // Held by the body stream, so it is dropped whenever the response stream is
-    // — including when the client hangs up mid-prefill, which the tail below
-    // never sees because that only runs on a fully read answer.
-    let mut guard = CancelOnDrop::new(canceller.clone());
-    let chunks = UnboundedReceiverStream::new(handle.chunks);
+    // The handler's guard, moved in: it now covers submission, prefill and the
+    // whole stream without a gap between them.
+    // The chunk already taken off the channel by `peek` goes back on the front,
+    // or the client loses the first token of every answer.
+    let chunks = stream::iter(first).chain(UnboundedReceiverStream::new(handle.chunks));
 
     let (head_id, head_model) = (id.clone(), model.clone());
     let head = stream::once(async move {
@@ -391,7 +590,10 @@ fn openai_stream(
         if chunk.is_final {
             guard.disarm();
         }
-        let event = if chunk.is_final {
+        let event = if let Some(failure) = &chunk.error {
+            // Past the point where an HTTP status was still possible.
+            Some(error_event(Dialect::OpenAi, failure))
+        } else if chunk.is_final {
             let reason = chunk.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
             Some(Event::default().data(json_of(&ChatCompletionChunk::closing(
                 &body_id, created, &body_model, &reason,
@@ -434,7 +636,10 @@ async fn anthropic_messages(
         }
     };
 
-    let mut handle = match submit(&state, req.to_chat_messages(), req.to_generation_params(), &client) {
+    let (messages, params) = (req.to_chat_messages(), req.to_generation_params());
+    let shape = log_request_shape(&client, "anthropic", req.stream, &messages, &params);
+
+    let mut handle = match submit(&state, messages, params, &client) {
         Ok(h) => h,
         Err(resp) => {
             state.finish_request();
@@ -442,26 +647,54 @@ async fn anthropic_messages(
         }
     };
 
+    // Armed for the whole handler, not just the response stream.
+    //
+    // Nothing else notices a client that hangs up during prefill: the
+    // scheduler only learns of a dropped receiver when it next emits a token,
+    // and prefill emits none. A 48 000-token prompt therefore ran to
+    // completion — minutes of CPU, blocking every request queued behind it —
+    // for a client that had already gone. Holding the guard here means the
+    // handler future being dropped is itself the signal.
+    let mut guard = CancelOnDrop::new(handle.canceller());
+
     let id = short_id("msg_");
 
     if !req.stream {
-        let (text, finish, tokens) = collect(&mut handle).await;
+        let answer = collect(&mut handle).await;
+        guard.disarm();
         state.finish_request();
-        let stop = anthropic::map_stop_reason(&finish);
-        return Json(MessagesResponse::new(id, model, text, stop, tokens)).into_response();
+        if let Some(failure) = &answer.failure {
+            return error_response(Dialect::Anthropic, &explain_overflow(failure, shape.tools, shape.tool_chars));
+        }
+        let stop = anthropic::map_stop_reason(&answer.finish);
+        return Json(MessagesResponse::new(id, model, answer.text, stop, answer.tokens))
+            .into_response();
     }
 
-    // Same reasoning as the OpenAI path: a tool call is only recognisable whole.
+    // Same reasoning as the OpenAI path: a tool call is only recognisable whole,
+    // and collecting first means an agentic request that overflows the context
+    // is reported as an error rather than as an empty answer.
     if !req.tools.is_empty() {
-        let (text, finish, tokens) = collect(&mut handle).await;
+        let answer = collect(&mut handle).await;
+        guard.disarm();
         state.finish_request();
-        let stop = anthropic::map_stop_reason(&finish);
-        return Sse::new(anthropic_buffered_stream(text, stop, tokens, id, model))
+        if let Some(failure) = &answer.failure {
+            return error_response(Dialect::Anthropic, &explain_overflow(failure, shape.tools, shape.tool_chars));
+        }
+        let stop = anthropic::map_stop_reason(&answer.finish);
+        return Sse::new(anthropic_buffered_stream(answer.text, stop, answer.tokens, id, model))
             .keep_alive(KeepAlive::default())
             .into_response();
     }
 
-    Sse::new(anthropic_stream(state.clone(), handle, id, model))
+    let first = peek(&mut handle).await;
+    if let Some(failure) = first.as_ref().and_then(|c| c.error.as_ref()) {
+        guard.disarm();
+        state.finish_request();
+        return error_response(Dialect::Anthropic, &explain_overflow(failure, shape.tools, shape.tool_chars));
+    }
+
+    Sse::new(anthropic_stream(state.clone(), handle, guard, first, id, model))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
@@ -523,14 +756,16 @@ fn anthropic_buffered_stream(
 fn anthropic_stream(
     state: Arc<GatewayState>,
     handle: GenerationHandle,
+    mut guard: CancelOnDrop,
+    first: Option<StreamChunk>,
     id: String,
     model: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
     let canceller: Canceller = handle.canceller();
-    // See the OpenAI stream: the tail only runs for an answer the client read to
-    // the end, so normal completion is not the case that needs covering.
-    let mut guard = CancelOnDrop::new(canceller.clone());
-    let chunks = UnboundedReceiverStream::new(handle.chunks);
+    // See the OpenAI stream: the guard comes from the handler, so the gap
+    // between submitting and streaming is covered too.
+    // Put back what `peek` took, or the first token never reaches the client.
+    let chunks = stream::iter(first).chain(UnboundedReceiverStream::new(handle.chunks));
     let outcome = Outcome::new();
 
     fn sse((name, data): (&'static str, String)) -> Result<Event, Infallible> {
@@ -544,7 +779,12 @@ fn anthropic_stream(
 
     let body_outcome = outcome.clone();
     let body = chunks.filter_map(move |chunk: StreamChunk| {
-        let event = if chunk.is_final {
+        let event = if let Some(failure) = &chunk.error {
+            // Too late for a status code, but the client still gets the reason.
+            guard.disarm();
+            body_outcome.record("error".to_string(), 0);
+            Some(Ok(error_event(Dialect::Anthropic, failure)))
+        } else if chunk.is_final {
             // Generation ended on its own, so dropping the guard must not read
             // as an abandonment.
             guard.disarm();

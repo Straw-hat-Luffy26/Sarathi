@@ -42,6 +42,9 @@ fn main() {
             client_dir: client_dir.to_string_lossy().to_string(),
             context_length: 32768,
             mcp: registry.clone(),
+            // This renders config files, not the startup screen, so nothing
+            // here reads the runtime facts.
+            runtime: Default::default(),
         };
 
         if let Some(cfg) = &tool.launch.client_config {

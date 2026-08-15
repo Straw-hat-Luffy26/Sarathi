@@ -647,9 +647,22 @@ impl LlamaCppRuntime {
 
         // Render the prompt with the model's own template when it has one, and
         // only fall back to the hand-written approximations otherwise.
+        //
+        // The fallbacks carry no tools. When the caller supplied some, taking a
+        // fallback would answer as though the model had chosen not to call
+        // anything, which is a different and much worse thing than saying the
+        // model cannot be given tools — see `tools_unsupported`.
         let (prompt, template_source) = match native_template.as_ref() {
             Some(tmpl) => match render_with_native_template(model, tmpl, messages, &params.tools) {
                 Ok(p) => (p, "gguf"),
+                Err(e) if !params.tools.is_empty() => {
+                    is_generating.store(false, Ordering::Relaxed);
+                    return Err(tools_unsupported(
+                        &config.model_name,
+                        params.tools.len(),
+                        &format!("its chat template could not be rendered ({e:#})"),
+                    ));
+                }
                 Err(e) => {
                     log::warn!(
                         "[RUNTIME] The GGUF's own chat template failed to render ({e:#}); \
@@ -662,11 +675,37 @@ impl LlamaCppRuntime {
                     )
                 }
             },
+            None if !params.tools.is_empty() => {
+                is_generating.store(false, Ordering::Relaxed);
+                return Err(tools_unsupported(
+                    &config.model_name,
+                    params.tools.len(),
+                    "it ships no chat template of its own, and the hand-written \
+                     fallbacks cannot carry tool definitions",
+                ));
+            }
             None => (
                 format_chat_prompt_with_template(messages, &config.chat_template),
                 "fallback",
             ),
         };
+
+        // Rendered, but did the template actually use them? A template that
+        // never mentions `tools` renders a perfectly good plain-chat prompt and
+        // drops the definitions on the floor, which looks identical from here.
+        if !params.tools.is_empty() {
+            if let Some(missing) = first_tool_name_missing(&prompt, &params.tools) {
+                is_generating.store(false, Ordering::Relaxed);
+                return Err(tools_unsupported(
+                    &config.model_name,
+                    params.tools.len(),
+                    &format!(
+                        "its chat template renders without them — '{missing}' does not appear \
+                         in the prompt, so the model would never learn the tool exists"
+                    ),
+                ));
+            }
+        }
 
         // Compute SHA-256 digest of final prompt sent to llama.cpp
         let mut hasher = Sha256::new();
@@ -925,6 +964,7 @@ impl LlamaCppRuntime {
                     is_final: true,
                     tokens_generated: Some(n_generated),
                     finish_reason: Some("cancelled".to_string()),
+                    error: None,
                 });
                 break;
             }
@@ -937,6 +977,7 @@ impl LlamaCppRuntime {
                     is_final: true,
                     tokens_generated: Some(n_generated),
                     finish_reason: Some("length".to_string()),
+                    error: None,
                 });
                 break;
             }
@@ -949,6 +990,7 @@ impl LlamaCppRuntime {
                     is_final: true,
                     tokens_generated: Some(n_generated),
                     finish_reason: Some("context_length".to_string()),
+                    error: None,
                 });
                 break;
             }
@@ -967,6 +1009,7 @@ impl LlamaCppRuntime {
                     is_final: true,
                     tokens_generated: Some(n_generated),
                     finish_reason: Some("stop".to_string()),
+                    error: None,
                 });
                 break;
             }
@@ -996,6 +1039,7 @@ impl LlamaCppRuntime {
                     is_final: true,
                     tokens_generated: Some(n_generated),
                     finish_reason: Some("stop".to_string()),
+                    error: None,
                 });
                 break;
             }
@@ -1020,6 +1064,7 @@ impl LlamaCppRuntime {
                     is_final: false,
                     tokens_generated: Some(n_generated),
                     finish_reason: None,
+                    error: None,
                 });
             }
 
@@ -1095,14 +1140,14 @@ fn render_with_native_template(
     }
 
     if !tools.is_empty() {
-        // llama.cpp's own template engine takes messages only, so a fallback to
-        // it silently drops the tools. Saying so is what separates "the model
-        // chose not to call anything" from "the model was never told it could".
-        log::warn!(
-            "[RUNTIME] Falling back to llama.cpp's template engine, which cannot carry \
-             the {} tool definition(s) in this request; the model will not see them.",
+        // llama.cpp's own template engine takes messages only, so falling
+        // through to it would drop the tools. The caller turns this into a
+        // refusal rather than an answer; returning an error here is what makes
+        // that possible.
+        return Err(anyhow!(
+            "llama.cpp's template engine cannot carry the {} tool definition(s) in this request",
             tools.len()
-        );
+        ));
     }
 
     let chat: Vec<LlamaChatMessage> = messages
@@ -1126,16 +1171,277 @@ fn render_with_native_template(
     Ok(prompt)
 }
 
+/// The error a caller gets when tools were asked for and cannot be delivered.
+///
+/// Deliberately not a silent degradation. A client that connected five MCP
+/// servers and gets prose back has no way to tell that from a model deciding
+/// none of its tools applied; this says which model, how many tools, and why.
+fn tools_unsupported(model_name: &str, tool_count: usize, why: &str) -> anyhow::Error {
+    anyhow!(
+        "This model cannot be given tools: {model_name} was sent {tool_count} tool \
+         definition(s) but {why}. Sarathi will not answer as though no tools were \
+         offered — load a model whose chat template supports tool calling, or have the \
+         client send `tool_choice: \"none\"` to ask for prose deliberately."
+    )
+}
+
+/// The first tool whose name does not appear in the rendered prompt.
+///
+/// A cheap, template-agnostic check that the definitions actually landed. Names
+/// are what a model needs in order to emit a call at all, so a name absent from
+/// the prompt means the tool was not passed on, whatever the template did.
+fn first_tool_name_missing(prompt: &str, tools: &[serde_json::Value]) -> Option<String> {
+    for tool in tools {
+        let name = tool
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .or_else(|| tool.get("name"))
+            .and_then(|n| n.as_str())
+            .unwrap_or_default();
+        if !name.is_empty() && !prompt.contains(name) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Rewrites template constructs minijinja has no parser for.
+///
+/// `{% generation %}` / `{% endgeneration %}` come from HuggingFace's
+/// `return_assistant_tokens_mask`: they mark which span of the rendered text is
+/// the assistant's, so a trainer can mask it. They contribute nothing to the
+/// output, and minijinja — which implements Jinja2 proper, not transformers'
+/// extensions — rejects the whole template on sight of one. LFM2.5 uses them,
+/// which is why a model whose template *does* support tools rendered as though
+/// it did not.
+///
+/// The replacement keeps each tag's whitespace-control markers, because
+/// `{%- x -%}` trims either side and deleting the tag outright would leave that
+/// whitespace in the prompt.
+fn strip_generation_tags(src: &str) -> std::borrow::Cow<'_, str> {
+    if !src.contains("generation") {
+        return std::borrow::Cow::Borrowed(src);
+    }
+
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    let mut rewrote = false;
+
+    while let Some(open) = rest.find("{%") {
+        let Some(close_rel) = rest[open..].find("%}") else { break };
+        let close = open + close_rel + 2;
+        let tag = &rest[open..close];
+
+        // `{%- generation -%}` and `{% endgeneration %}`, and every spacing in
+        // between. The body is exactly one word, so anything else — a variable
+        // called `generation_prompt`, say — is left alone.
+        let inner = tag[2..tag.len() - 2].trim_end_matches('-').trim_start_matches('-').trim();
+        let is_generation = inner == "generation" || inner == "endgeneration";
+
+        out.push_str(&rest[..open]);
+        if is_generation {
+            // A `set` of an unused name is a real statement that emits nothing,
+            // so the whitespace-control markers keep behaving as they did.
+            let left = if tag.starts_with("{%-") { "-" } else { "" };
+            let right = if tag.ends_with("-%}") { "-" } else { "" };
+            let value = if inner == "endgeneration" { "false" } else { "true" };
+            out.push_str(&format!("{{%{left} set __sarathi_generation_span = {value} {right}%}}"));
+            rewrote = true;
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[close..];
+    }
+
+    if !rewrote {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    out.push_str(rest);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Python string and mapping methods that chat templates take for granted.
+///
+/// HuggingFace templates are written to run under Jinja2 *with Python objects
+/// underneath*, so they call `content.endswith(…)`, `s.split(…)`,
+/// `d.items()` — methods of the underlying type, not Jinja filters. minijinja
+/// implements Jinja faithfully and therefore has none of them, and one call to
+/// a missing method aborts the whole render.
+///
+/// Before this, that abort was indistinguishable from "this model does not
+/// support tools": LFM2.5's template calls `endswith` while rendering a
+/// previous assistant turn, so a tool conversation rendered fine on turn one
+/// and failed on turn two.
+///
+/// Only methods with unambiguous semantics are implemented. Anything else still
+/// raises, so a template using something genuinely unsupported fails loudly
+/// rather than rendering something subtly wrong.
+fn python_method(
+    _state: &minijinja::State<'_, '_>,
+    value: &minijinja::value::Value,
+    method: &str,
+    args: &[minijinja::value::Value],
+) -> Result<minijinja::value::Value, minijinja::Error> {
+    use minijinja::value::Value;
+    use minijinja::{Error, ErrorKind};
+
+    let unsupported = || {
+        Error::new(
+            ErrorKind::UnknownMethod,
+            format!("no Python-compatible method named {method}"),
+        )
+    };
+    let arg_str = |i: usize| -> Option<String> { args.get(i)?.as_str().map(str::to_string) };
+
+    // ── mappings ────────────────────────────────────────────────────────────
+    if let Ok(iter) = value.try_iter() {
+        if value.kind() == minijinja::value::ValueKind::Map {
+            match method {
+                "items" => {
+                    let pairs: Vec<Value> = iter
+                        .map(|k| {
+                            let v = value.get_item(&k).unwrap_or(Value::UNDEFINED);
+                            Value::from(vec![k, v])
+                        })
+                        .collect();
+                    return Ok(Value::from(pairs));
+                }
+                "keys" => return Ok(Value::from(iter.collect::<Vec<_>>())),
+                "values" => {
+                    let vals: Vec<Value> = iter
+                        .map(|k| value.get_item(&k).unwrap_or(Value::UNDEFINED))
+                        .collect();
+                    return Ok(Value::from(vals));
+                }
+                "get" => {
+                    let default = args.get(1).cloned().unwrap_or(Value::from(()));
+                    let found = args
+                        .first()
+                        .and_then(|k| value.get_item(k).ok())
+                        .filter(|v| !v.is_undefined());
+                    return Ok(found.unwrap_or(default));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    // ── strings ─────────────────────────────────────────────────────────────
+    let Some(s) = value.as_str() else { return Err(unsupported()) };
+
+    let out = match method {
+        "startswith" => Value::from(s.starts_with(arg_str(0).ok_or_else(unsupported)?.as_str())),
+        "endswith" => Value::from(s.ends_with(arg_str(0).ok_or_else(unsupported)?.as_str())),
+        "strip" => Value::from(match arg_str(0) {
+            Some(chars) => s.trim_matches(|c| chars.contains(c)).to_string(),
+            None => s.trim().to_string(),
+        }),
+        "lstrip" => Value::from(match arg_str(0) {
+            Some(chars) => s.trim_start_matches(|c| chars.contains(c)).to_string(),
+            None => s.trim_start().to_string(),
+        }),
+        "rstrip" => Value::from(match arg_str(0) {
+            Some(chars) => s.trim_end_matches(|c| chars.contains(c)).to_string(),
+            None => s.trim_end().to_string(),
+        }),
+        "lower" => Value::from(s.to_lowercase()),
+        "upper" => Value::from(s.to_uppercase()),
+        "title" => Value::from(
+            s.split(' ')
+                .map(|w| {
+                    let mut c = w.chars();
+                    match c.next() {
+                        Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                        None => String::new(),
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+        "capitalize" => {
+            let mut c = s.chars();
+            Value::from(match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + &c.as_str().to_lowercase(),
+                None => String::new(),
+            })
+        }
+        "replace" => Value::from(s.replace(
+            arg_str(0).ok_or_else(unsupported)?.as_str(),
+            arg_str(1).ok_or_else(unsupported)?.as_str(),
+        )),
+        "split" => {
+            let parts: Vec<Value> = match arg_str(0) {
+                Some(sep) => s.split(sep.as_str()).map(Value::from).collect(),
+                None => s.split_whitespace().map(Value::from).collect(),
+            };
+            Value::from(parts)
+        }
+        "rsplit" => {
+            let sep = arg_str(0).ok_or_else(unsupported)?;
+            let mut parts: Vec<Value> = s.rsplit(sep.as_str()).map(Value::from).collect();
+            parts.reverse();
+            Value::from(parts)
+        }
+        "count" => Value::from(s.matches(arg_str(0).ok_or_else(unsupported)?.as_str()).count()),
+        "find" => Value::from(
+            s.find(arg_str(0).ok_or_else(unsupported)?.as_str())
+                .map_or(-1i64, |i| i as i64),
+        ),
+        _ => return Err(unsupported()),
+    };
+    Ok(out)
+}
+
+/// Puts tool calls into the shape chat templates are written against.
+///
+/// The OpenAI wire format carries `function.arguments` as a **string** of JSON.
+/// HuggingFace templates are written against `tokenizer.apply_chat_template`,
+/// where it is a **mapping** — LFM2's iterates `func_args.items()` to rebuild
+/// its `name(k=v)` syntax, and a string has no `.items()`, so the whole render
+/// aborts. Decoding it here is the difference between a tool conversation that
+/// continues past its first turn and one that dies on the second.
+fn normalise_tool_calls(calls: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    calls
+        .iter()
+        .map(|call| {
+            let mut call = call.clone();
+            let Some(args) = call.pointer("/function/arguments") else { return call };
+            let serde_json::Value::String(text) = args else { return call };
+
+            // Only when it really is JSON. An argument string that is not an
+            // object is left exactly as the client sent it.
+            if let Ok(decoded) = serde_json::from_str::<serde_json::Value>(text) {
+                if decoded.is_object() {
+                    if let Some(slot) = call.pointer_mut("/function/arguments") {
+                        *slot = decoded;
+                    }
+                }
+            }
+            call
+        })
+        .collect()
+}
+
 /// A chat message as a chat template expects to see it.
 ///
 /// Templates are written against Python dicts, so they reach for `.get(...)`
 /// on optional fields like `reasoning` and `tool_calls`. A plain map value has
 /// no such method and rendering aborts, so this supplies dict semantics:
 /// subscripting known keys, and `.get` returning a default instead of raising.
+///
+/// `tool_calls` and `tool_call_id` are carried structurally rather than being
+/// flattened into the text, because that is the half of the round trip the
+/// model has to *read*: a template renders a previous assistant turn's calls in
+/// the model's own syntax, and a tool result has to be tied back to the call it
+/// answers. Without them the second turn of every tool conversation is
+/// malformed, which looks like the model ignoring its own tool results.
 #[derive(Debug)]
 struct TemplateMessage {
     role: String,
     content: String,
+    tool_calls: Vec<serde_json::Value>,
+    tool_call_id: Option<String>,
+    name: Option<String>,
 }
 
 impl minijinja::value::Object for TemplateMessage {
@@ -1143,6 +1449,17 @@ impl minijinja::value::Object for TemplateMessage {
         match key.as_str()? {
             "role" => Some(minijinja::value::Value::from(self.role.clone())),
             "content" => Some(minijinja::value::Value::from(self.content.clone())),
+            // Absent rather than empty when there are none: templates test
+            // `if message.tool_calls`, and an empty list is falsy either way,
+            // but `is defined` must be false for a plain turn.
+            "tool_calls" if !self.tool_calls.is_empty() => Some(
+                minijinja::value::Value::from_serialize(&normalise_tool_calls(&self.tool_calls)),
+            ),
+            "tool_call_id" => self
+                .tool_call_id
+                .as_ref()
+                .map(|id| minijinja::value::Value::from(id.clone())),
+            "name" => self.name.as_ref().map(|n| minijinja::value::Value::from(n.clone())),
             _ => None,
         }
     }
@@ -1191,7 +1508,10 @@ pub fn render_jinja_chat_template(
     // Chat templates are whitespace-sensitive; keeping blocks and newlines
     // verbatim is what makes the output match the training format.
     env.set_keep_trailing_newline(true);
-    env.add_template("chat", template_src)
+    // Chat templates are written against Python objects; see `python_method`.
+    env.set_unknown_method_callback(python_method);
+    let prepared = strip_generation_tags(template_src);
+    env.add_template("chat", &prepared)
         .map_err(|e| anyhow!("chat template is not valid Jinja: {e}"))?;
 
     let tmpl = env
@@ -1204,6 +1524,9 @@ pub fn render_jinja_chat_template(
             minijinja::value::Value::from_object(TemplateMessage {
                 role: m.role.clone(),
                 content: m.content.clone(),
+                tool_calls: m.tool_calls.clone(),
+                tool_call_id: m.tool_call_id.clone(),
+                name: m.name.clone(),
             })
         })
         .collect();
@@ -1386,16 +1709,8 @@ mod tests {
 
     fn sample_messages() -> Vec<ChatMessage> {
         vec![
-            ChatMessage {
-                role: "system".to_string(),
-                content: "You are helpful.".to_string(),
-                timestamp: None,
-            },
-            ChatMessage {
-                role: "user".to_string(),
-                content: "Hello".to_string(),
-                timestamp: None,
-            },
+            ChatMessage::new("system", "You are helpful."),
+            ChatMessage::new("user", "Hello"),
         ]
     }
 
@@ -1542,11 +1857,7 @@ mod tests {
     #[test]
     fn test_generate_fails_without_model() {
         let mut runtime = LlamaCppRuntime::new();
-        let messages = vec![ChatMessage {
-            role: "user".to_string(),
-            content: "test".to_string(),
-            timestamp: None,
-        }];
+        let messages = vec![ChatMessage::new("user", "test")];
         let result = runtime.generate(&messages, &GenerationParams::default(), |_| {});
         assert!(result.is_err());
     }
@@ -1722,7 +2033,7 @@ mod tests {
         println!("Resolved GGUF path: {}", gguf_path);
 
         let profile = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest).expect("Failed to get profile");
-        let config = InferenceManager::build_load_config(&app_data_dir, &gguf_path, model_id, &manifest, quantization, &profile).expect("Failed to build load config");
+        let config = InferenceManager::build_load_config(&app_data_dir, &gguf_path, model_id, &manifest, quantization, &profile, None).expect("Failed to build load config");
         println!("Built ModelLoadConfig: path='{}', ctx={}, gpu_layers={}, threads={}", config.model_path, config.context_length, config.gpu_layers, config.threads);
 
         let mut runtime = LlamaCppRuntime::new();
@@ -1761,7 +2072,7 @@ mod tests {
         println!("Resolved GGUF path: {}", gguf_path);
 
         let profile = crate::model_intelligence::ModelIntelligenceManager::get_or_create_profile(&package_dir, &manifest).expect("Failed to get profile");
-        let config = InferenceManager::build_load_config(&app_data_dir, &gguf_path, model_id, &manifest, quantization, &profile).expect("Failed to build load config");
+        let config = InferenceManager::build_load_config(&app_data_dir, &gguf_path, model_id, &manifest, quantization, &profile, None).expect("Failed to build load config");
 
         let mut runtime = LlamaCppRuntime::new();
         let res = runtime.load_model(&config, |step| println!("Step: {}", step));
@@ -1791,7 +2102,7 @@ mod tests {
             let manifest1 = AdapterRegistry::read_manifest(&pkg1).unwrap();
             if let Ok(path1) = InferenceManager::resolve_gguf_path(&pkg1, &manifest1) {
             let profile1 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg1, &manifest1).unwrap();
-            let cfg1 = InferenceManager::build_load_config(&app_data_dir, &path1, "meta-llama/Llama-3.2-1B", &manifest1, "Q8_0", &profile1).unwrap();
+            let cfg1 = InferenceManager::build_load_config(&app_data_dir, &path1, "meta-llama/Llama-3.2-1B", &manifest1, "Q8_0", &profile1, None).unwrap();
 
             println!("\n=== [SEQUENTIAL LOAD TEST 1] Loading Llama-3.2-1B ===");
             let res1 = runtime.load_model(&cfg1, |s| println!("Load step: {}", s));
@@ -1809,7 +2120,7 @@ mod tests {
             let manifest2 = AdapterRegistry::read_manifest(&pkg2).unwrap();
             if let Ok(path2) = InferenceManager::resolve_gguf_path(&pkg2, &manifest2) {
             let profile2 = crate::model_intelligence::ModelIntelligenceManager::refresh_profile(&pkg2, &manifest2).unwrap();
-            let cfg2 = InferenceManager::build_load_config(&app_data_dir, &path2, "Qwen/Qwen2.5-Coder-7B", &manifest2, "Q4_0", &profile2).unwrap();
+            let cfg2 = InferenceManager::build_load_config(&app_data_dir, &path2, "Qwen/Qwen2.5-Coder-7B", &manifest2, "Q4_0", &profile2, None).unwrap();
 
             println!("\n=== [SEQUENTIAL LOAD TEST 2] Loading Qwen2.5-Coder-7B into SAME session ===");
             let res2 = runtime.load_model(&cfg2, |s| println!("Load step: {}", s));
@@ -1872,5 +2183,272 @@ mod tests {
         }
 
         println!("\n=== PHASE 5.2 AUTOMATIC RUNTIME CONFIGURATION VERIFIED ===\n");
+    }
+
+    // ─── Tool schemas reaching the model ────────────────────────────────────
+
+    /// The construct that made a tool-capable model look tool-incapable.
+    #[test]
+    fn generation_tags_are_rewritten_rather_than_rejected() {
+        let src = "a{%- generation -%}b{% endgeneration %}c";
+        let out = super::strip_generation_tags(src);
+        assert!(!out.contains("generation -%}"), "got: {out}");
+        assert!(out.contains("{%- set"), "whitespace control must survive: {out}");
+        assert!(out.contains("{% set"), "and so must its absence: {out}");
+
+        // minijinja has to accept the result, which is the only thing that
+        // matters about it.
+        let mut env = minijinja::Environment::new();
+        env.add_template("t", &out).expect("rewritten template must parse");
+        assert_eq!(env.get_template("t").unwrap().render(()).unwrap(), "abc");
+    }
+
+    #[test]
+    fn a_template_without_the_tags_is_left_untouched() {
+        let src = "{% if tools %}x{% endif %}";
+        assert!(matches!(super::strip_generation_tags(src), std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// A name that never made it into the prompt is a tool the model cannot
+    /// call, whatever the template did with the list.
+    #[test]
+    fn a_tool_absent_from_the_prompt_is_detected() {
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "searxng_web_search" }
+        })];
+        assert_eq!(
+            super::first_tool_name_missing("a prompt with no tools", &tools).as_deref(),
+            Some("searxng_web_search")
+        );
+        assert_eq!(
+            super::first_tool_name_missing("List of tools: [searxng_web_search]", &tools),
+            None
+        );
+    }
+
+    /// The real thing: LFM2.5's own template, which uses `{% generation %}`
+    /// and builds a "List of tools:" system prompt. Before the rewrite this
+    /// failed to parse and every tool was dropped.
+    #[test]
+    fn the_real_lfm25_template_renders_and_carries_its_tools() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lfm2.5-chat-template.jinja");
+        let Ok(src) = std::fs::read_to_string(&path) else {
+            eprintln!("fixture missing, skipping: {}", path.display());
+            return;
+        };
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "searxng_web_search",
+                "description": "Search the web",
+                "parameters": {"type":"object","properties":{"query":{"type":"string"}}}
+            }
+        })];
+
+        let prompt = super::render_jinja_chat_template(
+            &src,
+            &[ChatMessage::new("user", "find me something")],
+            "<|startoftext|>",
+            "<|im_end|>",
+            &tools,
+        )
+        .expect("LFM2.5's template must render");
+
+        assert!(
+            prompt.contains("searxng_web_search"),
+            "the tool name has to reach the model:
+{prompt}"
+        );
+        assert!(super::first_tool_name_missing(&prompt, &tools).is_none());
+    }
+
+    /// And the same template with no tools still renders an ordinary prompt.
+    #[test]
+    fn the_real_template_still_renders_plain_chat() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lfm2.5-chat-template.jinja");
+        let Ok(src) = std::fs::read_to_string(&path) else { return };
+
+        let prompt = super::render_jinja_chat_template(
+            &src,
+            &[ChatMessage::new("user", "hello")],
+            "<|startoftext|>",
+            "<|im_end|>",
+            &[],
+        )
+        .expect("plain chat must still render");
+        assert!(prompt.contains("hello"), "got: {prompt}");
+        assert!(!prompt.contains("List of tools"), "no tools means no tool list: {prompt}");
+    }
+
+    /// A previous assistant turn's calls and the tool result that answered them
+    /// have to survive into the next prompt, or the model cannot see its own
+    /// conversation.
+    #[test]
+    fn a_tool_call_and_its_result_survive_into_the_next_prompt() {
+        let template = concat!(
+            "{% for m in messages %}",
+            "[{{ m.role }}]",
+            "{% if m.tool_calls is defined %}",
+            "{% for c in m.tool_calls %}CALL:{{ c.function.name }}{% endfor %}",
+            "{% endif %}",
+            "{% if m.tool_call_id is defined %}FOR:{{ m.tool_call_id }}{% endif %}",
+            "{{ m.content }}",
+            "{% endfor %}"
+        );
+
+        let assistant = ChatMessage {
+            tool_calls: vec![serde_json::json!({
+                "id": "call_1",
+                "function": {"name": "searxng_web_search", "arguments": "{}"}
+            })],
+            ..ChatMessage::new("assistant", "")
+        };
+        let result = ChatMessage {
+            tool_call_id: Some("call_1".into()),
+            name: Some("searxng_web_search".into()),
+            ..ChatMessage::new("tool", "three results")
+        };
+
+        let out = super::render_jinja_chat_template(
+            template,
+            &[ChatMessage::new("user", "search"), assistant, result],
+            "",
+            "",
+            &[],
+        )
+        .expect("renders");
+
+        assert!(out.contains("CALL:searxng_web_search"), "the call was lost: {out}");
+        assert!(out.contains("FOR:call_1"), "the result lost its call id: {out}");
+        assert!(out.contains("three results"), "the result body was lost: {out}");
+    }
+
+    /// The round trip's real failure mode: OpenAI sends `arguments` as a JSON
+    /// string, HuggingFace templates iterate it as a mapping.
+    #[test]
+    fn tool_call_arguments_are_decoded_for_the_template() {
+        let calls = vec![serde_json::json!({
+            "id": "call_1",
+            "function": {"name": "search", "arguments": "{\"query\":\"btc\"}"}
+        })];
+        let out = super::normalise_tool_calls(&calls);
+        assert!(out[0]["function"]["arguments"].is_object(), "got: {out:?}");
+        assert_eq!(out[0]["function"]["arguments"]["query"], "btc");
+    }
+
+    #[test]
+    fn arguments_that_are_not_json_are_left_alone() {
+        let calls = vec![serde_json::json!({
+            "function": {"name": "f", "arguments": "not json at all"}
+        })];
+        let out = super::normalise_tool_calls(&calls);
+        assert_eq!(out[0]["function"]["arguments"], "not json at all");
+    }
+
+    /// The whole second turn, through LFM2.5's real template: the model has to
+    /// see its own previous call and the result that answered it.
+    #[test]
+    fn the_real_template_renders_a_full_tool_round_trip() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/lfm2.5-chat-template.jinja");
+        let Ok(src) = std::fs::read_to_string(&path) else { return };
+
+        let tools = vec![serde_json::json!({
+            "type": "function",
+            "function": {"name": "searxng_web_search", "description": "Search",
+                         "parameters": {"type":"object","properties":{"query":{"type":"string"}}}}
+        })];
+
+        let assistant = ChatMessage {
+            tool_calls: vec![serde_json::json!({
+                "id": "call_1",
+                "function": {"name": "searxng_web_search", "arguments": "{\"query\":\"btc\"}"}
+            })],
+            ..ChatMessage::new("assistant", "")
+        };
+        let result = ChatMessage {
+            tool_call_id: Some("call_1".into()),
+            name: Some("searxng_web_search".into()),
+            ..ChatMessage::new("tool", "BTC is $91,432.18")
+        };
+
+        let prompt = super::render_jinja_chat_template(
+            &src,
+            &[ChatMessage::new("user", "price of btc?"), assistant, result],
+            "<|startoftext|>",
+            "<|im_end|>",
+            &tools,
+        )
+        .expect("a tool round trip must render");
+
+        assert!(prompt.contains("searxng_web_search"), "tool name lost:
+{prompt}");
+        assert!(prompt.contains("BTC is $91,432.18"), "the result was lost:
+{prompt}");
+        assert!(
+            prompt.contains("<|tool_call_start|>"),
+            "the previous call must be re-rendered in the model's own syntax:
+{prompt}"
+        );
+    }
+
+    /// The Python methods HF templates assume. One missing method aborts a
+    /// whole render, so these are load-bearing rather than nice-to-have.
+    #[test]
+    fn python_string_methods_are_available_to_templates() {
+        let cases = [
+            (r#"{{ "abc" if "hello world".endswith("world") else "no" }}"#, "abc"),
+            (r#"{{ "yes" if "hello".startswith("he") else "no" }}"#, "yes"),
+            (r#"{{ "  x  ".strip() }}"#, "x"),
+            (r#"{{ "xxaxx".strip("x") }}"#, "a"),
+            (r#"{{ "  x".lstrip() }}"#, "x"),
+            (r#"{{ "x  ".rstrip() }}"#, "x"),
+            (r#"{{ "AB".lower() }}"#, "ab"),
+            (r#"{{ "ab".upper() }}"#, "AB"),
+            (r#"{{ "a-b".replace("-", "+") }}"#, "a+b"),
+            (r#"{{ "a,b,c".split(",")[1] }}"#, "b"),
+            (r#"{{ "a b".title() }}"#, "A B"),
+            (r#"{{ "ab".capitalize() }}"#, "Ab"),
+            (r#"{{ "aXbXc".count("X") }}"#, "2"),
+            (r#"{{ "hello".find("ll") }}"#, "2"),
+            (r#"{{ "hello".find("zz") }}"#, "-1"),
+        ];
+
+        for (src, expected) in cases {
+            let out = super::render_jinja_chat_template(src, &[], "", "", &[])
+                .unwrap_or_else(|e| panic!("{src} failed: {e}"));
+            assert_eq!(out.trim(), expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn a_genuinely_unknown_method_still_fails_loudly() {
+        // The shim must not swallow real mistakes into a silently wrong prompt.
+        let err = super::render_jinja_chat_template(
+            r#"{{ "x".no_such_method() }}"#, &[], "", "", &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("no_such_method"), "got: {err:#}");
+    }
+
+    #[test]
+    fn mapping_methods_work_for_tool_arguments() {
+        let template = r#"{% for m in messages %}{% for c in m.tool_calls %}{% for k, v in c.function.arguments.items() %}{{ k }}={{ v }};{% endfor %}{% endfor %}{% endfor %}"#;
+
+        let assistant = ChatMessage {
+            tool_calls: vec![serde_json::json!({
+                "function": {"name": "f", "arguments": "{\"a\":1,\"b\":\"two\"}"}
+            })],
+            ..ChatMessage::new("assistant", "")
+        };
+
+        let out = super::render_jinja_chat_template(template, &[assistant], "", "", &[])
+            .expect("items() must work on decoded arguments");
+        assert!(out.contains("a=1"), "got: {out}");
+        assert!(out.contains("b=two"), "got: {out}");
     }
 }
