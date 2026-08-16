@@ -460,12 +460,3 @@ Observed on a CUDA build (RTX 5060, 8 GB), sampling `nvidia-smi` throughout:
 every installed model placed **all** its layers on the GPU — including an MoE
 model at 32 experts / 4 active — with VRAM moving 955 → 6971 MiB and GPU
 utilisation peaking at 88%.
-
----
-
-<div align="center">
-
-**Team Sankalp** · Smart India Hackathon 2026
-Guided by Prof. Rupali Zambre · Pimpri Chinchwad University, Pune — CSE-AIML
-
-</div>
