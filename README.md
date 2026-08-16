@@ -142,11 +142,12 @@ flowchart LR
 
 ## Screenshots
 
-> **These are placeholders.** Sarathi is a native Windows desktop application
-> and could not be launched and captured from the automated environment this
-> README was written in. Drop the PNGs into `docs/screenshots/` using the exact
-> filenames below and they will appear here — see
-> [`docs/screenshots/README.md`](docs/screenshots/README.md) for capture notes.
+> **These are placeholder tiles.** Sarathi is a native Windows desktop
+> application and could not be launched and captured from the automated
+> environment this README was written in. **Overwrite** the files in
+> `docs/screenshots/` — same filenames — and the real captures appear here with
+> no README edit. See [`docs/screenshots/README.md`](docs/screenshots/README.md)
+> for what each shot should show and how to compress it.
 
 | | |
 | :---: | :---: |
