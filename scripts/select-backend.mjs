@@ -17,8 +17,9 @@
  */
 
 import { spawnSync, spawn } from 'node:child_process';
-import { existsSync, readdirSync } from 'node:fs';
+import { existsSync, readdirSync, writeFileSync, unlinkSync } from 'node:fs';
 import path from 'node:path';
+import os from 'node:os';
 
 const isWindows = process.platform === 'win32';
 
@@ -189,10 +190,37 @@ if (isWindows && feature === 'cuda') {
   );
 
   const quoted = tauriArgs.map((a) => (a.includes(' ') ? `"${a}"` : a)).join(' ');
-  const archLine = archs ? `set CUDAARCHS=${archs}&& ` : '';
-  const line = `"${vcvars}" >nul && set CMAKE_GENERATOR=Ninja&& ${archLine}npx tauri ${quoted}`;
-  const child = spawn('cmd', ['/c', line], { stdio: 'inherit' });
-  child.on('exit', (code) => process.exit(code ?? 1));
+
+  // Handed to cmd as a script file rather than as a `cmd /c "<line>"` argument.
+  //
+  // Node escapes embedded quotes when it builds a Windows command line, so the
+  // quotes around the vcvars path arrived at cmd as `\"C:\Program Files...\"`.
+  // cmd read that as a command literally named `\"C:\Program`, reported
+  // "is not recognized as an internal or external command", and the `&&` chain
+  // short-circuited — so the build never ran while the script reported success.
+  // A batch file has no such quoting layer: what is written is what cmd reads.
+  const EOL = String.fromCharCode(13, 10);
+  const script = path.join(os.tmpdir(), `sarathi-build-${process.pid}.bat`);
+  writeFileSync(
+    script,
+    [
+      '@echo off',
+      `call "${vcvars}" >nul || exit /b 1`,
+      'set CMAKE_GENERATOR=Ninja',
+      ...(archs ? [`set CUDAARCHS=${archs}`] : []),
+      `npx tauri ${quoted}`,
+    ].join(EOL) + EOL
+  );
+
+  const child = spawn('cmd', ['/c', script], { stdio: 'inherit' });
+  child.on('exit', (code) => {
+    try {
+      unlinkSync(script);
+    } catch {
+      // A leftover temp file is not worth failing a successful build over.
+    }
+    process.exit(code ?? 1);
+  });
 } else {
   const env = { ...process.env };
   if (feature === 'cuda') {
