@@ -211,6 +211,119 @@ fn active_model(state: &GatewayState) -> Result<String, Response> {
     }
 }
 
+/// Characters per token, for sizing a prompt before the tokenizer sees it.
+///
+/// Deliberately pessimistic. English prose runs about four characters to the
+/// token, but tool schemas are JSON — braces, quotes, colons and snake_case keys
+/// all tokenize densely — and an estimate that runs *over* the real count
+/// silently reintroduces the overflow this is here to prevent. Measured against
+/// a real failure: 125 schemas estimated at 46k tokens on the four-character
+/// rule actually tokenized to a 49.5k prompt.
+const CHARS_PER_TOKEN: usize = 3;
+
+/// Tokens held back for chat-template scaffolding and estimation error.
+const FIT_MARGIN_TOKENS: usize = 1024;
+
+/// Drops tool definitions that cannot fit the loaded model's context.
+///
+/// ## Why this exists
+///
+/// Sarathi hands every MCP server in `mcp.json` to every provider it launches,
+/// and an agentic client re-sends all of their schemas on every single turn. Six
+/// servers came to 125 tools and ~46k tokens — so a one-word "Hii" arrived as a
+/// 49,478-token prompt against a 32,768-token context and was rejected outright.
+/// The user had done nothing wrong and the conversation could not proceed at
+/// all; the only advice on offer was to hand-edit `mcp.json`.
+///
+/// Sizing what a model is given to what that model can hold is Sarathi's job,
+/// the same way sizing a download to the GPU is. So the tool list is trimmed to
+/// fit and the request goes through, rather than failing whole.
+///
+/// ## What gets dropped
+///
+/// The tail of the list. Clients put their own built-in tools first and append
+/// MCP-provided ones, so trimming from the end keeps the tools an agent cannot
+/// work without — reading and writing files, running commands — and sheds the
+/// long tail of optional integrations. Nothing is reordered, because a client
+/// that does put something essential last would be worse served by a cleverer
+/// rule that guessed which those were.
+///
+/// Returns how many were removed. Zero is the normal case and costs one pass
+/// over the schemas.
+fn fit_tools_to_context(
+    messages: &[ChatMessage],
+    params: &mut GenerationParams,
+    context_length: u32,
+) -> usize {
+    if params.tools.is_empty() || context_length == 0 {
+        return 0;
+    }
+
+    let conversation_tokens: usize =
+        messages.iter().map(|m| m.content.len()).sum::<usize>() / CHARS_PER_TOKEN;
+
+    // Room the answer itself needs. Without this a prompt could fit exactly and
+    // then overflow the moment generation started.
+    let reserved = conversation_tokens
+        .saturating_add(params.max_tokens as usize)
+        .saturating_add(FIT_MARGIN_TOKENS);
+
+    let Some(mut remaining) = (context_length as usize).checked_sub(reserved) else {
+        // The conversation alone does not fit. Nothing to be gained by keeping
+        // tools; the overflow error will explain the real problem.
+        let dropped = params.tools.len();
+        params.tools.clear();
+        return dropped;
+    };
+
+    let before = params.tools.len();
+    let mut kept = 0;
+    for tool in &params.tools {
+        let cost = serde_json::to_string(tool).map_or(0, |s| s.len()) / CHARS_PER_TOKEN;
+        match remaining.checked_sub(cost) {
+            Some(left) => {
+                remaining = left;
+                kept += 1;
+            }
+            None => break,
+        }
+    }
+
+    params.tools.truncate(kept);
+    before - kept
+}
+
+/// Applies [`fit_tools_to_context`] against whatever model is loaded, and says
+/// so when it had to take something away.
+///
+/// Logged at warning level rather than silently: an agent that suddenly cannot
+/// see a tool it used last week needs *some* trace explaining why, and the fix
+/// — fewer MCP servers, or a model with a longer context — belongs in the log
+/// next to the evidence.
+fn trim_tools_for_model(
+    state: &GatewayState,
+    messages: &[ChatMessage],
+    params: &mut GenerationParams,
+    client: &str,
+) {
+    let Some(info) = state.inference.get_loaded_model_info() else {
+        return;
+    };
+
+    let offered = params.tools.len();
+    let dropped = fit_tools_to_context(messages, params, info.context_length);
+    if dropped > 0 {
+        log::warn!(
+            "[GATEWAY] {client}: {offered} tools would not fit {}'s {}-token context; \
+             sent the first {} and dropped {dropped}. Disable MCP servers in mcp.json, \
+             or load a model with a longer context, to stop this happening.",
+            info.model_id,
+            info.context_length,
+            params.tools.len(),
+        );
+    }
+}
+
 /// What arrived, in numbers, before anything is done with it.
 ///
 /// Sarathi could see that a request had failed but not why it was so large,
@@ -441,7 +554,8 @@ async fn openai_chat(
         }
     };
 
-    let (messages, params) = (req.to_chat_messages(), req.to_generation_params());
+    let (messages, mut params) = (req.to_chat_messages(), req.to_generation_params());
+    trim_tools_for_model(&state, &messages, &mut params, &client);
     let shape = log_request_shape(&client, "openai", req.stream, &messages, &params);
 
     let mut handle = match submit(&state, messages, params, &client) {
@@ -483,36 +597,18 @@ async fn openai_chat(
         .into_response();
     }
 
-    // A tool call cannot be recognised until the whole of it has arrived — it is
-    // JSON inside a tag, and half of it is not a call. So when the client has
-    // offered tools, the answer is collected and then emitted as one correct
-    // stream. The latency this costs is real, but it only applies to the
-    // agentic path, where no one is watching tokens appear anyway.
-    //
-    // It also means a failure on the agentic path — the path where prompts are
-    // largest and overflow likeliest — is always known before anything is sent,
-    // so it can always be a real HTTP error.
-    if !req.tools.is_empty() {
-        let answer = collect(&mut handle).await;
-        guard.disarm();
-        state.finish_request();
-        if let Some(failure) = &answer.failure {
-            return error_response(Dialect::OpenAi, &explain_overflow(failure, shape.tools, shape.tool_chars));
-        }
-        return Sse::new(openai_buffered_stream(
-            answer.text,
-            answer.finish,
-            answer.tokens,
-            id,
-            created,
-            model,
-        ))
-        .keep_alive(KeepAlive::default())
-        .into_response();
-    }
-
     // Wait for the first chunk before committing to a 200, so a request that
     // fails during prefill is answered rather than left blank.
+    //
+    // This is also what lets the tool-carrying path stream. It used to `collect`
+    // the entire answer first, reasoning that a tool call is only recognisable
+    // whole and that "no one is watching tokens appear" on the agentic path. The
+    // first half is true of the *call*; it is not true of the prose beside it,
+    // and every agentic client sends tools on every request — so in practice
+    // nothing served through this gateway ever streamed, and
+    // time-to-first-visible-token was the entire generation time. Peeking gives
+    // the same guarantee collecting did — an overflow is a real HTTP error
+    // rather than an empty 200 — without paying for the rest of the answer.
     let first = peek(&mut handle).await;
     if let Some(failure) = first.as_ref().and_then(|c| c.error.as_ref()) {
         guard.disarm();
@@ -520,45 +616,94 @@ async fn openai_chat(
         return error_response(Dialect::OpenAi, &explain_overflow(failure, shape.tools, shape.tool_chars));
     }
 
+    // With tools offered, the same stream runs through a sieve that holds back
+    // anything that might be the opening of a call.
+    if !req.tools.is_empty() {
+        return Sse::new(openai_tool_stream(
+            state.clone(), handle, guard, first, id, created, model,
+        ))
+        .keep_alive(KeepAlive::default())
+        .into_response();
+    }
+
     Sse::new(openai_stream(state.clone(), handle, guard, first, id, created, model))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
-/// Replays a completed answer as a well-formed OpenAI stream.
+/// Streams an answer that may contain tool calls.
 ///
-/// Used when tools were offered; see [`openai_chat`].
-fn openai_buffered_stream(
-    text: String,
-    finish: String,
-    _tokens: u32,
+/// Identical to [`openai_stream`] except that text passes through a
+/// [`StreamSieve`](crate::gateway::toolcall::StreamSieve), which releases prose
+/// immediately and withholds anything that could be the opening of a call. At
+/// the end the accumulated output is parsed once: a call is emitted as a proper
+/// `tool_calls` delta, and text the sieve held back that turned out to be
+/// ordinary prose is released.
+fn openai_tool_stream(
+    state: Arc<GatewayState>,
+    handle: GenerationHandle,
+    mut guard: CancelOnDrop,
+    first: Option<StreamChunk>,
     id: String,
     created: u64,
     model: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
-    let parsed = crate::gateway::toolcall::parse(&text);
-    let reason = parsed.finish_reason(&finish).to_string();
+    let canceller: Canceller = handle.canceller();
+    let chunks = stream::iter(first).chain(UnboundedReceiverStream::new(handle.chunks));
 
-    let mut events = vec![Ok(Event::default()
-        .data(json_of(&ChatCompletionChunk::opening(&id, created, &model))))];
+    let (head_id, head_model) = (id.clone(), model.clone());
+    let head = stream::once(async move {
+        Ok(Event::default().data(json_of(&ChatCompletionChunk::opening(&head_id, created, &head_model))))
+    });
 
-    if !parsed.text.is_empty() {
-        events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::text(
-            &id, created, &model, parsed.text.clone(),
-        )))));
-    }
-    if !parsed.calls.is_empty() {
-        events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::tool_calls(
-            &id, created, &model, &parsed.calls,
-        )))));
-    }
+    let mut sieve = crate::gateway::toolcall::StreamSieve::new();
+    let (body_id, body_model) = (id.clone(), model.clone());
+    let body = chunks.flat_map(move |chunk: StreamChunk| {
+        let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
-    events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::closing(
-        &id, created, &model, &reason,
-    )))));
-    events.push(Ok(Event::default().data("[DONE]")));
+        if chunk.is_final {
+            guard.disarm();
+        }
 
-    stream::iter(events)
+        if let Some(failure) = &chunk.error {
+            // Past the point where an HTTP status was still possible.
+            events.push(Ok(error_event(Dialect::OpenAi, failure)));
+        } else if chunk.is_final {
+            let natural = chunk.finish_reason.clone().unwrap_or_else(|| "stop".to_string());
+            let parsed = crate::gateway::toolcall::parse(sieve.full());
+
+            if let Some(rest) = sieve.finish(&parsed) {
+                events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::text(
+                    &body_id, created, &body_model, rest,
+                )))));
+            }
+            if !parsed.calls.is_empty() {
+                events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::tool_calls(
+                    &body_id, created, &body_model, &parsed.calls,
+                )))));
+            }
+            events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::closing(
+                &body_id, created, &body_model, parsed.finish_reason(&natural),
+            )))));
+        } else if !chunk.text.is_empty() {
+            if let Some(out) = sieve.push(&chunk.text) {
+                events.push(Ok(Event::default().data(json_of(&ChatCompletionChunk::text(
+                    &body_id, created, &body_model, out,
+                )))));
+            }
+        }
+
+        stream::iter(events)
+    });
+
+    let tail = stream::once(async move {
+        // The client has read everything; make sure nothing keeps generating.
+        canceller.cancel();
+        state.finish_request();
+        Ok(Event::default().data("[DONE]"))
+    });
+
+    head.chain(body).chain(tail)
 }
 
 /// `opening chunk` → `text chunk`* → `closing chunk` → `[DONE]`.
@@ -636,7 +781,8 @@ async fn anthropic_messages(
         }
     };
 
-    let (messages, params) = (req.to_chat_messages(), req.to_generation_params());
+    let (messages, mut params) = (req.to_chat_messages(), req.to_generation_params());
+    trim_tools_for_model(&state, &messages, &mut params, &client);
     let shape = log_request_shape(&client, "anthropic", req.stream, &messages, &params);
 
     let mut handle = match submit(&state, messages, params, &client) {
@@ -671,22 +817,11 @@ async fn anthropic_messages(
             .into_response();
     }
 
-    // Same reasoning as the OpenAI path: a tool call is only recognisable whole,
-    // and collecting first means an agentic request that overflows the context
-    // is reported as an error rather than as an empty answer.
-    if !req.tools.is_empty() {
-        let answer = collect(&mut handle).await;
-        guard.disarm();
-        state.finish_request();
-        if let Some(failure) = &answer.failure {
-            return error_response(Dialect::Anthropic, &explain_overflow(failure, shape.tools, shape.tool_chars));
-        }
-        let stop = anthropic::map_stop_reason(&answer.finish);
-        return Sse::new(anthropic_buffered_stream(answer.text, stop, answer.tokens, id, model))
-            .keep_alive(KeepAlive::default())
-            .into_response();
-    }
-
+    // Peeking rather than collecting, for the reason given on the OpenAI path:
+    // it keeps the guarantee that an overflow is a real HTTP error, without
+    // withholding the answer until it is complete. This is the path Claude Code
+    // and every other agentic client uses, and it always carries tools — so
+    // collecting here meant nothing ever streamed.
     let first = peek(&mut handle).await;
     if let Some(failure) = first.as_ref().and_then(|c| c.error.as_ref()) {
         guard.disarm();
@@ -694,60 +829,114 @@ async fn anthropic_messages(
         return error_response(Dialect::Anthropic, &explain_overflow(failure, shape.tools, shape.tool_chars));
     }
 
+    if !req.tools.is_empty() {
+        return Sse::new(anthropic_tool_stream(state.clone(), handle, guard, first, id, model))
+            .keep_alive(KeepAlive::default())
+            .into_response();
+    }
+
     Sse::new(anthropic_stream(state.clone(), handle, guard, first, id, model))
         .keep_alive(KeepAlive::default())
         .into_response()
 }
 
-/// Replays a completed answer as the exact event sequence Anthropic clients
-/// require, with a `tool_use` block per call the model made.
-fn anthropic_buffered_stream(
-    text: String,
-    stop_reason: &'static str,
-    tokens: u32,
+/// Streams an Anthropic answer that may contain tool calls.
+///
+/// Text streams into content block 0 as it is produced, filtered by a
+/// [`StreamSieve`](crate::gateway::toolcall::StreamSieve). Any calls are emitted
+/// as `tool_use` blocks after that one closes, which is the same block ordering
+/// the buffered form produced — clients key their assembly on the index, so the
+/// numbering has to stay stable.
+fn anthropic_tool_stream(
+    state: Arc<GatewayState>,
+    handle: GenerationHandle,
+    mut guard: CancelOnDrop,
+    first: Option<StreamChunk>,
     id: String,
     model: String,
 ) -> impl Stream<Item = Result<Event, Infallible>> {
+    let canceller: Canceller = handle.canceller();
+    let chunks = stream::iter(first).chain(UnboundedReceiverStream::new(handle.chunks));
+    let outcome = Outcome::new();
+    let calls: Arc<Mutex<Vec<crate::gateway::toolcall::ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
+
     fn sse((name, data): (&'static str, String)) -> Result<Event, Infallible> {
         Ok(Event::default().event(name).data(data))
     }
 
-    let parsed = crate::gateway::toolcall::parse(&text);
-    let stop = if parsed.calls.is_empty() { stop_reason } else { "tool_use" };
+    let head = stream::iter(vec![
+        sse(StreamEvents::message_start(&id, &model)),
+        sse(StreamEvents::content_block_start()),
+    ]);
 
-    let mut events = vec![sse(StreamEvents::message_start(&id, &model))];
+    let mut sieve = crate::gateway::toolcall::StreamSieve::new();
+    let body_outcome = outcome.clone();
+    let body_calls = calls.clone();
+    let body = chunks.flat_map(move |chunk: StreamChunk| {
+        let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
-    // Blocks are indexed across the whole message, so text and tool_use share
-    // one counter — a client keys its assembly on that index.
-    let mut index = 0u32;
-    if !parsed.text.is_empty() {
-        events.push(sse(StreamEvents::content_block_start_at(index)));
-        events.push(sse(StreamEvents::content_block_delta_at(index, &parsed.text)));
-        events.push(sse(StreamEvents::content_block_stop_at(index)));
-        index += 1;
-    }
+        if let Some(failure) = &chunk.error {
+            // Too late for a status code, but the client still gets the reason.
+            guard.disarm();
+            body_outcome.record("error".to_string(), 0);
+            events.push(Ok(error_event(Dialect::Anthropic, failure)));
+        } else if chunk.is_final {
+            // Generation ended on its own, so dropping the guard must not read
+            // as an abandonment.
+            guard.disarm();
 
-    for call in &parsed.calls {
-        let input: serde_json::Value =
-            serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
-        events.push(sse(StreamEvents::tool_use_start(index, &call.id, &call.name)));
-        // Sent whole rather than as partial JSON: Sarathi has the complete
-        // arguments by this point, and splitting them would only give the
-        // client something to reassemble.
-        events.push(sse(StreamEvents::tool_use_delta(index, &input.to_string())));
-        events.push(sse(StreamEvents::content_block_stop_at(index)));
-        index += 1;
-    }
+            let parsed = crate::gateway::toolcall::parse(sieve.full());
+            if let Some(rest) = sieve.finish(&parsed) {
+                events.push(sse(StreamEvents::content_block_delta(&rest)));
+            }
 
-    if index == 0 {
-        events.push(sse(StreamEvents::content_block_start_at(0)));
-        events.push(sse(StreamEvents::content_block_stop_at(0)));
-    }
+            let natural =
+                anthropic::map_stop_reason(chunk.finish_reason.as_deref().unwrap_or("stop"));
+            let reason = if parsed.calls.is_empty() { natural } else { "tool_use" };
+            if let Ok(mut slot) = body_calls.lock() {
+                *slot = parsed.calls;
+            }
+            // Terminal events belong to `tail`; just record how it ended.
+            body_outcome.record(reason.to_string(), chunk.tokens_generated.unwrap_or(0));
+        } else if !chunk.text.is_empty() {
+            if let Some(out) = sieve.push(&chunk.text) {
+                events.push(sse(StreamEvents::content_block_delta(&out)));
+            }
+        }
 
-    events.push(sse(StreamEvents::message_delta(stop, tokens)));
-    events.push(sse(StreamEvents::message_stop()));
+        stream::iter(events)
+    });
 
-    stream::iter(events)
+    let tail_outcome = outcome.clone();
+    let tail = stream::once(async move {
+        canceller.cancel();
+        state.finish_request();
+        let (reason, tokens) = tail_outcome.get();
+        let calls = calls.lock().map(|g| g.clone()).unwrap_or_default();
+        (reason, tokens, calls)
+    })
+    .flat_map(|(stop_reason, tokens, calls)| {
+        // Block 0 is the text block opened in `head`; tool_use blocks follow it.
+        let mut events = vec![sse(StreamEvents::content_block_stop())];
+
+        for (offset, call) in calls.iter().enumerate() {
+            let index = offset as u32 + 1;
+            let input: serde_json::Value =
+                serde_json::from_str(&call.arguments).unwrap_or_else(|_| serde_json::json!({}));
+            events.push(sse(StreamEvents::tool_use_start(index, &call.id, &call.name)));
+            // Sent whole rather than as partial JSON: the arguments are complete
+            // by this point, and splitting them would only give the client
+            // something to reassemble.
+            events.push(sse(StreamEvents::tool_use_delta(index, &input.to_string())));
+            events.push(sse(StreamEvents::content_block_stop_at(index)));
+        }
+
+        events.push(sse(StreamEvents::message_delta(&stop_reason, tokens)));
+        events.push(sse(StreamEvents::message_stop()));
+        stream::iter(events)
+    });
+
+    head.chain(body).chain(tail)
 }
 
 /// The exact event order Anthropic clients require:
@@ -815,6 +1004,126 @@ fn anthropic_stream(
     });
 
     head.chain(body).chain(tail)
+}
+
+#[cfg(test)]
+mod fit_tests {
+    use super::*;
+
+    /// A tool schema of roughly `chars` characters, as an MCP server would send.
+    fn tool(name: &str, chars: usize) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "description": "x".repeat(chars),
+            "input_schema": { "type": "object" },
+        })
+    }
+
+    fn params(tools: Vec<serde_json::Value>, max_tokens: u32) -> GenerationParams {
+        GenerationParams { tools, max_tokens, ..Default::default() }
+    }
+
+    fn msg(content: &str) -> ChatMessage {
+        ChatMessage::new("user", content)
+    }
+
+    /// The reported failure, reproduced: 125 tools of schema against a
+    /// 32,768-token context and a one-word message. It must now fit.
+    #[test]
+    fn the_reported_overflow_is_trimmed_until_it_fits() {
+        // ~184k chars of schema across 125 tools, which is what produced the
+        // 49,478-token prompt.
+        let tools: Vec<_> = (0..125).map(|i| tool(&format!("t{i}"), 1470)).collect();
+        let mut p = params(tools, 4096);
+        let messages = vec![msg("Hii")];
+
+        let dropped = fit_tools_to_context(&messages, &mut p, 32_768);
+
+        assert!(dropped > 0, "125 schemas cannot fit a 32k context");
+        assert!(!p.tools.is_empty(), "trimming must not strip the agent of every tool");
+
+        let kept_tokens: usize = p
+            .tools
+            .iter()
+            .map(|t| serde_json::to_string(t).unwrap().len() / CHARS_PER_TOKEN)
+            .sum();
+        assert!(
+            kept_tokens + 4096 + FIT_MARGIN_TOKENS <= 32_768,
+            "what survived still has to fit: {kept_tokens} tokens of schema"
+        );
+    }
+
+    /// The ordinary case must cost nothing: a tool set that fits is untouched.
+    #[test]
+    fn a_tool_set_that_fits_is_left_alone() {
+        let tools: Vec<_> = (0..8).map(|i| tool(&format!("t{i}"), 400)).collect();
+        let mut p = params(tools, 1024);
+
+        assert_eq!(fit_tools_to_context(&[msg("hello")], &mut p, 32_768), 0);
+        assert_eq!(p.tools.len(), 8);
+    }
+
+    /// Clients list their own built-ins first and append MCP tools, so the head
+    /// of the list is what an agent cannot work without.
+    #[test]
+    fn trimming_takes_from_the_tail_and_keeps_the_order() {
+        let tools = vec![
+            tool("Read", 300),
+            tool("Write", 300),
+            tool("Bash", 300),
+            tool("mcp_huge", 60_000),
+        ];
+        let mut p = params(tools, 512);
+
+        assert_eq!(fit_tools_to_context(&[msg("hi")], &mut p, 4096), 1);
+        let names: Vec<&str> = p.tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["Read", "Write", "Bash"]);
+    }
+
+    /// When the conversation alone overflows, no tool selection can save it —
+    /// and the overflow error should describe that, not a tool problem.
+    #[test]
+    fn a_conversation_that_cannot_fit_drops_every_tool() {
+        let mut p = params(vec![tool("a", 100)], 512);
+        let huge = "x".repeat(500_000);
+
+        assert_eq!(fit_tools_to_context(&[msg(&huge)], &mut p, 8192), 1);
+        assert!(p.tools.is_empty());
+    }
+
+    #[test]
+    fn a_request_with_no_tools_is_untouched() {
+        let mut p = params(vec![], 512);
+        assert_eq!(fit_tools_to_context(&[msg("hi")], &mut p, 8192), 0);
+    }
+
+    /// An unknown context must not be treated as "zero room for anything".
+    #[test]
+    fn an_unknown_context_length_trims_nothing() {
+        let mut p = params(vec![tool("a", 100)], 512);
+        assert_eq!(fit_tools_to_context(&[msg("hi")], &mut p, 0), 0);
+        assert_eq!(p.tools.len(), 1);
+    }
+
+    /// Room for the answer is reserved too, or a prompt could fit exactly and
+    /// then overflow the moment generation began.
+    #[test]
+    fn the_reply_gets_room_reserved_for_it() {
+        // Sized so the two budgets genuinely differ: 20 schemas of ~1,000
+        // tokens each against a 16k context, where the answer's share decides
+        // how many survive.
+        let tools: Vec<_> = (0..20).map(|i| tool(&format!("t{i}"), 3000)).collect();
+
+        let mut small = params(tools.clone(), 256);
+        let mut large = params(tools, 8192);
+        fit_tools_to_context(&[msg("hi")], &mut small, 16_384);
+        fit_tools_to_context(&[msg("hi")], &mut large, 16_384);
+
+        assert!(
+            large.tools.len() < small.tools.len(),
+            "a bigger max_tokens must leave less room for schemas"
+        );
+    }
 }
 
 #[cfg(test)]

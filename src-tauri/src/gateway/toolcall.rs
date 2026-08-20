@@ -57,6 +57,152 @@ impl ParsedCompletion {
     }
 }
 
+/// Every string that can open a tool call in one of the supported formats.
+///
+/// Kept beside the extractors that consume them: adding a format means adding
+/// its opener here, or [`StreamSieve`] will stream the call out as prose before
+/// the parser ever sees it.
+///
+/// The fence is included even though a fenced block is usually just a code
+/// sample. Being wrong that way costs a little streaming latency on answers
+/// containing code; being wrong the other way emits half a tool call as text.
+const OPENERS: [&str; 8] = [
+    "<tool_call>",
+    "<tool_call ",
+    "<|tool_call_start|>",
+    "<|python_tag|>",
+    "[TOOL_CALLS]",
+    "<function",
+    "<tool ",
+    "```",
+];
+
+/// Releases model output for streaming, holding back anything that might turn
+/// out to be a tool call.
+///
+/// ## Why this exists
+///
+/// A tool call is only recognisable once it is complete, so the gateway used to
+/// collect the *entire* answer before sending any of it whenever the request
+/// carried tools. Every agentic client sends tools on every request, so in
+/// practice nothing ever streamed: time-to-first-visible-token was the full
+/// generation time, and a 500-token answer at 50 tok/s showed nothing for ten
+/// seconds. That is the single largest source of perceived slowness for anything
+/// driving Sarathi through the gateway.
+///
+/// Prose and tool calls are distinguishable much earlier than "at the end",
+/// though — every supported format announces itself with one of [`OPENERS`].
+/// So text is released as it arrives until an opener appears, at which point the
+/// sieve closes and the rest is accumulated for [`parse`].
+///
+/// ## What is held back
+///
+/// Only a partial opener at the very end of what has arrived. If output ends in
+/// `"<too"` that could still become `<tool_call>`, so those bytes wait for the
+/// next chunk. Anything that cannot begin an opener goes out immediately.
+///
+/// A response that is *entirely* a bare-JSON call (Llama 3.1 emits one with no
+/// marker at all) is caught by the leading `{` or `[` check, so it never
+/// streams a fragment of JSON as prose.
+#[derive(Debug, Default)]
+pub struct StreamSieve {
+    /// Everything received so far.
+    full: String,
+    /// Bytes of `full` already handed to the client.
+    released: usize,
+    /// Set once an opener is seen; nothing is released after that.
+    closed: bool,
+}
+
+impl StreamSieve {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Everything the model has produced so far.
+    pub fn full(&self) -> &str {
+        &self.full
+    }
+
+    /// Accepts a delta and returns the text that is now safe to send.
+    pub fn push(&mut self, delta: &str) -> Option<String> {
+        self.full.push_str(delta);
+        if self.closed {
+            return None;
+        }
+
+        // A response that opens with JSON may be a bare call in its entirety, so
+        // nothing may be released until the parser has seen all of it.
+        let lead = self.full.trim_start();
+        if lead.starts_with('{') || lead.starts_with('[') {
+            self.closed = true;
+            return None;
+        }
+
+        // The earliest complete opener closes the sieve permanently.
+        if let Some(at) = OPENERS.iter().filter_map(|o| self.full.find(o)).min() {
+            self.closed = true;
+            return self.release_to(at);
+        }
+
+        // Otherwise release everything except a trailing partial opener.
+        let hold = partial_opener_len(&self.full);
+        self.release_to(self.full.len() - hold)
+    }
+
+    /// Text between `released` and `end`, advancing the cursor.
+    fn release_to(&mut self, end: usize) -> Option<String> {
+        if end <= self.released {
+            return None;
+        }
+        let out = self.full[self.released..end].to_string();
+        self.released = end;
+        Some(out)
+    }
+
+    /// The text still owed to the client once generation has ended.
+    ///
+    /// When the model called something, the call itself is delivered separately
+    /// and only prose the parser kept is owed — and only the part not already
+    /// streamed. When it did not, everything held back is released, which is how
+    /// a fenced code block that was never a tool call still arrives complete.
+    pub fn finish(&self, parsed: &ParsedCompletion) -> Option<String> {
+        let streamed = &self.full[..self.released];
+
+        if parsed.calls.is_empty() {
+            let rest = &self.full[self.released..];
+            return (!rest.is_empty()).then(|| rest.to_string());
+        }
+
+        // Anything the parser kept beyond what was already sent. The guard
+        // matters: extractors trim, so `parsed.text` is not always a literal
+        // continuation of what went out, and sending it again would duplicate.
+        parsed
+            .text
+            .strip_prefix(streamed)
+            .filter(|rest| !rest.is_empty())
+            .map(str::to_string)
+    }
+}
+
+/// Length of the trailing run of `text` that could still grow into an opener.
+fn partial_opener_len(text: &str) -> usize {
+    // Longest opener bounds how far back a partial match can start.
+    let max = OPENERS.iter().map(|o| o.len()).max().unwrap_or(0);
+    let window = max.min(text.len());
+
+    // Longest first, so the most cautious answer wins.
+    (1..=window)
+        .rev()
+        .find(|&k| {
+            let Some(tail) = text.get(text.len() - k..) else {
+                return false;
+            };
+            OPENERS.iter().any(|o| o.len() > k && o.starts_with(tail))
+        })
+        .unwrap_or(0)
+}
+
 /// Extracts tool calls from raw model output.
 ///
 /// `seq` seeds the generated call ids so two calls in one response never
@@ -658,6 +804,133 @@ mod tests {
 
     fn args_of(c: &ToolCall) -> serde_json::Value {
         serde_json::from_str(&c.arguments).expect("arguments must be valid JSON")
+    }
+
+    // ─── Streaming sieve ────────────────────────────────────────────────────
+
+    /// Feeds `output` through the sieve one token-sized piece at a time and
+    /// returns what a client would have seen, in order.
+    fn sieve_stream(output: &str, piece: usize) -> (String, StreamSieve) {
+        let mut sieve = StreamSieve::new();
+        let mut seen = String::new();
+        let bytes: Vec<char> = output.chars().collect();
+        for chunk in bytes.chunks(piece) {
+            let delta: String = chunk.iter().collect();
+            if let Some(out) = sieve.push(&delta) {
+                seen.push_str(&out);
+            }
+        }
+        (seen, sieve)
+    }
+
+    /// The point of the whole thing: ordinary prose streams as it arrives
+    /// instead of waiting for the answer to finish.
+    #[test]
+    fn prose_is_released_while_it_is_still_being_generated() {
+        let mut sieve = StreamSieve::new();
+
+        assert_eq!(sieve.push("Hello, ").as_deref(), Some("Hello, "));
+        assert_eq!(sieve.push("world").as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn prose_streamed_in_pieces_arrives_whole_and_in_order() {
+        let text = "The capital of France is Paris, and it has been since 987.";
+        let (seen, sieve) = sieve_stream(text, 3);
+        let parsed = parse(sieve.full());
+
+        let tail = sieve.finish(&parsed).unwrap_or_default();
+        assert_eq!(format!("{seen}{tail}"), text);
+        assert!(parsed.calls.is_empty());
+    }
+
+    /// A partial opener must not be streamed out as prose — the client would
+    /// see `<tool` appear in the answer and then never be completed.
+    #[test]
+    fn a_half_written_opener_is_held_back() {
+        let mut sieve = StreamSieve::new();
+
+        assert_eq!(sieve.push("ok ").as_deref(), Some("ok "));
+        assert_eq!(sieve.push("<tool").as_deref(), None, "could still become <tool_call>");
+        assert_eq!(sieve.push("_call>{}").as_deref(), None, "and it did");
+    }
+
+    /// Text before a tool call is still streamed; the call itself is not.
+    #[test]
+    fn text_before_a_tool_call_streams_but_the_call_does_not() {
+        let output = "Let me look that up. <tool_call>{\"name\":\"search\",\"arguments\":{\"q\":\"x\"}}</tool_call>";
+        let (seen, sieve) = sieve_stream(output, 4);
+
+        assert_eq!(seen, "Let me look that up. ");
+        assert!(!seen.contains("tool_call"), "no call syntax may reach the client as prose");
+
+        let parsed = parse(sieve.full());
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "search");
+        // The parser's prose is what was already streamed, so nothing is owed.
+        assert_eq!(sieve.finish(&parsed), None, "the client must not be sent it twice");
+    }
+
+    /// Llama 3.1 emits a bare JSON call with no marker at all. Not one byte of
+    /// it may be streamed as prose.
+    #[test]
+    fn a_bare_json_call_never_streams_as_prose() {
+        let output = "{\"name\":\"get_weather\",\"parameters\":{\"city\":\"Oslo\"}}";
+        let (seen, sieve) = sieve_stream(output, 5);
+
+        assert!(seen.is_empty(), "streamed {seen:?} of what is entirely a call");
+
+        let parsed = parse(sieve.full());
+        assert_eq!(parsed.calls.len(), 1);
+        assert_eq!(parsed.calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn a_mistral_call_is_recognised_before_its_body_streams() {
+        let output = "[TOOL_CALLS] [{\"name\":\"ping\",\"arguments\":{}}]";
+        let (seen, sieve) = sieve_stream(output, 6);
+
+        assert!(seen.is_empty());
+        assert_eq!(parse(sieve.full()).calls.len(), 1);
+    }
+
+    /// A fenced block closes the sieve, but most fenced blocks are just code.
+    /// When the parser finds no call, everything held back is still delivered.
+    #[test]
+    fn a_code_block_that_was_never_a_tool_call_is_delivered_in_full() {
+        let output = "Here:\n```rust\nfn main() {}\n```\nThat compiles.";
+        let (seen, sieve) = sieve_stream(output, 7);
+
+        let parsed = parse(sieve.full());
+        assert!(parsed.calls.is_empty(), "a code sample is not a call");
+
+        let tail = sieve.finish(&parsed).expect("the held-back remainder is owed");
+        assert_eq!(format!("{seen}{tail}"), output, "nothing may be lost");
+    }
+
+    /// Whatever the chunk boundaries, the client sees the same bytes.
+    #[test]
+    fn the_result_does_not_depend_on_how_output_is_chunked() {
+        let output = "Checking. <tool_call>{\"name\":\"ls\",\"arguments\":{}}</tool_call>";
+
+        for piece in [1, 2, 3, 5, 8, 13, 64] {
+            let (seen, sieve) = sieve_stream(output, piece);
+            let parsed = parse(sieve.full());
+            assert_eq!(seen, "Checking. ", "chunked by {piece}");
+            assert_eq!(parsed.calls.len(), 1, "chunked by {piece}");
+        }
+    }
+
+    /// Multi-byte characters must not be split mid-sequence when holding back a
+    /// partial opener.
+    #[test]
+    fn multibyte_text_survives_the_sieve() {
+        let output = "Résumé: café — naïve 日本語 🚀 done.";
+        let (seen, sieve) = sieve_stream(output, 2);
+        let parsed = parse(sieve.full());
+
+        let tail = sieve.finish(&parsed).unwrap_or_default();
+        assert_eq!(format!("{seen}{tail}"), output);
     }
 
     #[test]
