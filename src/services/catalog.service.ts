@@ -37,6 +37,15 @@ export interface CatalogPage {
   refreshing: boolean;
   /** Explains a partial result, e.g. rate limiting or browsing without a token. */
   notice?: string | null;
+  /**
+   * How many swept models were dropped for having no placement on this machine.
+   *
+   * Discover lists only models that run here, so this is the difference between
+   * what the Hub offered and what is shown. Reported so the count can be stated
+   * plainly rather than leaving the listing looking mysteriously short. Zero
+   * when hardware could not be read, since nothing is filtered then.
+   */
+  hiddenIncompatible: number;
 }
 
 /**

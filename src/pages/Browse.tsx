@@ -15,7 +15,7 @@ import {
   Cpu,
   Database,
 } from 'lucide-react';
-import { Button, Spinner } from '../components/ui';
+import { Button } from '../components/ui';
 import {
   browseModelCards,
   findModelAdapters,
@@ -35,7 +35,6 @@ import {
 import { startModelDownload } from '../services/download.service';
 import { useDownloads } from '../hooks/useDownloads';
 import { useToast } from '../hooks/useToast';
-import { useConfirm, type ConfirmFn } from '../contexts/ConfirmContext';
 import {
   CATEGORY_LABELS,
   KIND_LABELS,
@@ -44,6 +43,7 @@ import {
   type ModelCard,
   type ModelCategory,
   type ModelKind,
+  type Placement,
 } from '../types/ai';
 import styles from './Browse.module.css';
 
@@ -214,18 +214,25 @@ export const Browse: React.FC = () => {
   // page rather than per request, so a background refresh started by an earlier
   // visit still reports into this one.
   //
-  // CRITICAL: Subscribe BEFORE calling load() to avoid race condition where
-  // progress events fire before the subscription is ready. Without this, the
-  // loading UI may not receive progress updates on the first load.
+  // The subscription is *awaited* before the load starts. Registering it in an
+  // earlier `useEffect` than the one calling `load()` was not enough: `listen`
+  // returns a promise, and the sweep began while that promise was still
+  // pending, so the earliest events — the whole searching phase — were emitted
+  // before anything was listening. That is what left the screen showing a bare
+  // spinner and no numbers during the part of the load that takes longest.
   useEffect(() => {
-    const pending = onCatalogProgress(setProgress);
-    return () => {
-      void pending.then((off) => off());
-    };
-  }, []);
+    let unlisten: (() => void) | undefined;
+    let cancelled = false;
 
-  useEffect(() => {
-    load();
+    void (async () => {
+      unlisten = await onCatalogProgress(setProgress);
+      if (!cancelled) void load();
+    })();
+
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
   }, [load]);
 
   // A background refresh replaces the stored library. Re-reading it here is
@@ -289,6 +296,11 @@ export const Browse: React.FC = () => {
    * drawn would describe the wrong work.
    */
   const backgroundProgress = progress?.background ? progress : null;
+  /** The refresh's completed share, or null while it has no denominator yet. */
+  const backgroundPct =
+    backgroundProgress?.fraction != null
+      ? Math.round(backgroundProgress.fraction * 100)
+      : null;
 
   /**
    * Recommended cards shown as their own section, ahead of everything else.
@@ -318,10 +330,20 @@ export const Browse: React.FC = () => {
       <header className={styles.header}>
         <div>
           <h1 className={styles.title}>Models</h1>
+          {/* Says what the listing *is*, which is not "HuggingFace" but "the
+            * part of HuggingFace that runs here". Naming the models left out
+            * keeps a short list from reading as a failed fetch. */}
           <p className={styles.subtitle}>
             {activeSearch
               ? `Results for “${activeSearch}”`
-              : 'Popular models from HuggingFace, sized for your hardware.'}
+              : 'Models that run on this computer, from HuggingFace.'}
+            {!activeSearch && (page?.hiddenIncompatible ?? 0) > 0 && (
+              <span className={styles.filterNote}>
+                {' · '}
+                {page?.hiddenIncompatible.toLocaleString()} hidden — too large for this
+                hardware
+              </span>
+            )}
           </p>
         </div>
 
@@ -370,9 +392,32 @@ export const Browse: React.FC = () => {
               ? // The same counts the loading screen would show, in one line.
                 // "Checking in the background" on its own is indistinguishable
                 // from a check that silently died.
-                ` ${backgroundProgress?.message ?? 'Checking HuggingFace for new models'}…`
+                ` ${backgroundProgress?.message ?? 'Updating model library'}…`
               : ' It is up to date.'}
           </span>
+
+          {/* The refresh's own progress, kept to a thin bar inside this row.
+            * The results are already on screen and readable, so this reports the
+            * update without taking the page over the way the first-load panel
+            * does. Rendered only while a refresh is running, so the row does not
+            * reserve empty space once the library is up to date. */}
+          {page.refreshing && (
+            <div
+              className={styles.miniTrack}
+              role="progressbar"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              // Absent during the search phase for the same reason the full
+              // panel omits it: the denominator is not known yet.
+              aria-valuenow={backgroundPct ?? undefined}
+              aria-label="Updating the model library"
+            >
+              <div
+                className={backgroundPct === null ? styles.miniIndeterminate : styles.miniFill}
+                style={backgroundPct === null ? undefined : { width: `${backgroundPct}%` }}
+              />
+            </div>
+          )}
           <Button
             variant="ghost"
             size="sm"
@@ -471,15 +516,24 @@ export const Browse: React.FC = () => {
           )}
         </nav>
 
-        <section className={styles.results}>
+        <section
+          className={loading ? `${styles.results} ${styles.resultsCentered}` : styles.results}
+        >
           {loading && <LoadingLibrary progress={progress} />}
 
+          {/* An empty listing has two very different causes now, and saying
+            * "no models found" for both would be misleading. If models were
+            * found and then filtered out, the honest message is that this
+            * hardware cannot run them — not that the Hub had nothing. */}
           {!loading && visible.length === 0 && !error && (
             <div className={styles.centered}>
               <p>
-                {selection.tab === 'all'
-                  ? 'No models found. Try a different search.'
-                  : 'Nothing in this category yet.'}
+                {selection.tab !== 'all'
+                  ? 'Nothing in this category runs on this computer.'
+                  : (page?.hiddenIncompatible ?? 0) > 0
+                    ? `None of the ${page?.hiddenIncompatible.toLocaleString()} models found ` +
+                      `will run on this computer’s memory.`
+                    : 'No models found. Try a different search.'}
               </p>
             </div>
           )}
@@ -559,103 +613,152 @@ function ageLabel(seconds?: number | null): string | null {
  * so an indeterminate shimmer is shown rather than a percentage that would have
  * to jump backwards when the truth arrives.
  */
+/** `95` -> `1:35`. Tabular digits keep it from jittering as it counts. */
+function clock(seconds: number): string {
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+}
+
+/** What each phase is actually doing, in the order they run. */
+const PHASES: { key: CatalogProgress['phase']; label: string }[] = [
+  { key: 'searching', label: 'Searching' },
+  { key: 'fetching', label: 'Reading details' },
+  { key: 'caching', label: 'Saving' },
+];
+
 function LoadingLibrary({ progress }: { progress: CatalogProgress | null }) {
   const pct = progress?.fraction != null ? Math.round(progress.fraction * 100) : null;
 
+  // A clock that ticks regardless of what the backend is doing.
+  //
+  // Every other signal here depends on an event arriving, and the gaps between
+  // events are exactly when the screen used to read as hung — a batch of eight
+  // repositories can take many seconds, and during that time nothing moved. The
+  // elapsed counter is the one thing that cannot stall while the app is alive,
+  // which makes it the difference between "working" and "frozen" at a glance.
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const started = Date.now();
+    const id = window.setInterval(
+      () => setElapsed(Math.floor((Date.now() - started) / 1000)),
+      1000
+    );
+    return () => window.clearInterval(id);
+  }, []);
+
+  const phaseIndex = PHASES.findIndex((p) => p.key === progress?.phase);
+  const current = PHASES[phaseIndex]?.label ?? 'Starting';
+
   return (
     <div className={styles.centered}>
-      <Spinner />
-      <p className={styles.loadingMessage}>
-        {progress?.message ?? 'Reading the model library…'}
-      </p>
+      <div className={styles.loadingPanel}>
+        <div className={styles.loadingHead}>
+          <span className={styles.loadingPhase}>{current}</span>
+          {/* Right-aligned against the phase so the two never reflow each
+            * other as the numbers change width. */}
+          <span className={styles.loadingClock}>{clock(elapsed)}</span>
+        </div>
 
-      <div
-        className={styles.progressTrack}
-        role="progressbar"
-        aria-valuemin={0}
-        aria-valuemax={100}
-        // Omitted while indeterminate, which is what tells a screen reader the
-        // difference between "no progress yet" and "0% done".
-        aria-valuenow={pct ?? undefined}
-        aria-label="Loading the model library"
-      >
         <div
-          className={pct === null ? styles.progressIndeterminate : styles.progressFill}
-          style={pct === null ? undefined : { width: `${pct}%` }}
-        />
-      </div>
+          className={styles.progressTrack}
+          role="progressbar"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          // Omitted while indeterminate, which is what tells a screen reader the
+          // difference between "no progress yet" and "0% done".
+          aria-valuenow={pct ?? undefined}
+          aria-label="Loading the model library"
+        >
+          <div
+            className={pct === null ? styles.progressIndeterminate : styles.progressFill}
+            style={pct === null ? undefined : { width: `${pct}%` }}
+          />
+        </div>
 
-      <p className={styles.loadingNote}>
-        {pct !== null
-          ? `${pct}% — reading details for ${progress?.total.toLocaleString()} models`
-          : 'The first load reads the whole library from HuggingFace. After this it is saved, and opening this page is instant.'}
-      </p>
+        {/* The counts, which are the proof of work: they move even when the
+          * percentage cannot be computed yet. */}
+        <div className={styles.loadingStats}>
+          <span>{progress?.message ?? 'Contacting HuggingFace…'}</span>
+          {progress != null && progress.total > 0 && (
+            <span className={styles.loadingCount}>
+              {progress.done.toLocaleString()} / {progress.total.toLocaleString()}
+              {pct !== null && ` · ${pct}%`}
+            </span>
+          )}
+        </div>
+
+        {/* Three dots showing which of the three jobs is running. A single bar
+          * cannot say that the search phase has no denominator; this can. */}
+        <ol className={styles.phaseList}>
+          {PHASES.map((p, i) => (
+            <li
+              key={p.key}
+              className={
+                i < phaseIndex
+                  ? styles.phaseDone
+                  : i === phaseIndex
+                    ? styles.phaseActive
+                    : styles.phasePending
+              }
+            >
+              {p.label}
+            </li>
+          ))}
+        </ol>
+
+        <p className={styles.loadingNote}>
+          The first load reads the whole library from HuggingFace and takes a few
+          minutes. After this it is saved, and opening this page is instant.
+        </p>
+      </div>
     </div>
   );
 }
 
-/** How the offered download would run, if it runs at all. */
-type Runs = 'vram' | 'offload' | 'no';
-
-function largest(quants: Quant[]): Quant | null {
-  return quants.reduce<Quant | null>(
-    (acc, q) => (acc === null || q.sizeBytes > acc.sizeBytes ? q : acc),
-    null
-  );
-}
+/** How the offered download would run. There is no "does not run" case here. */
+type Runs = Placement;
 
 /**
- * The size the card's button would download.
+ * The build this card offers, as chosen by the Rust planner.
  *
- * Preference order is what each option actually gives the user: a build that
- * sits on the GPU, then one that runs with its experts in system memory, then —
- * only if nothing runs — the smallest build, offered with a warning.
+ * This used to rank the quantizations itself, with a third tier that fell back
+ * to the smallest build and offered it behind a "Download anyway" warning. That
+ * tier is why models this computer cannot run were reaching the browser at all:
+ * the backend listed every repository, and the UI always found *something* to
+ * offer. Both halves are gone. Discover now only receives models with a
+ * placement, and the build is read from `bestQuantization` rather than picked
+ * again here — deciding it in two places would give two answers to one
+ * question, which is exactly the duplication the planner is meant to prevent.
  *
- * Within each tier the largest wins, because quantization trades quality for
- * size and the biggest that runs is the most capable that runs.
+ * Returns no offer when the card carries no placement. That should not happen
+ * in a normal listing; it is handled rather than asserted because a card can
+ * also come from hardware Sarathi could not read.
  */
-function pickOffer(card: ModelCard): { offer: Quant | null; runs: Runs } {
-  const onCard = largest(card.quantizations.filter((q) => q.fits));
-  if (onCard) return { offer: onCard, runs: 'vram' };
+function pickOffer(card: ModelCard): { offer: Quant | null; runs: Runs | null } {
+  if (!card.runsHere || !card.bestQuantization) return { offer: null, runs: null };
 
-  const offloaded = largest(card.quantizations.filter((q) => q.offload));
-  if (offloaded) return { offer: offloaded, runs: 'offload' };
-
-  const smallest = card.quantizations.reduce<Quant | null>(
-    (acc, q) => (acc === null || q.sizeBytes < acc.sizeBytes ? q : acc),
-    null
-  );
-  return { offer: smallest, runs: 'no' };
+  const offer = card.quantizations.find((q) => q.label === card.bestQuantization) ?? null;
+  return { offer, runs: offer ? card.runsHere : null };
 }
 
 /**
- * Starts a download, confirming first when the size cannot run here.
+ * Starts a download of a build that runs here.
  *
- * Shared by the card and the drawer so both warn identically.
+ * Shared by the card and the drawer so both behave identically.
+ *
+ * It used to take a confirmation callback and warn before downloading a build
+ * that could not load. Nothing reaches it in that state any more: Discover
+ * lists only models with a placement, and both callers offer only the builds
+ * the planner found room for. Asking the user to accept a download that would
+ * "most likely fail to load" was delegating back the judgement Sarathi exists
+ * to make.
  */
 async function beginDownload(
   card: ModelCard,
   quant: Quant,
-  addToast: (kind: 'success' | 'error', msg: string) => void,
-  // Passed in rather than reached for: this is a plain function shared by the
-  // card and the drawer, so it cannot call a hook itself.
-  confirm: ConfirmFn
+  addToast: (kind: 'success' | 'error', msg: string) => void
 ): Promise<void> {
-  // An offloadable build is not a risky download — the planner has already
-  // found a placement this machine can execute. Warning about it would train
-  // people to click through the warning that matters.
-  if (runsHere(quant) === 'no') {
-    const ok = await confirm({
-      title: `${quant.label} needs more memory than this computer has free`,
-      message:
-        `It would download ${formatSize(quant.sizeBytes)} and then most likely fail to load, ` +
-        `or run very slowly.`,
-      confirmLabel: 'Download anyway',
-      tone: 'danger',
-    });
-    if (!ok) return;
-  }
-
   try {
     await startModelDownload({
       modelId: card.repoId,
@@ -680,7 +783,6 @@ interface CardProps {
 function Card({ card, open, onOpen }: CardProps) {
   const [starting, setStarting] = useState(false);
   const { addToast } = useToast();
-  const confirm = useConfirm();
   const { isDownloading } = useDownloads();
   const fitting = card.quantizations.filter((q) => q.fits);
   const offloadable = card.quantizations.filter((q) => !q.fits && q.offload);
@@ -690,7 +792,7 @@ function Card({ card, open, onOpen }: CardProps) {
     if (!offer) return;
     setStarting(true);
     try {
-      await beginDownload(card, offer, addToast, confirm);
+      await beginDownload(card, offer, addToast);
     } finally {
       setStarting(false);
     }
@@ -775,20 +877,19 @@ function Card({ card, open, onOpen }: CardProps) {
           * it is installed from the base model's card instead. */}
         {card.kind !== 'lora-adapter' && offer && (
           <button
-            className={runs === 'no' ? styles.downloadBtnWarn : styles.downloadBtn}
+            className={styles.downloadBtn}
             disabled={starting || isDownloading(card.repoId)}
             onClick={() => void download()}
+            // Both remaining cases describe a model that runs. The third
+            // wording this replaced — "still needs more memory than this
+            // computer has free" — has no card left to appear on.
             title={
-              runs === 'vram'
-                ? `Download the largest size that fits: ${offer.label}, ${formatSize(
-                    offer.sizeBytes
-                  )}`
-                : runs === 'offload'
+              runs === 'offload'
                 ? `Download ${offer.label} (${formatSize(offer.sizeBytes)}). Larger than this ` +
                   `computer's video memory, but it runs by keeping its experts in system memory.`
-                : `${offer.label} is the smallest build at ${formatSize(
+                : `Download the largest size that fits: ${offer.label}, ${formatSize(
                     offer.sizeBytes
-                  )}, but it still needs more memory than this computer has free`
+                  )}`
             }
           >
             <Download size={13} />
@@ -796,9 +897,7 @@ function Card({ card, open, onOpen }: CardProps) {
               ? 'Downloading…'
               : starting
               ? 'Starting…'
-              : // "anyway" is the honest word: the card already says nothing
-                // runs, so the button should not pretend otherwise.
-                `Download ${offer.label}${runs === 'no' ? ' anyway' : ''}`}
+              : `Download ${offer.label}`}
           </button>
         )}
       </div>
@@ -825,7 +924,6 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
   const [installError, setInstallError] = useState<string | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
   const { addToast } = useToast();
-  const confirm = useConfirm();
   const { isDownloading } = useDownloads();
 
   // Escape closes it, as with any dialog.
@@ -879,7 +977,7 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
   const download = async (q: Quant) => {
     setStarting(q.label);
     try {
-      await beginDownload(card, q, addToast, confirm);
+      await beginDownload(card, q, addToast);
     } finally {
       setStarting(null);
     }
@@ -961,8 +1059,13 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                     >
                       {runs === 'vram' ? 'fits' : runs === 'offload' ? 'offloaded' : 'too large'}
                     </td>
+                    {/* The table lists every published build so the sizes can
+                      * be compared honestly, but only the ones that run here
+                      * are downloadable. Offering the rest would reintroduce,
+                      * one row down, the "download something that cannot load"
+                      * path the card no longer has. */}
                     <td className={styles.qAction}>
-                      {card.kind !== 'lora-adapter' && (
+                      {card.kind !== 'lora-adapter' && runs !== 'no' && (
                         <button
                           className={styles.rowBtn}
                           disabled={

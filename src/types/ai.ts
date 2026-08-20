@@ -164,8 +164,16 @@ export interface QuantizationOption {
   offloadBlockedReason?: string | null;
 }
 
+/**
+ * How a build runs on this machine.
+ *
+ * Mirrors `card::Placement` in Rust, which has no "cannot run" variant on
+ * purpose: a model with no placement is not listed at all.
+ */
+export type Placement = 'vram' | 'offload';
+
 /** Whether a build runs here, and by what route. */
-export function runsHere(q: QuantizationOption): 'vram' | 'offload' | 'no' {
+export function runsHere(q: QuantizationOption): Placement | 'no' {
   if (q.fits) return 'vram';
   if (q.offload) return 'offload';
   return 'no';
@@ -283,6 +291,21 @@ export interface ModelCard {
   totalParameters?: number | null;
   contextLength?: number | null;
   quantizations: QuantizationOption[];
+  /**
+   * How this model runs on this machine, decided by the Rust planner.
+   *
+   * Discover only lists models where this is set, so in a normal listing it is
+   * always present. It is optional because a card built on hardware Sarathi
+   * could not read carries no placement.
+   */
+  runsHere?: Placement | null;
+  /**
+   * The quantization Discover offers, chosen by the planner.
+   *
+   * Read rather than re-derived: picking the build in the UI as well would give
+   * two answers to one question, and they would drift.
+   */
+  bestQuantization?: string | null;
   /**
    * True when Sarathi vouches for this one: a publisher whose conversions are
    * dependable, enough real use to have surfaced problems, no reasoning tokens

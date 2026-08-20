@@ -56,6 +56,23 @@ pub const FRESH_FOR: chrono::Duration = chrono::Duration::hours(1);
 /// sweep is awaited instead.
 pub const USABLE_FOR: chrono::Duration = chrono::Duration::days(7);
 
+/// Ceiling on how many repositories a merged library may hold.
+///
+/// [`merge`] carries over entries a sweep did not reach, which is what stops a
+/// rate-limited refresh from destroying the library. Left unbounded that grows:
+/// the Hub reorders by popularity over weeks, so successive sweeps return
+/// overlapping but not identical sets, and the union creeps upwards forever.
+///
+/// A full authenticated sweep considers 2,000 candidates
+/// ([`AUTHENTICATED_PAGES`](super::live_catalog::AUTHENTICATED_PAGES) at 100 per
+/// page) and keeps rather fewer, since most repositories carry no usable GGUF.
+/// Double that leaves room for genuine carry-over while keeping the file, and
+/// the card-building pass that reads it, bounded.
+///
+/// Trimming takes from the tail, which is the oldest carried-over end: the
+/// current sweep is written first and is never what gets dropped.
+pub const MAX_MERGED_REPOS: usize = 4_000;
+
 /// A swept library as it sits on disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -175,6 +192,52 @@ pub fn load(app_data_dir: &Path) -> Option<CachedLibrary> {
             None
         }
     }
+}
+
+/// Folds a sweep into whatever is already stored, and returns the union.
+///
+/// A sweep is not always the whole library. When HuggingFace rate-limits a
+/// refresh part-way through, [`live_catalog`] deliberately keeps what it has and
+/// stops — so a background refresh can come back with forty repositories where
+/// the stored library holds four hundred. Writing that directly would replace a
+/// complete library with a truncated one and call it an update, which is the
+/// one thing a refresh must never do.
+///
+/// Merging makes a partial sweep additive instead of destructive: every
+/// repository the sweep saw is taken at its new value, and every repository it
+/// did not reach keeps the value it already had. A full sweep is unaffected —
+/// it covers everything in the cache, so the union is just the sweep.
+///
+/// The cost of this is that a repository withdrawn from the Hub lingers until a
+/// cache is cleared outright, which [`clear`] does when the token changes.
+/// Showing one model that has since disappeared is a far smaller harm than
+/// losing nine tenths of the library to a rate limit.
+///
+/// Ordering follows the sweep, because that is the Hub's own popularity
+/// ordering and the browser presents results in the order they arrive. Entries
+/// held over from the previous cache follow, keeping their relative order.
+///
+/// Takes the previous repositories directly rather than reading the disk, so
+/// the merge can be tested without a filesystem.
+pub fn merge(previous: &[GgufRepo], sweep: &[GgufRepo]) -> Vec<GgufRepo> {
+    use std::collections::HashSet;
+
+    let swept: HashSet<&str> = sweep.iter().map(|r| r.repo_id.as_str()).collect();
+
+    let mut merged = Vec::with_capacity(previous.len() + sweep.len());
+    merged.extend(sweep.iter().cloned());
+    // Only those the sweep never reached; anything it did see is already
+    // present at its newer value.
+    merged.extend(
+        previous
+            .iter()
+            .filter(|r| !swept.contains(r.repo_id.as_str()))
+            .cloned(),
+    );
+
+    // From the tail, so a sweep's own results are never the ones discarded.
+    merged.truncate(MAX_MERGED_REPOS);
+    merged
 }
 
 /// Writes a completed sweep.
@@ -382,6 +445,79 @@ mod tests {
 
         assert!(store(&dir, true, &fp, &[]).is_err());
         assert_eq!(load(&dir).expect("the good cache survives").repos.len(), 1);
+    }
+
+    /// The defect this exists for: HuggingFace rate-limits a background refresh
+    /// part-way through, the sweep keeps what it reached, and writing that
+    /// directly replaced a complete library with a fraction of one.
+    #[test]
+    fn a_partial_sweep_does_not_drop_what_it_never_reached() {
+        let previous = vec![repo("a/b"), repo("c/d"), repo("e/f")];
+        let partial = vec![repo("a/b")];
+
+        let merged = merge(&previous, &partial);
+
+        assert_eq!(merged.len(), 3, "the two the sweep never reached survive");
+        let ids: Vec<&str> = merged.iter().map(|r| r.repo_id.as_str()).collect();
+        assert_eq!(ids, vec!["a/b", "c/d", "e/f"]);
+    }
+
+    /// A repository the sweep *did* reach must take its new value, otherwise a
+    /// refresh could never update anything.
+    #[test]
+    fn a_swept_repository_wins_over_the_stored_copy() {
+        let mut stale = repo("a/b");
+        stale.downloads = 1;
+        let mut fresh = repo("a/b");
+        fresh.downloads = 9_999;
+
+        let merged = merge(&[stale], &[fresh]);
+
+        assert_eq!(merged.len(), 1, "the same repo must not appear twice");
+        assert_eq!(merged[0].downloads, 9_999, "the sweep is the newer truth");
+    }
+
+    /// A sweep that covers everything is a plain replacement, and must not be
+    /// made to grow by merging.
+    #[test]
+    fn a_full_sweep_merges_to_exactly_itself() {
+        let previous = vec![repo("a/b"), repo("c/d")];
+        let full = vec![repo("a/b"), repo("c/d")];
+
+        assert_eq!(merge(&previous, &full).len(), 2);
+    }
+
+    #[test]
+    fn a_sweep_that_finds_something_new_keeps_it_first() {
+        let merged = merge(&[repo("old/one")], &[repo("new/one")]);
+
+        let ids: Vec<&str> = merged.iter().map(|r| r.repo_id.as_str()).collect();
+        assert_eq!(ids, vec!["new/one", "old/one"], "sweep order leads");
+    }
+
+    /// Carrying entries over must not let the library grow without limit: the
+    /// Hub reorders over weeks, so successive sweeps overlap without matching,
+    /// and an uncapped union creeps upwards on every refresh.
+    #[test]
+    fn a_merged_library_is_capped_and_drops_the_carried_over_end_first() {
+        let previous: Vec<GgufRepo> =
+            (0..MAX_MERGED_REPOS).map(|i| repo(&format!("old/{i}"))).collect();
+        let sweep = vec![repo("new/one"), repo("new/two")];
+
+        let merged = merge(&previous, &sweep);
+
+        assert_eq!(merged.len(), MAX_MERGED_REPOS, "the cap holds");
+        assert_eq!(merged[0].repo_id, "new/one", "the sweep survives at the front");
+        assert_eq!(merged[1].repo_id, "new/two");
+        assert!(
+            !merged.iter().any(|r| r.repo_id == format!("old/{}", MAX_MERGED_REPOS - 1)),
+            "the oldest carried-over entries are what gets trimmed"
+        );
+    }
+
+    #[test]
+    fn merging_against_an_empty_cache_is_just_the_sweep() {
+        assert_eq!(merge(&[], &[repo("a/b")]).len(), 1);
     }
 
     #[test]

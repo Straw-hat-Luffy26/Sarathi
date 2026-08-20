@@ -320,6 +320,57 @@ pub struct QuantizationOption {
     pub offload_blocked_reason: Option<String>,
 }
 
+/// How a build would actually run on this machine.
+///
+/// There is no third variant on purpose. "It could be downloaded but not run"
+/// is not a way of running, and giving it a name here is what let it reach the
+/// browser as an offer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Placement {
+    /// Weights sit in VRAM.
+    Vram,
+    /// A verified MoE model whose routed experts live in system RAM.
+    Offload,
+}
+
+/// Picks the build this machine should actually be offered, or `None` when the
+/// model cannot run here at all.
+///
+/// This is the one decision that decides both what Discover shows and what its
+/// download button does, and it makes no hardware judgement of its own: `fits`
+/// comes from the VRAM budget calculated in
+/// [`commands::catalog`](crate::commands::catalog), and `offload` comes from
+/// [`moe_fit::plan_for`]. Both are already the planner's answers. All this does
+/// is rank them.
+///
+/// The order is what each option is worth to the user:
+///
+/// 1. On the card, at a quantization that is not degraded.
+/// 2. On the card at all — a 2-bit build that runs beats nothing.
+/// 3. Offloaded and not degraded; correct, slower across the PCIe bus.
+/// 4. Offloaded at all.
+///
+/// Within a tier the largest wins: quantization trades quality for size, so the
+/// biggest build that runs is the most capable one that runs.
+pub fn best_placement(quants: &[QuantizationOption]) -> Option<(&QuantizationOption, Placement)> {
+    fn largest<'a>(
+        quants: &'a [QuantizationOption],
+        pick: impl Fn(&QuantizationOption) -> bool,
+    ) -> Option<&'a QuantizationOption> {
+        quants.iter().filter(|q| pick(q)).max_by_key(|q| q.size_bytes)
+    }
+
+    largest(quants, |q| q.fits && !q.low_quality)
+        .or_else(|| largest(quants, |q| q.fits))
+        .map(|q| (q, Placement::Vram))
+        .or_else(|| {
+            largest(quants, |q| q.offload.is_some() && !q.low_quality)
+                .or_else(|| largest(quants, |q| q.offload.is_some()))
+                .map(|q| (q, Placement::Offload))
+        })
+}
+
 /// Presentation-ready model card.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -356,6 +407,20 @@ pub struct ModelCard {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
     pub quantizations: Vec<QuantizationOption>,
+    /// How this model runs here, and `None` when nothing about it does.
+    ///
+    /// Decided by [`best_placement`]. Discover drops cards where this is
+    /// `None`, so in a normal listing it is always set — it is optional because
+    /// the type also describes a card built before hardware could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runs_here: Option<Placement>,
+    /// The quantization Discover offers, chosen by [`best_placement`].
+    ///
+    /// Carried on the card so the browser presents the same build the planner
+    /// picked, rather than re-deriving the choice from `quantizations` and
+    /// drifting from it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub best_quantization: Option<String>,
     /// Whether this is one Sarathi vouches for. See
     /// [`crate::model_providers::huggingface::curation`] for what that means.
     pub recommended: bool,
@@ -526,7 +591,15 @@ pub fn build_card(
     // Offload is deliberately not counted here. Sarathi vouching for a model
     // implies it is a comfortable default, and running across the PCIe bus is a
     // capable answer rather than a comfortable one.
-    let fits_here = budget_bytes == 0 || quantizations.iter().any(|q| q.fits);
+    //
+    // Nor is a 1- or 2-bit build. Those are listed — they do run, and a
+    // degraded answer beats none — but a recommendation is a claim that the
+    // model is good here, and a 27B squeezed to one bit per weight can produce
+    // nonsense. A model whose only fitting build is degraded is loadable rather
+    // than practical, so it is browsable without being vouched for.
+    let fits_here = budget_bytes == 0 || quantizations.iter().any(|q| q.fits && !q.low_quality);
+
+    let placement = best_placement(&quantizations);
 
     ModelCard {
         repo_id: repo.repo_id.clone(),
@@ -547,6 +620,8 @@ pub fn build_card(
         base_model: repo.base_model.clone(),
         total_parameters: (params > 0).then_some(params),
         context_length: (context > 0).then_some(context),
+        runs_here: placement.map(|(_, p)| p),
+        best_quantization: placement.map(|(q, _)| q.label.clone()),
         quantizations,
         recommended: crate::model_providers::huggingface::curation::is_recommended(repo, fits_here),
         emits_reasoning: crate::model_providers::huggingface::curation::emits_reasoning_tokens(repo),
@@ -838,6 +913,149 @@ mod tests {
 
         assert_eq!(fitting, vec!["Q2_K"], "only the 3 GB option fits a 4 GB budget");
         assert!(card.quantizations.iter().any(|q| q.quality_note.contains("recommended")));
+    }
+
+    /// A recommendation is a claim the model is good on this machine. A 27B
+    /// model that only fits at one bit per weight runs, and is listed, but
+    /// vouching for it would be vouching for output that can be nonsense.
+    #[test]
+    fn a_model_that_only_fits_when_degraded_is_listed_but_not_recommended() {
+        let mut repo = repo_for_card();
+        repo.repo_id = "bartowski/Big-27B-GGUF".into();
+        repo.downloads = 500_000;
+        repo.quantizations = vec![
+            Quantization {
+                label: "Q1_0".into(),
+                filename: "b-q1.gguf".into(),
+                size_bytes: 3 * GB,
+                is_sharded: false,
+            },
+            Quantization {
+                label: "Q4_K_M".into(),
+                filename: "b-q4.gguf".into(),
+                size_bytes: 16 * GB,
+                is_sharded: false,
+            },
+        ];
+
+        let card = build_card(&repo, 8 * GB, no_host(), chrono::Utc::now());
+
+        assert_eq!(card.runs_here, Some(Placement::Vram), "the 1-bit build does run");
+        assert_eq!(card.best_quantization.as_deref(), Some("Q1_0"));
+        assert!(!card.recommended, "but it is not something to vouch for");
+    }
+
+    // ─── Placement: what Discover offers, and what it refuses to list ─────
+
+    /// A quantization option built directly, so placement ranking can be tested
+    /// without routing through hardware detection.
+    fn opt(label: &str, size: u64, fits: bool, low_quality: bool) -> QuantizationOption {
+        QuantizationOption {
+            label: label.into(),
+            size_bytes: size,
+            quality_note: String::new(),
+            fits,
+            low_quality,
+            offload: None,
+            offload_blocked_reason: None,
+        }
+    }
+
+    #[test]
+    fn the_largest_build_that_fits_is_the_one_offered() {
+        let quants = vec![
+            opt("Q3_K_M", 3 * GB, true, false),
+            opt("Q4_K_M", 4 * GB, true, false),
+            opt("Q8_0", 9 * GB, false, false),
+        ];
+
+        let (best, placement) = best_placement(&quants).expect("something fits");
+        assert_eq!(best.label, "Q4_K_M", "quantization trades quality for size");
+        assert_eq!(placement, Placement::Vram);
+    }
+
+    /// A 2-bit build can read as broken. When a usable build also fits, it is
+    /// the one to offer even though it is smaller.
+    #[test]
+    fn a_degraded_build_is_not_preferred_over_a_usable_one() {
+        let quants = vec![
+            opt("IQ2_XXS", 5 * GB, true, true),
+            opt("Q4_K_M", 4 * GB, true, false),
+        ];
+
+        let (best, _) = best_placement(&quants).expect("something fits");
+        assert_eq!(best.label, "Q4_K_M");
+    }
+
+    /// ...but a degraded build that runs still beats not listing the model.
+    #[test]
+    fn a_degraded_build_is_offered_when_it_is_all_that_fits() {
+        let quants = vec![
+            opt("IQ2_XXS", 3 * GB, true, true),
+            opt("Q4_K_M", 9 * GB, false, false),
+        ];
+
+        let (best, placement) = best_placement(&quants).expect("the 2-bit build fits");
+        assert_eq!(best.label, "IQ2_XXS");
+        assert_eq!(placement, Placement::Vram);
+    }
+
+    /// The whole point: a model with nothing that runs gets no placement, and
+    /// so never reaches Discover.
+    #[test]
+    fn a_model_that_cannot_run_here_has_no_placement() {
+        let quants = vec![
+            opt("Q4_K_M", 200 * GB, false, false),
+            opt("Q8_0", 400 * GB, false, false),
+        ];
+
+        assert!(best_placement(&quants).is_none());
+    }
+
+    #[test]
+    fn a_model_with_no_published_builds_has_no_placement() {
+        assert!(best_placement(&[]).is_none());
+    }
+
+    /// A 295B model on an 8 GB card: no quantization fits, so the card carries
+    /// no placement and Discover drops it rather than offering a download.
+    #[test]
+    fn an_enormous_model_gets_no_placement_on_a_small_card() {
+        let mut huge = repo_for_card();
+        huge.repo_id = "moonshotai/Kimi-K2-Instruct-GGUF".into();
+        huge.quantizations = vec![Quantization {
+            label: "Q4_K_M".into(),
+            filename: "kimi.gguf".into(),
+            size_bytes: 160 * GB,
+            is_sharded: true,
+        }];
+
+        let card = build_card(&huge, 7 * GB, no_host(), chrono::Utc::now());
+
+        assert!(card.runs_here.is_none(), "nothing about it runs on an 8 GB card");
+        assert!(card.best_quantization.is_none(), "so there is nothing to offer");
+    }
+
+    /// Hardware that could not be read must not read as "nothing runs" — that
+    /// would empty Discover for a detection failure rather than a real one.
+    /// `page_from` handles this by not filtering at all; the card simply
+    /// reports no placement.
+    #[test]
+    fn an_unknown_budget_yields_no_placement_rather_than_a_guess() {
+        let card = build_card(&repo_for_card(), 0, no_host(), chrono::Utc::now());
+        assert!(card.runs_here.is_none());
+    }
+
+    #[test]
+    fn a_card_that_runs_names_the_build_it_offers() {
+        let card = build_card(&repo_for_card(), 4 * GB, no_host(), chrono::Utc::now());
+
+        assert_eq!(card.runs_here, Some(Placement::Vram));
+        assert_eq!(
+            card.best_quantization.as_deref(),
+            Some("Q2_K"),
+            "the only build inside a 4 GB budget"
+        );
     }
 
     #[test]

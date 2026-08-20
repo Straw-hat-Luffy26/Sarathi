@@ -138,6 +138,12 @@ pub struct CatalogPage {
     /// still usable; the message explains why there are fewer than expected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
+    /// How many swept models were dropped for having no placement here.
+    ///
+    /// Reported so the browser can say that a listing is filtered rather than
+    /// implying the Hub holds only this much. Zero when hardware could not be
+    /// read, since nothing is filtered in that case.
+    pub hidden_incompatible: usize,
 }
 
 /// Which of the three sources answered this request.
@@ -314,6 +320,30 @@ fn tally_categories(cards: &[ModelCard]) -> Vec<CategoryCount> {
         .collect()
 }
 
+/// Drops every model this machine has no way of running.
+///
+/// Discover answers one question — what can this computer run? — and a model
+/// with no placement is not a weaker option, it is not an option. Listing them
+/// made the user do the sizing arithmetic Sarathi exists to do for them, and
+/// the browser then had to invent something to offer, which is how a 295B model
+/// ended up behind a "Download anyway" button.
+///
+/// No hardware judgement is made here. `runs_here` is
+/// [`card::best_placement`](crate::model_providers::huggingface::card::best_placement),
+/// which ranks the planner's own `fits` and MoE `offload` answers; this only
+/// acts on the verdict.
+///
+/// `hardware_known` is the one escape. When memory could not be read at all,
+/// `fits` is false everywhere for want of a budget rather than for want of
+/// room, and filtering on it would empty Discover for a detection failure.
+/// Showing everything unfiltered is the honest response to not knowing.
+fn runnable_only(cards: Vec<ModelCard>, hardware_known: bool) -> Vec<ModelCard> {
+    if !hardware_known {
+        return cards;
+    }
+    cards.into_iter().filter(|c| c.runs_here.is_some()).collect()
+}
+
 /// Turns repositories into a page of cards, sized against the current machine.
 ///
 /// Always called on the way out, never cached: this is where hardware enters,
@@ -335,11 +365,22 @@ fn page_from(
     // models offered a Download button for something that would never start.
     // They stay discoverable in the place they make sense — the adapter list on
     // the base model they were trained against.
-    let cards: Vec<ModelCard> = repos
+    let built: Vec<ModelCard> = repos
         .iter()
         .filter(|r| !r.is_lora_adapter)
         .map(|r| build_card(r, budget, host, now))
         .collect();
+
+    let hardware_known = budget > 0 || host.usable_ram_bytes > 0;
+    let total_built = built.len();
+    let cards = runnable_only(built, hardware_known);
+    let hidden_incompatible = total_built - cards.len();
+
+    if hidden_incompatible > 0 {
+        log::debug!(
+            "[CATALOG] Hid {hidden_incompatible} of {total_built} models with no placement on this machine"
+        );
+    }
 
     CatalogPage {
         categories: tally_categories(&cards),
@@ -350,6 +391,7 @@ fn page_from(
         age_seconds,
         refreshing,
         notice,
+        hidden_incompatible,
     }
 }
 
@@ -387,8 +429,51 @@ async fn sweep(app: &AppHandle, token: Option<&str>, background: bool) -> Result
         ProgressPayload::simple("caching", "Saving the library for next time…", background),
     );
 
+    let dir = data_dir(app);
+
+    // Folded into what is already stored rather than replacing it.
+    //
+    // A sweep is not always the whole library: `fetch_repos_reporting` keeps
+    // partial results when the Hub rate-limits it part-way through, so a
+    // background refresh can return forty repositories where the stored library
+    // holds four hundred. Replacing on every sweep meant a single rate limit
+    // turned a complete library into a truncated one and reported it as an
+    // update — exactly the data loss the cache exists to prevent.
+    //
+    // The merged set is what gets stored *and* what gets returned, so the page
+    // drawn after a partial refresh shows the whole library rather than the
+    // fraction this attempt happened to reach.
+    let repos = match dir.as_deref().and_then(catalog_cache::load) {
+        // Two things disqualify a stored library from being carried over.
+        //
+        // Different credentials describe a different library — an anonymous
+        // sweep reaches one search page against twenty — so the two are not
+        // sets that may be unioned.
+        //
+        // And a library past `USABLE_FOR` is one the app already refuses to
+        // *show*; quietly folding it back in through a refresh would reintroduce
+        // exactly the entries that rule exists to retire.
+        Some(previous)
+            if previous.authenticated == token.is_some()
+                && previous
+                    .age_at(chrono::Utc::now())
+                    .is_some_and(|age| age < catalog_cache::USABLE_FOR) =>
+        {
+            let merged = catalog_cache::merge(&previous.repos, &repos);
+            if merged.len() > repos.len() {
+                log::info!(
+                    "[CATALOG] Sweep returned {} repositories; kept {} from the stored library that it did not reach",
+                    repos.len(),
+                    merged.len() - repos.len()
+                );
+            }
+            merged
+        }
+        _ => repos,
+    };
+
     store_repos(token.is_some(), &repos);
-    if let Some(dir) = data_dir(app) {
+    if let Some(dir) = dir {
         let fingerprint = {
             let host = host_capacity();
             catalog_cache::fingerprint(host.vram_total_bytes, host.usable_ram_bytes)
@@ -619,6 +704,96 @@ pub fn list_model_categories() -> Vec<CategoryCount> {
 mod tests {
     use super::*;
     use crate::system_analyzer::traits::GpuInfo;
+    use crate::model_providers::huggingface::card::Placement;
+    use crate::model_providers::huggingface::discovery::{GgufMeta, Quantization};
+
+    /// A repository whose largest build is `size_bytes`, so a budget decides
+    /// whether it has any placement at all.
+    fn repo_sized(id: &str, size_bytes: u64) -> GgufRepo {
+        GgufRepo {
+            repo_id: id.into(),
+            author: id.split('/').next().unwrap_or("").into(),
+            downloads: 50_000,
+            likes: 100,
+            last_modified: "2026-07-01T00:00:00Z".into(),
+            quantizations: vec![Quantization {
+                label: "Q4_K_M".into(),
+                filename: "m.gguf".into(),
+                size_bytes,
+                is_sharded: false,
+            }],
+            gguf: Some(GgufMeta {
+                total_parameters: 7_600_000_000,
+                architecture: "qwen2".into(),
+                context_length: 32768,
+                chat_template: None,
+                bos_token: None,
+                eos_token: None,
+            }),
+            base_model: None,
+            is_finetune: false,
+            is_lora_adapter: false,
+            tags: vec![],
+        }
+    }
+
+    const GB: u64 = 1024 * 1024 * 1024;
+
+    fn cards_for(budget: u64, sizes: &[(&str, u64)]) -> Vec<ModelCard> {
+        let now = chrono::Utc::now();
+        sizes
+            .iter()
+            .map(|(id, size)| {
+                build_card(
+                    &repo_sized(id, *size),
+                    budget,
+                    crate::model_providers::huggingface::moe_fit::HostCapacity::default(),
+                    now,
+                )
+            })
+            .collect()
+    }
+
+    /// The behaviour the whole change is for: a model with no placement is not
+    /// listed, however large or famous it is.
+    #[test]
+    fn a_model_with_no_placement_is_not_listed() {
+        let cards = cards_for(
+            8 * GB,
+            &[("bartowski/small-GGUF", 4 * GB), ("moonshotai/Kimi-K2-GGUF", 160 * GB)],
+        );
+
+        let kept = runnable_only(cards, true);
+
+        let ids: Vec<&str> = kept.iter().map(|c| c.repo_id.as_str()).collect();
+        assert_eq!(ids, vec!["bartowski/small-GGUF"], "the 160 GB model is gone entirely");
+        assert_eq!(kept[0].runs_here, Some(Placement::Vram));
+    }
+
+    /// Hiding everything because hardware could not be read would turn a
+    /// detection failure into an empty app.
+    #[test]
+    fn nothing_is_filtered_when_the_hardware_is_unknown() {
+        let cards = cards_for(0, &[("a/b", 4 * GB), ("c/d", 160 * GB)]);
+        assert_eq!(runnable_only(cards, false).len(), 2);
+    }
+
+    /// A machine that genuinely cannot run anything shows nothing, rather than
+    /// a page of downloads that would all fail.
+    #[test]
+    fn a_machine_that_can_run_nothing_gets_an_empty_listing() {
+        let cards = cards_for(1 * GB, &[("a/b", 40 * GB), ("c/d", 160 * GB)]);
+        assert!(runnable_only(cards, true).is_empty());
+    }
+
+    #[test]
+    fn every_listed_card_names_the_build_it_offers() {
+        let kept = runnable_only(cards_for(8 * GB, &[("a/b", 4 * GB)]), true);
+
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].best_quantization.as_deref(), Some("Q4_K_M"));
+    }
+
 
     fn gpu(model: &str, dedicated: bool, total: u64, cuda: bool) -> GpuInfo {
         GpuInfo {

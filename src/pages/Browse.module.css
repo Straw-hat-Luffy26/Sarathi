@@ -214,7 +214,20 @@
   gap: var(--space-3);
   padding: var(--space-6);
   color: var(--text-secondary);
-  min-height: 100%;
+  /* No height of its own: `.resultsCentered` below gives it the whole grid to
+   * sit in, and anything set here would only fight that. */
+}
+
+/* Applied to `.results` while the library is loading.
+ *
+ * `.results` normally sets `align-content: start` so cards pack from the top.
+ * That also sizes each row to its content, which is why the loading panel's
+ * `min-height: 100%` resolved against nothing and the panel sat at the top of
+ * an empty page — the percentage had no definite row height to measure. The
+ * container is the only place that can be fixed from: with a single centred
+ * row, the one child fills the scroll area and centres inside it. */
+.resultsCentered {
+  align-content: center;
 }
 
 /* Loading the library --------------------------------------------------- */
@@ -223,17 +236,91 @@
  * as work rather than as a hang: a phase that changes, counts that move, and a
  * bar that fills only once there is a real denominator to fill it against. */
 
-.loadingMessage {
-  margin: 0;
+/* One box holding every signal, so they read as a single status rather than as
+ * loose text stacked under a spinner. Its width is fixed to the bar's, which
+ * stops the panel resizing as the message and counts change length. */
+.loadingPanel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: min(380px, 100%);
+}
+
+.loadingHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.loadingPhase {
   font-size: var(--text-sm);
+  font-weight: 600;
   color: var(--text-primary);
+}
+
+/* The elapsed clock. Tabular figures so the digits do not shuffle sideways
+ * once a second, which is its own kind of distraction. */
+.loadingClock {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
 }
 
+.loadingStats {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+.loadingCount {
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* The three jobs a sweep does, so the user can see which one is running and
+ * that there is an end to it. */
+.phaseList {
+  display: flex;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-size: var(--text-xs);
+}
+
+.phaseList li::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: var(--space-1);
+  border-radius: 999px;
+  background: currentColor;
+  vertical-align: middle;
+}
+
+.phaseDone {
+  color: var(--accent-primary);
+}
+
+.phaseActive {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.phasePending {
+  color: var(--text-tertiary);
+  opacity: 0.6;
+}
+
+/* Left-aligned, unlike before: it now sits inside the status panel with the
+ * phase, bar and counts, and centred text under left-aligned rows reads as a
+ * misalignment rather than as emphasis. */
 .loadingNote {
   margin: 0;
-  max-width: 46ch;
-  text-align: center;
   font-size: var(--text-xs);
   line-height: var(--leading-snug);
   color: var(--text-tertiary);
@@ -289,6 +376,12 @@
 
 /* Where the results came from. Quieter than .notice: a saved library is the
  * normal, good case, not a warning. */
+/* The "N hidden" note beside the subtitle. Quieter than the subtitle itself:
+ * it explains the listing rather than describing it. */
+.filterNote {
+  color: var(--text-tertiary);
+}
+
 .cacheBar {
   display: flex;
   align-items: center;
@@ -303,6 +396,58 @@
 
 .cacheBar span {
   flex: 1;
+}
+
+/* The background refresh's progress, inside the cache row.
+ *
+ * Deliberately small and inline. The library is already drawn and readable
+ * behind it, so this reports an update the user did not ask for; taking the
+ * page over for that would undo the whole point of serving the saved copy
+ * first. Narrow and fixed-width so the row's text does not reflow as the bar
+ * appears and disappears. */
+.miniTrack {
+  flex: 0 0 auto;
+  width: 92px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.miniFill {
+  height: 100%;
+  border-radius: 999px;
+  background: var(--accent-primary);
+  /* Same easing as the full bar: the sweep reports in batches, and an
+   * unanimated bar steps visibly, which reads as stalling between batches. */
+  transition: width 400ms ease-out;
+}
+
+/* Shown while the sweep is still searching and has no denominator to fill
+ * against. It has to move - the only claim it makes is "still working". */
+.miniIndeterminate {
+  height: 100%;
+  width: 40%;
+  border-radius: 999px;
+  background: var(--accent-primary);
+  animation: miniSweep 1.4s ease-in-out infinite;
+}
+
+@keyframes miniSweep {
+  0% { transform: translateX(-100%); }
+  100% { transform: translateX(250%); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .miniIndeterminate {
+    animation: none;
+    width: 100%;
+    opacity: 0.4;
+  }
+
+  .miniFill {
+    transition: none;
+  }
 }
 
 /* Cards ------------------------------------------------------------------ */

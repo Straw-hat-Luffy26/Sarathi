@@ -248,10 +248,23 @@ const QUANT_PREFIXES: &[&str] = &["IQ", "MXFP", "TQ", "BF", "Q", "F"];
 /// Extracts the quantization label from a GGUF filename.
 ///
 /// `Qwen2.5-Coder-7B-Instruct-Q4_K_M.gguf` -> `Q4_K_M`
+/// `Qwen3.8-27B.Q4_K_M.gguf`              -> `Q4_K_M`
+///
+/// Both separators are accepted because both conventions are in wide use. The
+/// hyphen form is what most publishers emit; the dot form is mradermacher's,
+/// and mradermacher is one of the largest GGUF publishers on the Hub.
+///
+/// Splitting on `-` alone made every dot-named quantization unparseable, which
+/// did not merely hide them — it inverted the listing. In
+/// `mradermacher/Qwen3.8-27B-GGUF` the eleven real builds are all dot-named
+/// (`Qwen3.8-27B.Q8_0.gguf`, 29.0 GB) and so returned `None`, while the two
+/// projectors are hyphen-named (`Qwen3.8-27B.mmproj-Q8_0.gguf`, 0.6 GB) and so
+/// parsed cleanly. The repository's advertised sizes became 600 MB and 885 MB:
+/// its side-cars, and nothing else.
 pub fn quantization_label(filename: &str) -> Option<String> {
     let stem = filename.strip_suffix(".gguf")?;
     let (stem, _) = strip_shard_suffix(stem);
-    let label = stem.rsplit('-').next()?;
+    let label = stem.rsplit(['-', '.']).next()?;
 
     let upper = label.to_uppercase();
 
@@ -293,8 +306,15 @@ fn is_companion_file(filename: &str) -> bool {
     }
 
     let base = filename.to_ascii_lowercase();
+    // `.` counts as a separator alongside `-` and `_`. Without it
+    // `Qwen3.8-27B.mmproj-Q8_0.gguf` is not recognised as a projector at all —
+    // the token is there, but preceded by a dot — and the file goes on to parse
+    // as a perfectly ordinary `Q8_0` build of a 27B model.
     let has_token = |t: &str| {
-        base.starts_with(t) || base.contains(&format!("-{t}")) || base.contains(&format!("_{t}"))
+        base.starts_with(t)
+            || base.contains(&format!("-{t}"))
+            || base.contains(&format!("_{t}"))
+            || base.contains(&format!(".{t}"))
     };
 
     // Each of these is a documented llama.cpp side-car rather than a model:
@@ -363,7 +383,26 @@ fn is_plausible_build(size_bytes: u64, total_parameters: u64) -> bool {
 pub fn parse_quantizations(siblings: &[RawSibling], total_parameters: u64) -> Vec<Quantization> {
     use std::collections::HashMap;
 
-    let mut totals: HashMap<String, (String, u64, bool)> = HashMap::new();
+    /// One label's candidates, kept apart until a size is chosen.
+    ///
+    /// Split and merged copies of the same build must not be added together.
+    /// `Qwen/Qwen2.5-Coder-7B-Instruct-GGUF` publishes both
+    /// `…-q4_0.gguf` and `…-q4_0-00001-of-00002.gguf` + `…-00002-of-00002`,
+    /// which are the same 4.43 GB of weights offered two ways. Summing every
+    /// file with the label reported 8.86 GB — 9.31 bits per weight for a 7.6B
+    /// model, when no quantization exceeds 16 — and the same doubling reached
+    /// Q8_0 (17.01 bpw) and FP16 (32.01 bpw) in that one repository.
+    #[derive(Default)]
+    struct Candidates {
+        /// Sum across `-NNNNN-of-NNNNN` parts: one model split up.
+        shard_total: u64,
+        /// Largest single-file copy: the same model, merged.
+        single_max: u64,
+        shard_name: Option<String>,
+        single_name: Option<String>,
+    }
+
+    let mut totals: HashMap<String, Candidates> = HashMap::new();
 
     for s in siblings {
         if !s.rfilename.ends_with(".gguf") {
@@ -379,24 +418,40 @@ pub fn parse_quantizations(siblings: &[RawSibling], total_parameters: u64) -> Ve
         let stem = s.rfilename.strip_suffix(".gguf").unwrap_or(&s.rfilename);
         let (_, sharded) = strip_shard_suffix(stem);
 
-        let entry = totals
-            .entry(label.clone())
-            .or_insert_with(|| (s.rfilename.clone(), 0, sharded));
-        entry.1 += size;
-        entry.2 |= sharded;
-        // Keep the first shard as the representative filename.
-        if sharded && s.rfilename.contains("-00001-of-") {
-            entry.0 = s.rfilename.clone();
+        let entry = totals.entry(label).or_default();
+        if sharded {
+            entry.shard_total += size;
+            // Keep the first shard as the representative filename.
+            if entry.shard_name.is_none() || s.rfilename.contains("-00001-of-") {
+                entry.shard_name = Some(s.rfilename.clone());
+            }
+        } else if size >= entry.single_max || entry.single_name.is_none() {
+            entry.single_max = size;
+            entry.single_name = Some(s.rfilename.clone());
         }
     }
 
     let mut out: Vec<Quantization> = totals
         .into_iter()
-        .map(|(label, (filename, size_bytes, is_sharded))| Quantization {
-            label,
-            filename,
-            size_bytes,
-            is_sharded,
+        .filter_map(|(label, c)| {
+            // The two layouts describe one model, so the answer is whichever is
+            // present — not their sum. When both are, they should agree; taking
+            // the larger keeps the estimate on the safe side of a partial
+            // upload rather than understating what has to fit in memory.
+            let use_shards = c.shard_total >= c.single_max;
+            let size_bytes = c.shard_total.max(c.single_max);
+            let filename = if use_shards {
+                c.shard_name.or(c.single_name)?
+            } else {
+                c.single_name.or(c.shard_name)?
+            };
+
+            Some(Quantization {
+                label,
+                filename,
+                size_bytes,
+                is_sharded: use_shards && c.shard_total > 0,
+            })
         })
         // Applied to the summed total, never to an individual file: one shard of
         // a split model is legitimately a fraction of the model, and checking
@@ -590,6 +645,11 @@ mod tests {
         RawSibling { rfilename: name.to_string(), size: Some(size) }
     }
 
+    /// A sibling as the search endpoint returns it: filename only, no size.
+    fn sib_unsized(name: &str) -> RawSibling {
+        RawSibling { rfilename: name.to_string(), size: None }
+    }
+
     #[test]
     fn a_vision_projector_is_not_offered_as_a_quantization() {
         // The real file list of lmstudio-community/gemma-4-12B-it-QAT-GGUF.
@@ -752,6 +812,99 @@ mod tests {
         assert_eq!(quants.len(), 1, "got {quants:?}");
         assert_eq!(quants[0].label, "MXFP4", "the model itself must be offered");
         assert_eq!(quants[0].size_bytes, 12_800_000_000);
+    }
+
+    /// The real file list of `mradermacher/Qwen3.8-27B-GGUF`.
+    ///
+    /// Eleven dot-named builds from 10.9 GB to 29.0 GB, and two hyphen-named
+    /// projectors. Splitting only on `-` dropped all eleven and kept both
+    /// projectors, so the Discover panel offered a 27.3B model in exactly two
+    /// sizes — 600 MB and 885 MB — neither of which is the model.
+    #[test]
+    fn dot_separated_quantizations_are_the_sizes_and_the_projectors_are_not() {
+        let files = vec![
+            sib("Qwen3.8-27B.IQ4_XS.gguf", 15_420_450_528),
+            sib("Qwen3.8-27B.Q2_K.gguf", 10_864_592_608),
+            sib("Qwen3.8-27B.Q3_K_L.gguf", 14_559_799_008),
+            sib("Qwen3.8-27B.Q3_K_M.gguf", 13_500_737_248),
+            sib("Qwen3.8-27B.Q3_K_S.gguf", 12_256_536_288),
+            sib("Qwen3.8-27B.Q4_K_M.gguf", 16_810_714_848),
+            sib("Qwen3.8-27B.Q4_K_S.gguf", 15_825_299_168),
+            sib("Qwen3.8-27B.Q5_K_M.gguf", 19_535_701_728),
+            sib("Qwen3.8-27B.Q5_K_S.gguf", 18_971_682_528),
+            sib("Qwen3.8-27B.Q6_K.gguf", 22_431_000_288),
+            sib("Qwen3.8-27B.Q8_0.gguf", 29_047_084_768),
+            sib("Qwen3.8-27B.mmproj-Q8_0.gguf", 629_247_072),
+            sib("Qwen3.8-27B.mmproj-f16.gguf", 927_607_008),
+        ];
+
+        let quants = parse_quantizations(&files, 27_320_697_856);
+
+        assert_eq!(quants.len(), 11, "every real build is a size: {quants:?}");
+        assert!(
+            !quants.iter().any(|q| q.filename.contains("mmproj")),
+            "no projector may be offered as a size: {quants:?}"
+        );
+
+        let q8 = quants.iter().find(|q| q.label == "Q8_0").expect("Q8_0 exists");
+        assert_eq!(
+            q8.size_bytes, 29_047_084_768,
+            "Q8_0 is the 29.0 GB model, not the 0.6 GB projector beside it"
+        );
+    }
+
+    /// The search endpoint returns neither `gguf.total` nor sibling sizes, so
+    /// the plausibility check cannot fire and the filename rules are the only
+    /// defence. This is the exact shape the Discover panel parses.
+    #[test]
+    fn projectors_are_refused_even_with_no_sizes_and_no_parameter_count() {
+        let files = vec![
+            sib_unsized("Qwen3.8-27B.Q4_K_M.gguf"),
+            sib_unsized("Qwen3.8-27B.mmproj-Q8_0.gguf"),
+            sib_unsized("Qwen3.8-27B.mmproj-f16.gguf"),
+        ];
+
+        let quants = parse_quantizations(&files, 0);
+
+        assert_eq!(quants.len(), 1, "only the model survives: {quants:?}");
+        assert_eq!(quants[0].label, "Q4_K_M");
+    }
+
+    /// The real layout of `Qwen/Qwen2.5-Coder-7B-Instruct-GGUF`: a merged copy
+    /// beside a split one, both of the same build. Summing them reported 8.86 GB
+    /// for a 4.43 GB model — 9.31 bits per weight against 7.6B parameters.
+    #[test]
+    fn a_merged_copy_and_its_shards_are_one_model_not_two() {
+        let files = vec![
+            sib("qwen2.5-coder-7b-instruct-q4_0.gguf", 4_431_390_720),
+            sib("qwen2.5-coder-7b-instruct-q4_0-00001-of-00002.gguf", 3_000_000_000),
+            sib("qwen2.5-coder-7b-instruct-q4_0-00002-of-00002.gguf", 1_431_390_720),
+        ];
+
+        let quants = parse_quantizations(&files, 7_600_000_000);
+
+        assert_eq!(quants.len(), 1, "one build, one size: {quants:?}");
+        assert_eq!(
+            quants[0].size_bytes, 4_431_390_720,
+            "the merged file and the shards are the same weights, not 8.86 GB of them"
+        );
+    }
+
+    /// The shard-only case must keep summing, which is the behaviour the
+    /// merged/split split-out could plausibly have broken.
+    #[test]
+    fn shards_without_a_merged_copy_still_sum() {
+        let files = vec![
+            sib("Model-Q4_K_M-00001-of-00002.gguf", 3_000_000_000),
+            sib("Model-Q4_K_M-00002-of-00002.gguf", 1_000_000_000),
+        ];
+
+        let quants = parse_quantizations(&files, 7_600_000_000);
+
+        assert_eq!(quants.len(), 1);
+        assert_eq!(quants[0].size_bytes, 4_000_000_000);
+        assert!(quants[0].is_sharded);
+        assert!(quants[0].filename.contains("00001-of-00002"));
     }
 
     #[test]
