@@ -11,11 +11,13 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use sha2::{Digest, Sha256};
 use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaChatMessage, LlamaChatTemplate, LlamaModel};
 use llama_cpp_2::sampling::LlamaSampler;
+use llama_cpp_2::token::LlamaToken;
 
 use crate::ai_engine::lora_binding::LoraAdapterCache;
 use crate::ai_engine::traits::*;
@@ -49,9 +51,101 @@ fn cpu_moe_override_patterns(n_layers: u32) -> Vec<CString> {
 ///
 /// This struct owns the model, context, and backend. It is NOT thread-safe by itself;
 /// the InferenceManager wraps it in Arc<Mutex<>> for safe concurrent access.
+/// A live inference context plus the exact tokens its KV cache holds.
+///
+/// ## Why this exists
+///
+/// A context used to be created for every request and dropped at the end of it,
+/// which meant the KV cache was thrown away and the *entire* prompt was decoded
+/// again on every turn. Measured on an RTX 5060 with Qwen2.5-Coder-7B Q4_0 and a
+/// ~2,850-token agent prompt, that was ~1,200 ms of prefill per request, paid
+/// again on turn two and turn three even though nothing before the last user
+/// message had changed. Prefill was the whole of time-to-first-token; decode was
+/// already running at ~50 tok/s.
+///
+/// Keeping the context alive lets an unchanged prefix stay in the cache, so a
+/// follow-up turn only decodes what the user actually added.
+///
+/// ## What is tracked
+///
+/// `tokens` mirrors, exactly, what has been decoded into sequence 0 — prompt
+/// tokens *and* the tokens generated from them. Generated tokens matter as much
+/// as prompt tokens: the next turn's prompt replays the assistant's own reply,
+/// so leaving it cached extends the reusable prefix past the previous prompt.
+///
+/// It is only ever appended to after a successful `decode`, so it cannot claim
+/// more than the cache holds. Any failure or cancellation drops the whole
+/// session rather than trying to repair it — a mismatch between this list and
+/// the real cache would produce silently wrong output, which is far worse than
+/// one rebuilt context.
+struct GenerationSession {
+    /// Borrows the model in `LlamaCppRuntime::model`, with the lifetime erased.
+    ///
+    /// SAFETY: the referent is a `Box<LlamaModel>` owned by the same struct, so
+    /// its address is stable for as long as the box lives. The borrow is only
+    /// sound while that model is alive, which is upheld by dropping this session
+    /// before the model in every path that clears or replaces it
+    /// (`end_session`, called from `unload_model` and `load_model`).
+    ctx: LlamaContext<'static>,
+    /// Tokens currently decoded into sequence 0, in order.
+    tokens: Vec<LlamaToken>,
+    /// Context window this was built with. A different one needs a new context.
+    n_ctx: u32,
+    /// The LoRA binding in force, as (path, scale bits).
+    ///
+    /// A bound adapter is part of the context's state and cannot be swapped
+    /// without invalidating everything decoded under it, so a request wanting a
+    /// different adapter gets a fresh context.
+    adapter_key: Option<(std::path::PathBuf, u32)>,
+}
+
+// SAFETY: `LlamaContext` holds raw pointers into llama.cpp and so is not `Send`
+// by default. Nothing about a llama.cpp context is thread-*affine*, though — it
+// may be used from any thread provided it is never used from two at once, which
+// is exactly the guarantee the surrounding types already give:
+//
+//   - The only owner is `LlamaCppRuntime`, reachable solely through
+//     `InferenceManager`'s `Mutex<LlamaCppRuntime>`, so every use holds the lock.
+//   - Generation is funnelled through `GenerationScheduler`'s single worker
+//     thread, which processes one job at a time.
+//
+// Before this session existed the context was a local inside `generate`, so the
+// question never arose; storing it between requests is what surfaces it. The
+// mutex, not the thread identity, is what makes this sound.
+unsafe impl Send for GenerationSession {}
+
+/// How much of `prompt` is already decoded in `cached`.
+///
+/// Capped one token short of the prompt: llama.cpp draws the first sampled token
+/// from the logits of the last decoded position, so at least one prompt token
+/// must always go through `decode`. Reusing all of them would leave the sampler
+/// with no logits to read.
+fn reusable_prefix(cached: &[LlamaToken], prompt: &[LlamaToken]) -> usize {
+    let ceiling = prompt.len().saturating_sub(1);
+    cached
+        .iter()
+        .zip(prompt.iter())
+        .take(ceiling)
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
 pub struct LlamaCppRuntime {
     backend: Option<LlamaBackend>,
-    model: Option<LlamaModel>,
+    /// Boxed so the model has a stable heap address.
+    ///
+    /// [`GenerationSession`] holds a context that borrows this model, with the
+    /// borrow's lifetime erased. Moving a `LlamaModel` by value would move the
+    /// pointee and dangle that borrow; moving a `Box` moves only the pointer.
+    model: Option<Box<LlamaModel>>,
+    /// The live context and the tokens currently sitting in its KV cache.
+    ///
+    /// Kept between requests so an unchanged prompt prefix does not have to be
+    /// decoded again. See [`GenerationSession`].
+    ///
+    /// MUST be dropped before `model`: it borrows it. Every path that clears or
+    /// replaces the model goes through [`Self::end_session`] first.
+    session: Option<GenerationSession>,
     loaded_info: Option<LoadedModelInfo>,
     /// The chat template baked into the loaded GGUF, when it ships one.
     ///
@@ -68,11 +162,25 @@ pub struct LlamaCppRuntime {
 }
 
 impl LlamaCppRuntime {
+    /// Drops the cached context, freeing its KV cache and compute buffers.
+    ///
+    /// This is the only correct way to get rid of a session, and it must run
+    /// before the model is replaced or dropped: the context borrows the model.
+    /// Called on unload, on load, and whenever a decode fails — a session whose
+    /// token list might not match its cache has to go, because reusing a prefix
+    /// that is not really there produces confident nonsense rather than an error.
+    fn end_session(&mut self) {
+        if self.session.take().is_some() {
+            log::debug!("[RUNTIME] Inference context released");
+        }
+    }
+
     /// Creates a new unloaded runtime instance
     pub fn new() -> Self {
         Self {
             backend: None,
             model: None,
+            session: None,
             loaded_info: None,
             native_template: None,
             is_generating: Arc::new(AtomicBool::new(false)),
@@ -482,7 +590,11 @@ impl LlamaCppRuntime {
             active_adapter: None,
         };
 
-        self.model = Some(model);
+        // Any context from a previously loaded model borrows *that* model and
+        // must not outlive it.
+        self.end_session();
+
+        self.model = Some(Box::new(model));
         self.native_template = native_template;
         self.loaded_info = Some(info.clone());
 
@@ -571,6 +683,10 @@ impl LlamaCppRuntime {
             log::info!("[RUNTIME] Unloading model: {} ({})", info.model_name, info.quantization);
         }
 
+        // Release the context BEFORE the model: it holds a borrow of the model
+        // whose lifetime the compiler can no longer check for us.
+        self.end_session();
+
         // Release adapter handles BEFORE dropping the model. Each adapter was
         // initialised against this model; using one after the model is freed
         // would dereference a dangling pointer.
@@ -626,15 +742,17 @@ impl LlamaCppRuntime {
         let Self {
             backend,
             model,
+            session,
             loaded_info,
             native_template,
             is_generating,
             adapter_cache,
         } = self;
 
-        let model = model
+        let model_box = model
             .as_ref()
             .ok_or_else(|| anyhow!("No model loaded"))?;
+        let model: &LlamaModel = model_box;
         let backend = backend
             .as_ref()
             .ok_or_else(|| anyhow!("Backend not initialized"))?;
@@ -644,6 +762,14 @@ impl LlamaCppRuntime {
 
         is_generating.store(true, Ordering::Relaxed);
         let cancel_flag = is_generating.clone();
+
+        // Stage timings for the whole request. Kept because "the model is slow"
+        // is not actionable without knowing which stage spent the time — prompt
+        // rendering, context allocation, prefill and decode have entirely
+        // different fixes.
+        let t_start = std::time::Instant::now();
+        let mut t_ctx_ready = t_start;
+        let mut t_prefill_done = t_start;
 
         // Render the prompt with the model's own template when it has one, and
         // only fall back to the hand-written approximations otherwise.
@@ -791,38 +917,82 @@ impl LlamaCppRuntime {
             .with_n_threads(config.threads as i32)
             .with_n_threads_batch(config.threads as i32);
 
-        let mut ctx = model
-            .new_context(backend, ctx_params)
-            .map_err(|e| anyhow!("Failed to create inference context: {:?}", e))?;
+        // What this request needs bound, so a session built under a different
+        // adapter is not silently reused.
+        let wanted_adapter: Option<(std::path::PathBuf, u32)> = match capability_backend {
+            Some(CapabilityBackend::LoraAdapter { path, scale }) => {
+                Some((path.clone(), scale.to_bits()))
+            }
+            _ => None,
+        };
 
-        // Bind the capability's LoRA adapter, if one was resolved.
+        // Reuse the existing context when it is compatible with this request.
         //
-        // This must happen before the prefill decode below so the prompt is
-        // processed against the adapted weights. Because the context is created
-        // fresh for every generation, there is no stale binding to clear first.
+        // Only two things make a context unusable: a different context window,
+        // and a different LoRA binding. Neither can be changed in place — the
+        // window sizes the KV cache, and an adapter is baked into everything
+        // already decoded — so either one means starting over.
+        let reuse_session = session
+            .as_ref()
+            .is_some_and(|s| s.n_ctx == ctx_size.get() && s.adapter_key == wanted_adapter);
+
+        if !reuse_session && session.is_some() {
+            log::debug!("[RUNTIME] Context not reusable for this request; rebuilding");
+            *session = None;
+        }
+
         let mut active_adapter_label: Option<String> = None;
-        if let Some(CapabilityBackend::LoraAdapter { path, scale }) = capability_backend {
-            match adapter_cache.get_or_init(model, path) {
-                Ok(adapter) => match crate::ai_engine::lora_binding::bind_adapter(&mut ctx, adapter, *scale) {
-                    Ok(()) => {
-                        let label = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_else(|| "adapter".to_string());
-                        log::info!("[RUNTIME] Generating with LoRA adapter '{}' at scale {:.2}", label, scale);
-                        active_adapter_label = Some(label);
-                    }
+
+        if session.is_none() {
+            let mut ctx = model
+                .new_context(backend, ctx_params)
+                .map_err(|e| anyhow!("Failed to create inference context: {:?}", e))?;
+
+            // Bound before anything is decoded, so prefill runs against the
+            // adapted weights. A fresh context has no stale binding to clear.
+            if let Some(CapabilityBackend::LoraAdapter { path, scale }) = capability_backend {
+                match adapter_cache.get_or_init(model, path) {
+                    Ok(adapter) => match crate::ai_engine::lora_binding::bind_adapter(&mut ctx, adapter, *scale) {
+                        Ok(()) => {
+                            let label = path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().to_string())
+                                .unwrap_or_else(|| "adapter".to_string());
+                            log::info!("[RUNTIME] Generating with LoRA adapter '{}' at scale {:.2}", label, scale);
+                            active_adapter_label = Some(label);
+                        }
+                        Err(e) => log::warn!(
+                            "[RUNTIME WARN] LoRA bind failed, continuing on base model: {:#}",
+                            e
+                        ),
+                    },
                     Err(e) => log::warn!(
-                        "[RUNTIME WARN] LoRA bind failed, continuing on base model: {:#}",
+                        "[RUNTIME WARN] LoRA adapter init failed, continuing on base model: {:#}",
                         e
                     ),
-                },
-                Err(e) => log::warn!(
-                    "[RUNTIME WARN] LoRA adapter init failed, continuing on base model: {:#}",
-                    e
-                ),
+                }
             }
+
+            // SAFETY: `ctx` borrows `model`, which is the `Box<LlamaModel>` held
+            // in `self.model`. A box keeps its contents at a fixed heap address,
+            // so that borrow stays valid however the runtime itself is moved.
+            // The erased lifetime is upheld by `end_session`, which drops this
+            // context before the model is ever replaced or freed.
+            let ctx: LlamaContext<'static> = unsafe { std::mem::transmute(ctx) };
+            *session = Some(GenerationSession {
+                ctx,
+                tokens: Vec::new(),
+                n_ctx: ctx_size.get(),
+                adapter_key: wanted_adapter,
+            });
+        } else if let Some(CapabilityBackend::LoraAdapter { path, .. }) = capability_backend {
+            // Same adapter as the live context, so the binding is already in
+            // place; only the label for reporting has to be recovered.
+            active_adapter_label = path.file_name().map(|n| n.to_string_lossy().to_string());
         }
+
+        let live = session.as_mut().expect("a session was just established");
+        t_ctx_ready = std::time::Instant::now();
 
         // Prefill in chunks the size of this context's own batch.
         //
@@ -832,37 +1002,85 @@ impl LlamaCppRuntime {
         // after all of it had been paid for. Chunking gives a cancellation
         // point between batches, so an abandoned request stops within one
         // chunk instead of running to completion.
-        let prefill_chunk = (ctx.n_batch().max(1)) as usize;
+        let prefill_chunk = (live.ctx.n_batch().max(1)) as usize;
         let mut batch = LlamaBatch::new(prefill_chunk, 1);
 
-        for (chunk_index, chunk) in prompt_tokens.chunks(prefill_chunk).enumerate() {
-            // The flag is cleared by the canceller, so "not generating" here
-            // means someone asked us to stop.
-            if !cancel_flag.load(Ordering::Relaxed) {
-                let done = chunk_index * prefill_chunk;
-                log::info!(
-                    "[RUNTIME] Prefill cancelled after {}/{} prompt tokens",
-                    done, n_prompt_tokens
-                );
-                is_generating.store(false, Ordering::Relaxed);
-                return Err(anyhow!("Generation cancelled during prompt prefill"));
-            }
+        // How much of this prompt the cache already holds.
+        //
+        // A follow-up turn repeats its whole history — system prompt, every
+        // previous exchange, and the assistant's last reply — before adding the
+        // new user message. All of that is already decoded, so only the tail is
+        // new work.
+        let reuse = reusable_prefix(&live.tokens, &prompt_tokens);
 
-            batch.clear();
-            let base = chunk_index * prefill_chunk;
-            for (offset, &token) in chunk.iter().enumerate() {
-                let pos = base + offset;
-                // Only the final prompt token needs logits — that is the one the
-                // first sampled token is drawn from.
-                let wants_logits = pos == n_prompt_tokens - 1;
-                batch
-                    .add(token, pos as i32, &[0], wants_logits)
-                    .map_err(|e| anyhow!("Failed to add token to batch: {:?}", e))?;
-            }
-
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow!("Failed to decode prompt batch: {:?}", e))?;
+        // Drop everything after the divergence point. Positions from `reuse`
+        // onward describe a different conversation and would otherwise be
+        // attended to as though they belonged to this one.
+        if live.tokens.len() > reuse {
+            live.ctx
+                .clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
+                .map_err(|e| anyhow!("Failed to trim the KV cache: {e:?}"))?;
+            live.tokens.truncate(reuse);
         }
+
+        // From here the session's token list must track the cache exactly. If a
+        // decode fails or is cancelled the session is destroyed rather than left
+        // claiming tokens the cache does not hold — reusing a prefix that is not
+        // really there would produce confident nonsense instead of an error.
+        let prefill_result = (|| -> Result<()> {
+            for (chunk_index, chunk) in prompt_tokens[reuse..].chunks(prefill_chunk).enumerate() {
+                // The flag is cleared by the canceller, so "not generating" here
+                // means someone asked us to stop.
+                if !cancel_flag.load(Ordering::Relaxed) {
+                    let done = reuse + chunk_index * prefill_chunk;
+                    log::info!(
+                        "[RUNTIME] Prefill cancelled after {}/{} prompt tokens",
+                        done, n_prompt_tokens
+                    );
+                    return Err(anyhow!("Generation cancelled during prompt prefill"));
+                }
+
+                batch.clear();
+                let base = reuse + chunk_index * prefill_chunk;
+                for (offset, &token) in chunk.iter().enumerate() {
+                    let pos = base + offset;
+                    // Only the final prompt token needs logits — that is the one
+                    // the first sampled token is drawn from.
+                    let wants_logits = pos == n_prompt_tokens - 1;
+                    batch
+                        .add(token, pos as i32, &[0], wants_logits)
+                        .map_err(|e| anyhow!("Failed to add token to batch: {:?}", e))?;
+                }
+
+                live.ctx
+                    .decode(&mut batch)
+                    .map_err(|e| anyhow!("Failed to decode prompt batch: {:?}", e))?;
+
+                // Appended only once the cache really holds them.
+                live.tokens.extend_from_slice(chunk);
+            }
+            Ok(())
+        })();
+
+        if let Err(e) = prefill_result {
+            is_generating.store(false, Ordering::Relaxed);
+            *session = None;
+            return Err(e);
+        }
+
+        let live = session.as_mut().expect("the session survives a successful prefill");
+
+        t_prefill_done = std::time::Instant::now();
+        let fresh = n_prompt_tokens - reuse;
+        log::info!(
+            "[PERF] ctx_alloc={}ms prefill={}ms ({} new, {} reused, {:.1} tok/s)",
+            t_ctx_ready.duration_since(t_start).as_millis(),
+            t_prefill_done.duration_since(t_ctx_ready).as_millis(),
+            fresh,
+            reuse,
+            fresh as f64
+                / t_prefill_done.duration_since(t_ctx_ready).as_secs_f64().max(1e-9)
+        );
 
         let eos_token = model.token_eos();
 
@@ -996,7 +1214,7 @@ impl LlamaCppRuntime {
             }
 
             // Sample next token
-            let new_token_id = sampler.sample(&ctx, -1);
+            let new_token_id = sampler.sample(&live.ctx, -1);
 
             // Stop on any end-of-generation token the model itself declares.
             // `token_eos()` is only one of them — Gemma, for instance, ends turns
@@ -1077,11 +1295,35 @@ impl LlamaCppRuntime {
             n_cur += 1;
 
             // Decode
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow!("Decode failed at token {}: {:?}", n_generated, e))?;
+            //
+            // A failure here leaves the cache in a state the session's token
+            // list can no longer describe, so the session goes rather than being
+            // trusted on the next request.
+            if let Err(e) = live.ctx.decode(&mut batch) {
+                is_generating.store(false, Ordering::Relaxed);
+                *session = None;
+                return Err(anyhow!("Decode failed at token {}: {:?}", n_generated, e));
+            }
+
+            // Recorded after the decode, so the list never claims more than the
+            // cache holds. Generated tokens are worth keeping for the same
+            // reason prompt tokens are: the next turn replays this reply as part
+            // of its history, so caching it extends the reusable prefix past the
+            // end of the current prompt.
+            live.tokens.push(new_token_id);
         }
 
         is_generating.store(false, Ordering::Relaxed);
+        {
+            let decode_s = t_prefill_done.elapsed().as_secs_f64();
+            log::info!(
+                "[PERF] decode={}ms ({} tok, {:.1} tok/s) total={}ms",
+                (decode_s * 1000.0) as u64,
+                n_generated,
+                n_generated as f64 / decode_s.max(1e-9),
+                t_start.elapsed().as_millis()
+            );
+        }
         log::info!(
             "[RUNTIME] Generation complete: {} tokens, {} chars, adapter={}",
             n_generated,
@@ -1600,6 +1842,72 @@ pub fn format_chat_prompt_with_template(messages: &[ChatMessage], template_name:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── KV cache prefix reuse ──────────────────────────────────────────────
+
+    fn toks(ids: &[i32]) -> Vec<LlamaToken> {
+        ids.iter().copied().map(LlamaToken).collect()
+    }
+
+    /// The ordinary case: a follow-up turn repeats everything said so far and
+    /// appends to it, so only the appended part is new work.
+    #[test]
+    fn a_continued_conversation_reuses_everything_before_the_new_turn() {
+        let cached = toks(&[1, 2, 3, 4]);
+        let prompt = toks(&[1, 2, 3, 4, 5, 6]);
+
+        assert_eq!(reusable_prefix(&cached, &prompt), 4);
+    }
+
+    /// At least one prompt token must always be decoded: the first sampled
+    /// token is drawn from the logits of the last decoded position, so reusing
+    /// the whole prompt would leave the sampler nothing to read.
+    #[test]
+    fn an_identical_prompt_still_decodes_its_final_token() {
+        let same = toks(&[1, 2, 3, 4]);
+
+        assert_eq!(reusable_prefix(&same, &same), 3, "one short of the full prompt");
+    }
+
+    /// Regenerating the same turn is the case that would be tempting to reuse
+    /// entirely, and must not be.
+    #[test]
+    fn a_cache_longer_than_the_prompt_is_capped_by_the_prompt() {
+        let cached = toks(&[1, 2, 3, 4, 5, 6, 7]);
+        let prompt = toks(&[1, 2, 3]);
+
+        assert_eq!(reusable_prefix(&cached, &prompt), 2);
+    }
+
+    /// Editing an earlier message, or switching conversation, diverges partway
+    /// through. Everything from the divergence on has to be decoded again.
+    #[test]
+    fn a_divergent_conversation_reuses_only_the_shared_head() {
+        let cached = toks(&[1, 2, 3, 99, 99]);
+        let prompt = toks(&[1, 2, 3, 42, 42]);
+
+        assert_eq!(reusable_prefix(&cached, &prompt), 3);
+    }
+
+    #[test]
+    fn a_prompt_sharing_nothing_reuses_nothing() {
+        assert_eq!(reusable_prefix(&toks(&[9, 9, 9]), &toks(&[1, 2, 3])), 0);
+    }
+
+    /// A fresh context has an empty cache, which is simply "reuse nothing"
+    /// rather than a special case.
+    #[test]
+    fn an_empty_cache_reuses_nothing() {
+        assert_eq!(reusable_prefix(&[], &toks(&[1, 2, 3])), 0);
+    }
+
+    /// A single-token prompt has no reusable part at all, and the cap must not
+    /// underflow computing that.
+    #[test]
+    fn a_one_token_prompt_is_all_new_work() {
+        assert_eq!(reusable_prefix(&toks(&[1]), &toks(&[1])), 0);
+        assert_eq!(reusable_prefix(&[], &[]), 0);
+    }
 
     // ─── MoE expert offload patterns ────────────────────────────────────────
 

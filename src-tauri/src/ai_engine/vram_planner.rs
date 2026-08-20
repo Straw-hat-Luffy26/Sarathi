@@ -14,14 +14,18 @@
 //! `vram >= model_size + 1.0`, requests full offload, and then fails or silently
 //! spills once the KV cache and compute buffers are allocated.
 //!
-//! ## Approximation
+//! ## KV cache cost
 //!
-//! Exact KV cache size needs `n_layer`, `n_head_kv`, and `head_dim` from GGUF
-//! metadata, which is not parsed at load time. [`estimate_kv_bytes_per_token`]
-//! substitutes a conservative size-banded estimate — deliberately biased high,
-//! because under-offloading costs speed while over-offloading costs a crash.
-//! `model_recommendation::estimator` has the exact GQA-aware formula for the
-//! catalog path, where the metadata is available.
+//! Both planners take the exact per-token cost when the caller has read the
+//! GGUF header — `n_layer × n_head_kv × (k_len + v_len) × 2`, via
+//! [`gguf_meta::GgufMetadata::kv_bytes_per_token`](super::gguf_meta). The
+//! loader does read that header, so the exact figure is the normal case.
+//!
+//! [`estimate_kv_bytes_per_token`] remains the fallback for an unreadable
+//! header. It bands on file size, and the band is only a proxy: its top band of
+//! 256 KB/token is about right for an 8B and about half the truth for a 27B, so
+//! a plan built on it over-commits the card at exactly the sizes where that is
+//! least affordable. Prefer the exact value wherever the metadata exists.
 
 /// VRAM held back for the OS, desktop compositor, and other applications.
 ///
@@ -91,9 +95,27 @@ pub fn plan_gpu_offload(
     model_bytes: u64,
     context_length: u32,
     total_layers: Option<u32>,
+    kv_bytes_per_token: Option<u64>,
 ) -> GpuOffloadPlan {
     if vram_total_bytes == 0 {
         return GpuOffloadPlan::cpu_only("No GPU VRAM detected");
+    }
+
+    // A model of unknown size cannot be placed, and the arithmetic below fails
+    // silently rather than loudly: `weight_budget >= 0` holds on every card, so
+    // a zero size returns full offload with the reason "covers the 0.00 GB
+    // model". That is how a 17 GB package whose manifest recorded
+    // `sizeBytes: 0` — every package whose download was interrupted — came to
+    // request all 48 layers on an 8 GB card.
+    //
+    // The caller has the file and should pass its real length; this is the
+    // floor under that. CPU-only is slow, but it is the honest answer to "how
+    // much of a model I cannot measure fits in VRAM", and it does not crash.
+    if model_bytes == 0 {
+        return GpuOffloadPlan::cpu_only(
+            "Model size unknown (0 bytes) — cannot budget VRAM against it, so no layers \
+             are offloaded rather than guessing that all of them fit",
+        );
     }
 
     // Usable VRAM after the OS and desktop take their share.
@@ -107,7 +129,18 @@ pub fn plan_gpu_offload(
         ));
     }
 
-    let kv_bytes = estimate_kv_bytes_per_token(model_bytes)
+    // The exact per-token cost from the GGUF header when the caller has it.
+    //
+    // [`estimate_kv_bytes_per_token`] bands on file size and its top band is
+    // 256 KB for everything at or above 8 GB, which is roughly right for an 8B
+    // and roughly half the truth for a 27B — Gemma 3 27B is 62 layers × 16 KV
+    // heads × 128, or ~496 KB per token. At an 8K context that is a 2 GB
+    // shortfall in the budget, and every byte of it is spent on weights the
+    // card cannot then hold. The MoE path has used the exact figure since it
+    // was written; this is the dense path catching up.
+    let kv_bytes = kv_bytes_per_token
+        .filter(|b| *b > 0)
+        .unwrap_or_else(|| estimate_kv_bytes_per_token(model_bytes))
         .saturating_mul(context_length.max(1) as u64);
 
     // KV cache and compute buffers are charged before any weights.
@@ -253,6 +286,19 @@ pub fn plan_moe_offload(
         return MoeOffloadPlan::wont_fit(
             layers,
             "No routed-expert weights identified, so there is nothing to offload",
+        );
+    }
+
+    // The MoE side of the unknown-size trap in [`plan_gpu_offload`]. Here it is
+    // quieter still: a zero size satisfies `weight_budget >= model_bytes`, so
+    // the plan comes back "MoE resident — fits entirely in VRAM, no experts
+    // offloaded" and every expert of a 30B model is committed to the card.
+    // Refusing sends the caller to the dense path, which now also refuses.
+    if model_bytes == 0 {
+        return MoeOffloadPlan::wont_fit(
+            layers,
+            "Model size unknown (0 bytes) — cannot decide how many experts must move to \
+             system RAM, so no expert split is claimed",
         );
     }
 
@@ -405,9 +451,19 @@ pub fn max_affordable_context(
     vram_total_bytes: u64,
     model_bytes: u64,
     desired_context: u32,
+    kv_bytes_per_token: Option<u64>,
 ) -> u32 {
     if vram_total_bytes == 0 || desired_context == 0 {
         return desired_context;
+    }
+
+    // Same unknown-size trap as [`plan_gpu_offload`]: subtracting a zero-byte
+    // model leaves the whole card apparently free for KV, so a package with no
+    // recorded size was handed its advertised maximum — 205,342 tokens against
+    // a 262,144-token request on an 8 GB card. Treat it the way the
+    // weights-fill-the-card branch below is treated.
+    if model_bytes == 0 {
+        return MIN_VIABLE_CONTEXT.min(desired_context);
     }
 
     let usable = vram_total_bytes.saturating_sub(OS_RESERVE_BYTES);
@@ -425,7 +481,12 @@ pub fn max_affordable_context(
         return MIN_VIABLE_CONTEXT.min(desired_context);
     }
 
-    let per_token = estimate_kv_bytes_per_token(model_bytes).max(1);
+    // Same exact-when-known rule as [`plan_gpu_offload`]: a context sized
+    // against an underestimated cache is a context the card cannot hold.
+    let per_token = kv_bytes_per_token
+        .filter(|b| *b > 0)
+        .unwrap_or_else(|| estimate_kv_bytes_per_token(model_bytes))
+        .max(1);
     let affordable = (kv_budget / per_token).min(u32::MAX as u64) as u32;
 
     affordable.clamp(MIN_VIABLE_CONTEXT.min(desired_context), desired_context)
@@ -443,14 +504,14 @@ mod tests {
 
     #[test]
     fn no_vram_means_cpu_only() {
-        let plan = plan_gpu_offload(0, 2 * GB, 4096, None);
+        let plan = plan_gpu_offload(0, 2 * GB, 4096, None, None);
         assert_eq!(plan.gpu_layers, 0);
     }
 
     #[test]
     fn tiny_gpus_fall_back_to_cpu() {
         // 1 GB card: nothing usable after the OS reserve.
-        let plan = plan_gpu_offload(GB, 2 * GB, 4096, None);
+        let plan = plan_gpu_offload(GB, 2 * GB, 4096, None, None);
         assert_eq!(plan.gpu_layers, 0);
         assert!(plan.reason.contains("usable VRAM"));
     }
@@ -460,7 +521,7 @@ mod tests {
         // The exact case the old heuristic got wrong: 4 GB RTX 3050 laptop.
         // `vram_gb >= model_size_gb + 1.0` → 4.0 >= 3.5 → requested all layers,
         // ignoring ~1.3 GB of KV cache at 8K context.
-        let plan = plan_gpu_offload(4 * GB, 2560 * 1024 * 1024, 8192, Some(36));
+        let plan = plan_gpu_offload(4 * GB, 2560 * 1024 * 1024, 8192, Some(36), None);
 
         assert!(
             !plan.full_offload,
@@ -474,15 +535,49 @@ mod tests {
     fn regression_large_vram_does_not_blindly_full_offload() {
         // Old rule: `vram_gb >= 6.0` → full offload regardless of model size.
         // A 20 GB model on an 8 GB card must not request every layer.
-        let plan = plan_gpu_offload(8 * GB, 20 * GB, 8192, Some(80));
+        let plan = plan_gpu_offload(8 * GB, 20 * GB, 8192, Some(80), None);
 
         assert!(!plan.full_offload, "20 GB model cannot fit 8 GB VRAM");
         assert!(plan.gpu_layers > 0 && plan.gpu_layers < 80);
     }
 
+    /// A package whose manifest never recorded a size — every download that was
+    /// interrupted writes `sizeBytes: 0` — must not be read as a model that
+    /// trivially fits. Before the guard this returned `FULL_OFFLOAD` with the
+    /// reason "covers the 0.00 GB model", which is how a 30B package came to
+    /// request all 48 layers on an 8 GB card.
+    #[test]
+    fn regression_an_unknown_model_size_never_claims_full_offload() {
+        let plan = plan_gpu_offload(8 * GB, 0, 8192, Some(48), None);
+
+        assert!(!plan.full_offload, "got: {}", plan.reason);
+        assert_eq!(plan.gpu_layers, 0, "got: {}", plan.reason);
+        assert!(plan.reason.contains("unknown"), "got: {}", plan.reason);
+    }
+
+    /// The context half of the same defect: subtracting a zero-byte model left
+    /// the entire card apparently free for KV cache, so a 262,144-token request
+    /// was granted 205,342 tokens on 8 GB.
+    #[test]
+    fn regression_an_unknown_model_size_does_not_buy_a_full_context() {
+        let ctx = max_affordable_context(8 * GB, 0, 262_144, None);
+
+        assert_eq!(ctx, MIN_VIABLE_CONTEXT, "an unmeasurable model gets the floor, not the ceiling");
+    }
+
+    /// MoE models reach `plan_moe_offload` before the dense path, so the guard
+    /// has to sit on both or the expert split silently claims residency.
+    #[test]
+    fn regression_an_unknown_model_size_claims_no_expert_split() {
+        let plan = plan_moe_offload("unsized-moe", 8 * GB, ROOMY_RAM, 0, 8192, &gpt_oss_geometry());
+
+        assert!(!plan.fits, "got: {}", plan.reason);
+        assert!(plan.reason.contains("unknown"), "got: {}", plan.reason);
+    }
+
     #[test]
     fn a_roomy_card_offloads_everything() {
-        let plan = plan_gpu_offload(24 * GB, 4 * GB, 8192, Some(36));
+        let plan = plan_gpu_offload(24 * GB, 4 * GB, 8192, Some(36), None);
 
         assert!(plan.full_offload);
         assert_eq!(plan.gpu_layers, FULL_OFFLOAD);
@@ -490,8 +585,8 @@ mod tests {
 
     #[test]
     fn context_length_reduces_offloadable_layers() {
-        let short = plan_gpu_offload(8 * GB, 6 * GB, 2048, Some(32));
-        let long = plan_gpu_offload(8 * GB, 6 * GB, 32768, Some(32));
+        let short = plan_gpu_offload(8 * GB, 6 * GB, 2048, Some(32), None);
+        let long = plan_gpu_offload(8 * GB, 6 * GB, 32768, Some(32), None);
 
         assert!(
             long.gpu_layers <= short.gpu_layers,
@@ -504,8 +599,8 @@ mod tests {
     #[test]
     fn layer_count_is_respected_rather_than_assumed_32() {
         // Same memory pressure, different architectures.
-        let sixteen = plan_gpu_offload(6 * GB, 8 * GB, 4096, Some(16));
-        let eighty = plan_gpu_offload(6 * GB, 8 * GB, 4096, Some(80));
+        let sixteen = plan_gpu_offload(6 * GB, 8 * GB, 4096, Some(16), None);
+        let eighty = plan_gpu_offload(6 * GB, 8 * GB, 4096, Some(80), None);
 
         assert!(
             eighty.gpu_layers > sixteen.gpu_layers,
@@ -515,6 +610,52 @@ mod tests {
             sixteen.gpu_layers
         );
         assert!(sixteen.gpu_layers <= 16, "cannot offload more layers than exist");
+    }
+
+    /// The 27B case this exists for. Gemma 3 27B is 62 layers × 16 KV heads ×
+    /// 128, or ~496 KB per token — nearly double the 256 KB the size band
+    /// assumes for anything at or above 8 GB. At an 8K context that is a ~2 GB
+    /// error in the weight budget, all of it spent on layers the card cannot
+    /// hold, so the exact figure has to place strictly fewer of them.
+    #[test]
+    fn the_exact_kv_cost_places_fewer_layers_than_the_size_band() {
+        const GEMMA3_27B_KV: u64 = 62 * 16 * (128 + 128) * 2;
+        let model = 17 * GB;
+
+        let banded = plan_gpu_offload(8 * GB, model, 8192, Some(62), None);
+        let exact = plan_gpu_offload(8 * GB, model, 8192, Some(62), Some(GEMMA3_27B_KV));
+
+        assert!(
+            exact.gpu_layers < banded.gpu_layers,
+            "the real cache is larger than the band, so fewer layers fit \
+             (exact {} vs banded {}): {}",
+            exact.gpu_layers,
+            banded.gpu_layers,
+            exact.reason
+        );
+    }
+
+    /// A zero from a header that did not carry the fields must not be taken
+    /// literally — a free KV cache would buy every layer on the card.
+    #[test]
+    fn a_zero_kv_cost_falls_back_to_the_estimate() {
+        let zero = plan_gpu_offload(8 * GB, 6 * GB, 8192, Some(32), Some(0));
+        let none = plan_gpu_offload(8 * GB, 6 * GB, 8192, Some(32), None);
+
+        assert_eq!(zero, none, "0 means unknown, not free");
+    }
+
+    #[test]
+    fn the_exact_kv_cost_also_shortens_the_affordable_context() {
+        const GEMMA3_27B_KV: u64 = 62 * 16 * (128 + 128) * 2;
+
+        let banded = max_affordable_context(8 * GB, 4 * GB, 32768, None);
+        let exact = max_affordable_context(8 * GB, 4 * GB, 32768, Some(GEMMA3_27B_KV));
+
+        assert!(
+            exact < banded,
+            "a larger real cache must buy less context ({exact} vs {banded})"
+        );
     }
 
     #[test]
@@ -530,7 +671,7 @@ mod tests {
     fn a_4gb_card_cannot_afford_a_32k_context() {
         // The exact case the certified runtime profile got wrong: it hardcoded
         // context_length 32768 regardless of the machine.
-        let affordable = max_affordable_context(4 * GB, 2560 * 1024 * 1024, 32768);
+        let affordable = max_affordable_context(4 * GB, 2560 * 1024 * 1024, 32768, None);
 
         assert!(
             affordable < 32768,
@@ -541,26 +682,26 @@ mod tests {
 
     #[test]
     fn a_large_card_keeps_the_full_context() {
-        let affordable = max_affordable_context(24 * GB, 4 * GB, 32768);
+        let affordable = max_affordable_context(24 * GB, 4 * GB, 32768, None);
         assert_eq!(affordable, 32768, "a 24 GB card can afford the model's full context");
     }
 
     #[test]
     fn affordable_context_never_exceeds_what_was_asked_for() {
         // Even with enormous VRAM, we never invent context the model lacks.
-        assert_eq!(max_affordable_context(80 * GB, GB, 8192), 8192);
+        assert_eq!(max_affordable_context(80 * GB, GB, 8192, None), 8192);
     }
 
     #[test]
     fn no_gpu_leaves_the_request_untouched() {
         // CPU-only is bounded by system RAM, handled elsewhere.
-        assert_eq!(max_affordable_context(0, 4 * GB, 16384), 16384);
+        assert_eq!(max_affordable_context(0, 4 * GB, 16384, None), 16384);
     }
 
     #[test]
     fn context_shrinks_as_the_model_grows() {
-        let small = max_affordable_context(8 * GB, GB, 32768);
-        let large = max_affordable_context(8 * GB, 6 * GB, 32768);
+        let small = max_affordable_context(8 * GB, GB, 32768, None);
+        let large = max_affordable_context(8 * GB, 6 * GB, 32768, None);
 
         assert!(
             large <= small,
@@ -578,7 +719,7 @@ mod tests {
         ];
 
         for (vram, model, ctx) in cases {
-            let plan = plan_gpu_offload(vram, model, ctx, None);
+            let plan = plan_gpu_offload(vram, model, ctx, None, None);
             assert!(plan.gpu_layers == 0 || plan.gpu_layers > 0);
         }
     }

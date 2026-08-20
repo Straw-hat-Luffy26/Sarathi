@@ -873,6 +873,18 @@ impl InferenceManager {
                 }
             };
 
+        // The size every placement decision below is budgeted against.
+        //
+        // Deliberately not `manifest.base_model.size_bytes`. That field is
+        // written by the downloader on completion, so it is 0 for any package
+        // whose download was interrupted — and 0 is the one value the planner
+        // cannot survive: `weight_budget >= 0` holds on every card, so the plan
+        // came back as full offload of a model it measured at "0.00 GB", and
+        // the context sizer handed out 205,342 tokens for the same reason. The
+        // file is the authority, and its header was just read a few lines up.
+        let model_bytes =
+            model_bytes_on_disk(std::path::Path::new(gguf_path), manifest.base_model.size_bytes);
+
         // Host memory available for offloaded experts. Routed through the same
         // budget calculator the recommender uses, so the loader and the
         // recommendation apply identical OS reserves rather than two different
@@ -892,7 +904,6 @@ impl InferenceManager {
         let (gpu_layers, cpu_moe_layers) = match &selected_gpu {
             Some(gpu) => {
                 let budget = usable_vram_bytes(gpu);
-                let model_bytes = manifest.base_model.size_bytes;
                 let gpu_label = format!(
                     "GPU '{}' ({}, {:.2} GB usable of {:.2} GB)",
                     gpu.model,
@@ -939,6 +950,7 @@ impl InferenceManager {
                             model_bytes,
                             planned_context,
                             gguf_meta.as_ref().map(|m| m.block_count),
+                            gguf_meta.as_ref().map(|m| m.kv_bytes_per_token()),
                         );
                         log::info!("[INFERENCE_MGR] Selected {gpu_label}: {}", plan.reason);
                         (plan.gpu_layers, 0)
@@ -988,8 +1000,9 @@ impl InferenceManager {
             // The model's advertised context is an upper bound, not an entitlement.
             let affordable_context = crate::ai_engine::vram_planner::max_affordable_context(
                 detected_vram,
-                manifest.base_model.size_bytes,
+                model_bytes,
                 cfg.context_length,
+                gguf_meta.as_ref().map(|m| m.kv_bytes_per_token()),
             );
             if affordable_context < cfg.context_length {
                 log::info!(
@@ -1107,6 +1120,92 @@ fn usable_vram_bytes(gpu: &crate::system_analyzer::traits::GpuInfo) -> u64 {
     }
 }
 
+/// The model's real size on disk, in bytes, falling back to the manifest.
+///
+/// `manifest_bytes` is the downloader's record, written on completion — so it
+/// is 0 for every package whose download was interrupted, and 0 is precisely
+/// the value the planner cannot survive. It is used only when the file itself
+/// cannot be measured, which leaves the previous behaviour intact for packages
+/// that have no file at all.
+fn model_bytes_on_disk(gguf_path: &std::path::Path, manifest_bytes: u64) -> u64 {
+    let measured = measure_gguf_bytes(gguf_path);
+    if measured == 0 {
+        return manifest_bytes;
+    }
+
+    // Worth a line in the log rather than a silent correction: a manifest that
+    // disagrees with the file usually means an interrupted or resumed download,
+    // and the placement decisions below will read oddly without it.
+    if manifest_bytes != 0 && manifest_bytes.abs_diff(measured) > measured / 100 {
+        log::info!(
+            "[INFERENCE_MGR] Manifest records {:.2} GB but the file measures {:.2} GB; \
+             planning against the file",
+            manifest_bytes as f64 / 1e9,
+            measured as f64 / 1e9
+        );
+    }
+
+    measured
+}
+
+/// Sums a GGUF's bytes on disk, across shards when the model is split.
+///
+/// Measuring only the shard the manifest names understates a 3-part model by
+/// two thirds — the same over-commitment as a zero size, arriving more quietly.
+/// Returns 0 when nothing can be read, which the caller treats as "unmeasured".
+fn measure_gguf_bytes(path: &std::path::Path) -> u64 {
+    let own = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+
+    let Some(prefix) = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".gguf"))
+        .and_then(shard_prefix)
+    else {
+        return own;
+    };
+    let Some(dir) = path.parent() else {
+        return own;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return own;
+    };
+
+    let total: u64 = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".gguf"))
+        })
+        .filter_map(|e| e.metadata().ok().map(|m| m.len()))
+        .sum();
+
+    // A directory listing that somehow missed the file itself must not shrink
+    // the answer below what was already measured directly.
+    total.max(own)
+}
+
+/// `Model-Q4_K_M-00001-of-00003` -> `Model-Q4_K_M-`; `None` when unsharded.
+///
+/// Matches the `-NNNNN-of-NNNNN` convention llama.cpp's splitter emits, the
+/// same shape [`crate::model_providers::huggingface::discovery`] strips when it
+/// collapses a split model to one catalog entry.
+fn shard_prefix(stem: &str) -> Option<String> {
+    // rsplitn yields reversed: [NNNNN, "of", NNNNN, rest]
+    let parts: Vec<&str> = stem.rsplitn(4, '-').collect();
+    if parts.len() == 4
+        && parts[1] == "of"
+        && parts[0].len() == 5
+        && parts[2].len() == 5
+        && parts[0].chars().all(|c| c.is_ascii_digit())
+        && parts[2].chars().all(|c| c.is_ascii_digit())
+    {
+        return Some(format!("{}-", parts[3]));
+    }
+    None
+}
+
 /// Picks the GPU most likely to run the model fastest.
 ///
 /// Enumeration order is not preference order: adapters come back in whatever
@@ -1215,12 +1314,69 @@ mod tests {
             6_087_086_624,
             planned,
             Some(48),
+            None,
         );
         assert!(
             plan.gpu_layers > 0,
             "a model this size must still reach the GPU: {}",
             plan.reason
         );
+    }
+
+    /// The defect this guards: an interrupted download leaves
+    /// `manifest.base_model.size_bytes` at 0, the planner reads that as a model
+    /// that fits any card, and a 30B package requests full offload on 8 GB.
+    #[test]
+    fn an_unrecorded_manifest_size_falls_back_to_the_file() {
+        let dir = std::env::temp_dir().join(format!("sarathi-size-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("Model-Q4_K_M.gguf");
+        std::fs::write(&path, vec![0u8; 4096]).expect("write fixture");
+
+        assert_eq!(
+            model_bytes_on_disk(&path, 0),
+            4096,
+            "a zero manifest size must be replaced by the measured file"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Measuring only the shard the manifest names understates a split model by
+    /// the shard count, which over-commits VRAM the same way a zero size does.
+    #[test]
+    fn a_split_model_is_measured_across_every_shard() {
+        let dir = std::env::temp_dir().join(format!("sarathi-shard-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        for n in 1..=3 {
+            std::fs::write(
+                dir.join(format!("Big-Q4_K_M-{n:05}-of-00003.gguf")),
+                vec![0u8; 1000],
+            )
+            .expect("write shard");
+        }
+        let first = dir.join("Big-Q4_K_M-00001-of-00003.gguf");
+
+        assert_eq!(
+            model_bytes_on_disk(&first, 0),
+            3000,
+            "all three shards have to be counted, not just the one named"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_file_still_yields_the_manifest_size() {
+        let absent = std::path::Path::new("no-such-dir-xyz/model.gguf");
+        assert_eq!(model_bytes_on_disk(absent, 1234), 1234);
+    }
+
+    #[test]
+    fn shard_prefixes_are_recognised_only_in_the_llama_cpp_form() {
+        assert_eq!(shard_prefix("Big-Q4_K_M-00001-of-00003").as_deref(), Some("Big-Q4_K_M-"));
+        assert_eq!(shard_prefix("Model-Q4_K_M"), None);
+        assert_eq!(shard_prefix("Model-1-of-3"), None, "the counts are zero-padded to five");
     }
 
     #[test]
