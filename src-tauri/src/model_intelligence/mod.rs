@@ -1,11 +1,13 @@
 //! Model Intelligence Layer Module
 //!
 //! Provides source-driven metadata extraction, profile versioning,
-//! dynamic capability management, intent detection, and dynamic adapter routing.
+//! and dynamic capability management.
+//!
+//! Intent detection and adapter routing used to live here too. They were
+//! superseded by `crate::capability`, which classifies with a calibrated
+//! confidence and applies its decision to the actual inference call.
 
-pub mod adapter_router;
 pub mod extractor;
-pub mod intent;
 pub mod profile;
 
 use anyhow::Result;
@@ -13,9 +15,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::adapter_manager::ModelPackageManifest;
-pub use adapter_router::{AdapterRouteResult, AdapterRouter};
 pub use extractor::MetadataExtractor;
-pub use intent::{IntentDetector, PromptIntent};
 pub use profile::{CapabilityRegistry, ModelFamily, ModelProfile, InferenceParameters, TokenConfig, CURRENT_PROFILE_VERSION};
 
 pub struct ModelIntelligenceManager;
@@ -86,16 +86,6 @@ impl ModelIntelligenceManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_intent_detection() {
-        assert_eq!(IntentDetector::classify("Write a python function to compute fibonacci"), PromptIntent::Coding);
-        assert_eq!(IntentDetector::classify("Solve for x: 3x + 5 = 20"), PromptIntent::Mathematics);
-        assert_eq!(IntentDetector::classify("Think step by step and compare pros and cons"), PromptIntent::Reasoning);
-        assert_eq!(IntentDetector::classify("Execute function call with json arguments"), PromptIntent::ToolCalling);
-        assert_eq!(IntentDetector::classify("Summarize key findings of this literature paper"), PromptIntent::Research);
-        assert_eq!(IntentDetector::classify("Hello how are you doing today?"), PromptIntent::GeneralChat);
-    }
 
     #[test]
     fn test_profile_versioning_and_migration() {

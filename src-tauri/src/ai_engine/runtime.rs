@@ -159,6 +159,14 @@ pub struct LlamaCppRuntime {
     /// LoRA adapters initialised against the currently loaded model.
     /// Cleared on unload — entries are only valid for the model they were built from.
     adapter_cache: LoraAdapterCache,
+    /// Why the adapter requested for the last turn could not be bound.
+    ///
+    /// A bind failure is survivable — generation continues on the base model —
+    /// but it must not be silent. The capability payload is emitted before
+    /// generation starts, so without this the UI kept claiming a LoRA was
+    /// active while the reply came from unadapted weights. Shared rather than
+    /// plain because `generate_with_capability` destructures `self`.
+    last_adapter_failure: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl LlamaCppRuntime {
@@ -185,7 +193,19 @@ impl LlamaCppRuntime {
             native_template: None,
             is_generating: Arc::new(AtomicBool::new(false)),
             adapter_cache: LoraAdapterCache::new(),
+            last_adapter_failure: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Takes the reason the last turn's adapter failed to bind, if it did.
+    ///
+    /// Consuming rather than peeking: the caller emits a correction once, and a
+    /// stale reason re-reported on a later turn would be worse than none.
+    pub fn take_adapter_failure(&self) -> Option<String> {
+        self.last_adapter_failure
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
     }
 
     /// Returns the current runtime status
@@ -747,7 +767,14 @@ impl LlamaCppRuntime {
             native_template,
             is_generating,
             adapter_cache,
+            last_adapter_failure,
         } = self;
+
+        // Each turn reports its own outcome; last turn's failure is not this
+        // turn's.
+        if let Ok(mut slot) = last_adapter_failure.lock() {
+            *slot = None;
+        }
 
         let model_box = model
             .as_ref()
@@ -770,6 +797,11 @@ impl LlamaCppRuntime {
         let t_start = std::time::Instant::now();
         let mut t_ctx_ready = t_start;
         let mut t_prefill_done = t_start;
+
+        // Put the system prompt in the one shape every chat template expects
+        // before any of them sees it — see `normalise_system_messages`.
+        let normalised = normalise_system_messages(messages);
+        let messages: &[ChatMessage] = &normalised;
 
         // Render the prompt with the model's own template when it has one, and
         // only fall back to the hand-written approximations otherwise.
@@ -961,15 +993,25 @@ impl LlamaCppRuntime {
                             log::info!("[RUNTIME] Generating with LoRA adapter '{}' at scale {:.2}", label, scale);
                             active_adapter_label = Some(label);
                         }
-                        Err(e) => log::warn!(
-                            "[RUNTIME WARN] LoRA bind failed, continuing on base model: {:#}",
-                            e
-                        ),
+                        Err(e) => {
+                            log::warn!(
+                                "[RUNTIME WARN] LoRA bind failed, continuing on base model: {:#}",
+                                e
+                            );
+                            if let Ok(mut slot) = last_adapter_failure.lock() {
+                                *slot = Some(format!("the adapter could not be applied ({e:#})"));
+                            }
+                        }
                     },
-                    Err(e) => log::warn!(
-                        "[RUNTIME WARN] LoRA adapter init failed, continuing on base model: {:#}",
-                        e
-                    ),
+                    Err(e) => {
+                        log::warn!(
+                            "[RUNTIME WARN] LoRA adapter init failed, continuing on base model: {:#}",
+                            e
+                        );
+                        if let Ok(mut slot) = last_adapter_failure.lock() {
+                            *slot = Some(format!("the adapter could not be loaded ({e:#})"));
+                        }
+                    }
                 }
             }
 
@@ -1011,16 +1053,48 @@ impl LlamaCppRuntime {
         // previous exchange, and the assistant's last reply — before adding the
         // new user message. All of that is already decoded, so only the tail is
         // new work.
-        let reuse = reusable_prefix(&live.tokens, &prompt_tokens);
+        let mut reuse = reusable_prefix(&live.tokens, &prompt_tokens);
 
         // Drop everything after the divergence point. Positions from `reuse`
         // onward describe a different conversation and would otherwise be
         // attended to as though they belonged to this one.
+        //
+        // Not every model can do that. A recurrent or hybrid architecture —
+        // `nemotron_h`, Mamba, Jamba — carries a rolling state rather than an
+        // addressable cache, so there is no "everything after position N" to
+        // drop, and llama.cpp refuses the partial removal. It says so in the
+        // bool this call returns, which used to be discarded: the state stayed
+        // where it was while `live.tokens` claimed a shorter prefix, and the
+        // next decode arrived at a position the module had already passed.
+        // llama.cpp rejected the batch with `ret = -1`, which llama-cpp-2 names
+        // `NTokensZero` — a batch that was never empty, reported as empty.
+        //
+        // When the prefix cannot be dropped the sequence starts over. That is a
+        // full re-prefill on any turn that diverges; simply continuing a
+        // conversation still reuses everything, which is the common case.
         if live.tokens.len() > reuse {
-            live.ctx
+            let trimmed = live
+                .ctx
                 .clear_kv_cache_seq(Some(0), Some(reuse as u32), None)
                 .map_err(|e| anyhow!("Failed to trim the KV cache: {e:?}"))?;
-            live.tokens.truncate(reuse);
+
+            // The module's own account of where it sits, which is what the next
+            // decode is checked against — believed over the bool if they ever
+            // disagree. An empty sequence reports -1, matching a `reuse` of 0.
+            let rewound = trimmed && live.ctx.kv_cache_seq_pos_max(0) == reuse as i32 - 1;
+
+            if rewound {
+                live.tokens.truncate(reuse);
+            } else {
+                log::info!(
+                    "[RUNTIME] This model's memory cannot drop a partial prefix; \
+                     restarting the sequence and re-prefilling all {} prompt tokens.",
+                    n_prompt_tokens
+                );
+                live.ctx.clear_kv_cache();
+                live.tokens.clear();
+                reuse = 0;
+            }
         }
 
         // From here the session's token list must track the cache exactly. If a
@@ -1413,6 +1487,60 @@ fn render_with_native_template(
     Ok(prompt)
 }
 
+/// Collapses the system prompt into a single leading message.
+///
+/// Chat templates are written against `tokenizer.apply_chat_template`, whose
+/// contract is at most one system message and it comes first. Several enforce
+/// it literally: Qwen3.5 answers a later one with
+/// `raise_exception('System message must be at the beginning.')`, which aborts
+/// the whole render and — when tools were in the request — costs the caller the
+/// entire turn.
+///
+/// Clients do not honour that contract. The Anthropic dialect carries its
+/// system prompt in a top-level field that [`crate::gateway::anthropic`] hoists
+/// to the front, so a client that *also* puts a system-role turn in `messages`
+/// (system reminders, mid-conversation instruction updates) arrives here with
+/// two; the OpenAI dialect passes whatever roles it was given straight through.
+///
+/// Joining them keeps every instruction the client sent, at the cost of moving
+/// a late one forward. Leaving them in place loses the request outright, so the
+/// trade is not close.
+///
+/// `developer` folds in too — it is OpenAI's newer name for the same role, and
+/// a template that has never heard of it rejects the turn as an unknown role.
+fn normalise_system_messages(messages: &[ChatMessage]) -> std::borrow::Cow<'_, [ChatMessage]> {
+    let is_system = |m: &ChatMessage| m.role == "system" || m.role == "developer";
+    let system_count = messages.iter().filter(|m| is_system(m)).count();
+
+    // Already the expected shape: no system prompt at all, or exactly one that
+    // leads and is spelled the way templates match on.
+    if system_count == 0 || (system_count == 1 && messages[0].role == "system") {
+        return std::borrow::Cow::Borrowed(messages);
+    }
+
+    let joined = messages
+        .iter()
+        .filter(|m| is_system(m))
+        .map(|m| m.content.trim())
+        .filter(|c| !c.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    log::info!(
+        "[RUNTIME] Merged {system_count} system message(s) into one leading turn; \
+         chat templates accept only one, at the front."
+    );
+
+    let mut out = Vec::with_capacity(messages.len() - system_count + 1);
+    // Every system message may have been blank, in which case there is nothing
+    // to lead with and the conversation stands on its own.
+    if !joined.is_empty() {
+        out.push(ChatMessage::new("system", joined));
+    }
+    out.extend(messages.iter().filter(|m| !is_system(m)).cloned());
+    std::borrow::Cow::Owned(out)
+}
+
 /// The error a caller gets when tools were asked for and cannot be delivered.
 ///
 /// Deliberately not a silent degradation. A client that connected five MCP
@@ -1731,6 +1859,52 @@ impl minijinja::value::Object for TemplateMessage {
     }
 }
 
+/// Registers the globals transformers injects into every chat template.
+///
+/// These are not Jinja2 — they are `transformers`' own additions, so minijinja
+/// has never heard of them and a template that calls one dies with
+/// `unknown function`. That error is doubly misleading: it reads as a gap in
+/// Sarathi's engine, and it buries whatever the template was actually trying to
+/// say.
+///
+/// `raise_exception` is how a template rejects a conversation it cannot render
+/// ("System message must be at the beginning."). Handing it a real error makes
+/// that message the one the caller sees. `strftime_now` supplies the current
+/// date to templates that stamp one into the system prompt — Llama 3.x and
+/// friends — where the alternative is failing the whole render over a date.
+fn add_transformers_globals(env: &mut minijinja::Environment<'_>) {
+    use minijinja::value::Value;
+    use minijinja::{Error, ErrorKind};
+
+    env.add_global(
+        "raise_exception",
+        Value::from_function(|msg: String| -> Result<Value, Error> {
+            Err(Error::new(ErrorKind::InvalidOperation, msg))
+        }),
+    );
+
+    env.add_global(
+        "strftime_now",
+        Value::from_function(|format: String| -> Result<Value, Error> {
+            use chrono::format::{Item, StrftimeItems};
+
+            // chrono panics at Display time on a specifier it cannot parse, so
+            // the format is validated up front and refused as an error instead.
+            let items: Vec<Item> = StrftimeItems::new(&format).collect();
+            if items.iter().any(|i| matches!(i, Item::Error)) {
+                return Err(Error::new(
+                    ErrorKind::InvalidOperation,
+                    format!("strftime_now: unsupported format string {format:?}"),
+                ));
+            }
+
+            Ok(Value::from(
+                chrono::Local::now().format_with_items(items.into_iter()).to_string(),
+            ))
+        }),
+    );
+}
+
 /// Renders a HuggingFace-style Jinja chat template.
 ///
 /// The context mirrors what `tokenizer.apply_chat_template` provides, since
@@ -1752,6 +1926,7 @@ pub fn render_jinja_chat_template(
     env.set_keep_trailing_newline(true);
     // Chat templates are written against Python objects; see `python_method`.
     env.set_unknown_method_callback(python_method);
+    add_transformers_globals(&mut env);
     let prepared = strip_generation_tags(template_src);
     env.add_template("chat", &prepared)
         .map_err(|e| anyhow!("chat template is not valid Jinja: {e}"))?;
@@ -2758,5 +2933,137 @@ mod tests {
             .expect("items() must work on decoded arguments");
         assert!(out.contains("a=1"), "got: {out}");
         assert!(out.contains("b=two"), "got: {out}");
+    }
+
+    // ─── system-message normalisation ───────────────────────────────────────
+
+    /// The shape that broke Qwen3.5: a client sends its system prompt and then
+    /// a system-role reminder later in the conversation. Templates that police
+    /// the `apply_chat_template` contract reject the second one outright.
+    #[test]
+    fn a_later_system_message_is_folded_into_the_leading_one() {
+        let msgs = [
+            ChatMessage::new("system", "FIRST"),
+            ChatMessage::new("user", "hi"),
+            ChatMessage::new("system", "SECOND"),
+        ];
+
+        let out = normalise_system_messages(&msgs);
+
+        assert_eq!(out.len(), 2, "the two system turns become one");
+        assert_eq!(out[0].role, "system");
+        assert!(out[0].content.contains("FIRST"), "got: {}", out[0].content);
+        assert!(out[0].content.contains("SECOND"), "got: {}", out[0].content);
+        assert_eq!(out[1].role, "user");
+    }
+
+    /// Nothing may be dropped: the joined prompt keeps the client's order.
+    #[test]
+    fn merged_system_prompts_keep_their_original_order() {
+        let msgs = [
+            ChatMessage::new("system", "one"),
+            ChatMessage::new("system", "two"),
+            ChatMessage::new("user", "hi"),
+        ];
+
+        assert_eq!(normalise_system_messages(&msgs)[0].content, "one\n\ntwo");
+    }
+
+    /// `developer` is OpenAI's newer name for the system role; templates have
+    /// never heard of it and reject the turn as an unknown role.
+    #[test]
+    fn a_developer_turn_is_renamed_to_system() {
+        let msgs = [
+            ChatMessage::new("developer", "rules"),
+            ChatMessage::new("user", "hi"),
+        ];
+
+        let out = normalise_system_messages(&msgs);
+
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[0].content, "rules");
+    }
+
+    /// The common case must not be rewritten — borrowing keeps it allocation
+    /// free and guarantees the messages reach the template untouched.
+    #[test]
+    fn a_conversation_already_in_shape_is_passed_through_unchanged() {
+        let msgs = [
+            ChatMessage::new("system", "S"),
+            ChatMessage::new("user", "hi"),
+        ];
+
+        assert!(matches!(normalise_system_messages(&msgs), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_conversation_with_no_system_turn_is_passed_through_unchanged() {
+        let msgs = [ChatMessage::new("user", "hi")];
+
+        assert!(matches!(normalise_system_messages(&msgs), std::borrow::Cow::Borrowed(_)));
+    }
+
+    /// Blank system turns leave nothing to lead with, and an empty system
+    /// message is worse than none — some templates emit a stray header for it.
+    #[test]
+    fn system_turns_that_are_all_blank_leave_no_system_message() {
+        let msgs = [
+            ChatMessage::new("system", "   "),
+            ChatMessage::new("user", "hi"),
+            ChatMessage::new("system", ""),
+        ];
+
+        let out = normalise_system_messages(&msgs);
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].role, "user");
+    }
+
+    // ─── transformers globals ───────────────────────────────────────────────
+
+    /// Without the global this fails as `unknown function: raise_exception`,
+    /// which reads as a gap in our engine and hides what the template said.
+    #[test]
+    fn raise_exception_surfaces_the_templates_own_message() {
+        let template = r#"{{ raise_exception('System message must be at the beginning.') }}"#;
+
+        let err = super::render_jinja_chat_template(template, &[ChatMessage::new("user", "hi")], "", "", &[])
+            .expect_err("the template asked to fail");
+
+        assert!(
+            format!("{err:#}").contains("System message must be at the beginning."),
+            "got: {err:#}"
+        );
+    }
+
+    /// A template that never trips its own guard must still render.
+    #[test]
+    fn raise_exception_costs_nothing_when_it_is_not_reached() {
+        let template = r#"{% if false %}{{ raise_exception('nope') }}{% endif %}ok"#;
+
+        let out = super::render_jinja_chat_template(template, &[ChatMessage::new("user", "hi")], "", "", &[])
+            .expect("the guard was not reached");
+        assert_eq!(out.trim(), "ok");
+    }
+
+    /// Llama 3.x and friends stamp the current date into the system prompt.
+    #[test]
+    fn strftime_now_renders_the_current_date() {
+        let template = r#"{{ strftime_now('%Y') }}"#;
+
+        let out = super::render_jinja_chat_template(template, &[ChatMessage::new("user", "hi")], "", "", &[])
+            .expect("strftime_now must be available");
+        assert_eq!(out.trim(), chrono::Local::now().format("%Y").to_string());
+    }
+
+    /// A format chrono cannot parse would panic inside its `Display`, so it is
+    /// refused before it gets there.
+    #[test]
+    fn an_unparseable_strftime_format_is_an_error_not_a_panic() {
+        let template = r#"{{ strftime_now('%Q') }}"#;
+
+        let err = super::render_jinja_chat_template(template, &[ChatMessage::new("user", "hi")], "", "", &[])
+            .expect_err("%Q is not a chrono specifier");
+        assert!(format!("{err:#}").contains("strftime_now"), "got: {err:#}");
     }
 }

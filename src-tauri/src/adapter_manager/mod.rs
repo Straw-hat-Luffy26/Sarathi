@@ -24,6 +24,20 @@ pub struct BaseManifestInfo {
     pub file_path: String,
     pub size_bytes: u64,
     pub checksum: Option<String>,
+    /// The original model this GGUF was built from, e.g.
+    /// `Qwen/Qwen2.5-7B-Instruct`.
+    ///
+    /// `model_id` is the repository the *weights* came from, which for a
+    /// quantization is the converter's repo (`bartowski/…-GGUF`). Adapter
+    /// authors declare the **original** model, so that is the only id worth
+    /// searching adapters by — querying the quantization repo matches nothing
+    /// and is indistinguishable from "no adapters exist".
+    ///
+    /// `None` means it has not been determined. It is never guessed: stripping
+    /// `-GGUF` from a repository name produces an id that is often wrong, and a
+    /// wrong base model yields adapters that install and then fail to bind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_model_id: Option<String>,
 }
 
 /// `Default` exists so construction sites can use `..Default::default()` and a
@@ -89,7 +103,32 @@ pub struct ModelPackageManifest {
     pub package_id: String,
     pub provider_id: String,
     pub base_model: BaseManifestInfo,
+    /// The adapter **actively bound** for each capability, keyed by capability.
+    ///
+    /// At most one per capability, because at most one can be bound: the
+    /// capability layer resolves a turn to a capability and needs a single
+    /// answer. This is the view the resolver reads.
+    ///
+    /// It is derived, not authoritative — [`AdapterRegistry::rebuild_active_bindings`]
+    /// recomputes it from `installed_adapters` and `capability_defaults`.
     pub adapters: HashMap<String, AdapterManifestInfo>,
+    /// Every installed adapter, keyed by its directory id.
+    ///
+    /// Several adapters can serve one capability — a Python specialist, a C++
+    /// specialist and a general coding adapter are all `coding` — and installing
+    /// the second must not evict the first. Capability cannot be the key for
+    /// that reason; the record carries its own `capability` field instead.
+    ///
+    /// This is the inventory. Which of them is *used* is `capability_defaults`.
+    #[serde(default)]
+    pub installed_adapters: HashMap<String, AdapterManifestInfo>,
+    /// Which installed adapter is active for each capability: capability → id.
+    ///
+    /// Chosen by the user. Automatic selection among same-capability adapters is
+    /// a later phase; until then this is the whole answer, and it stays the
+    /// fallback once ranking exists.
+    #[serde(default)]
+    pub capability_defaults: HashMap<String, String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -111,8 +150,100 @@ impl AdapterRegistry {
             return Err(anyhow!("manifest.json does not exist at {:?}", manifest_path));
         }
         let content = fs::read_to_string(&manifest_path)?;
-        let manifest: ModelPackageManifest = serde_json::from_str(&content)?;
+        let mut manifest: ModelPackageManifest = serde_json::from_str(&content)?;
+        Self::migrate_to_inventory(&mut manifest);
         Ok(manifest)
+    }
+
+    /// Brings a manifest written before the inventory existed up to date.
+    ///
+    /// Older manifests hold only `adapters`, keyed by capability — one adapter
+    /// per capability, because that was the only shape available. Each becomes
+    /// an inventory entry and the default for its capability, which reproduces
+    /// the previous behaviour exactly: the same adapter stays bound to the same
+    /// capability.
+    ///
+    /// In memory only. The file is rewritten on the next write, so merely
+    /// listing installed models does not dirty every manifest on disk.
+    fn migrate_to_inventory(manifest: &mut ModelPackageManifest) {
+        if !manifest.installed_adapters.is_empty() || manifest.adapters.is_empty() {
+            return;
+        }
+
+        for (capability, record) in manifest.adapters.clone() {
+            let id = Self::adapter_id_for(&record, &capability);
+            manifest.capability_defaults.insert(capability, id.clone());
+            manifest.installed_adapters.insert(id, record);
+        }
+
+        log::info!(
+            "[ADAPTERS] Migrated {} adapter(s) in '{}' to the inventory format",
+            manifest.installed_adapters.len(),
+            manifest.package_id
+        );
+    }
+
+    /// The inventory key for an adapter record.
+    ///
+    /// Its install directory, which is what `store::list_installed` reports and
+    /// therefore what the UI can refer to. Falls back to the capability name for
+    /// a record that predates `repo_id` being recorded — unique enough, because
+    /// the format it came from allowed only one adapter per capability.
+    pub fn adapter_id_for(record: &AdapterManifestInfo, capability: &str) -> String {
+        record
+            .repo_id
+            .as_deref()
+            .map(store::adapter_dir_name)
+            .unwrap_or_else(|| capability.to_string())
+    }
+
+    /// Recomputes the active bindings from the inventory and the chosen defaults.
+    ///
+    /// `adapters` is a derived view. Everything that changes the inventory or a
+    /// default calls this, so the map the resolver reads can never drift from
+    /// the inventory it is supposed to summarise.
+    ///
+    /// A default naming an adapter that is no longer installed is dropped rather
+    /// than left dangling — that is what removing the active adapter for a
+    /// capability looks like, and the capability simply becomes unbound.
+    pub fn rebuild_active_bindings(manifest: &mut ModelPackageManifest) {
+        manifest
+            .capability_defaults
+            .retain(|_, id| manifest.installed_adapters.contains_key(id));
+
+        let mut active = HashMap::new();
+        for (capability, id) in &manifest.capability_defaults {
+            if let Some(record) = manifest.installed_adapters.get(id) {
+                active.insert(capability.clone(), record.clone());
+            }
+        }
+        manifest.adapters = active;
+    }
+
+    /// Records an installed adapter, making it the default for its capability
+    /// when that capability has none yet.
+    ///
+    /// The first adapter for a capability becomes active because a user who
+    /// installs one skill plainly means to use it. A later one does not displace
+    /// it: they may be trying a Python specialist alongside a general coding
+    /// adapter, and silently swapping what is bound would change how the model
+    /// answers without the user asking for that.
+    pub fn register_installed(
+        manifest: &mut ModelPackageManifest,
+        id: &str,
+        record: AdapterManifestInfo,
+    ) {
+        let capability = record.capability.clone();
+        manifest.installed_adapters.insert(id.to_string(), record);
+
+        if !capability.is_empty() {
+            manifest
+                .capability_defaults
+                .entry(capability)
+                .or_insert_with(|| id.to_string());
+        }
+
+        Self::rebuild_active_bindings(manifest);
     }
 
     /// Self-healing manifest validator and repair function.
@@ -214,8 +345,11 @@ impl AdapterRegistry {
                 file_path: rel_file_path,
                 size_bytes: total_gguf_bytes,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: HashMap::new(),
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -537,7 +671,12 @@ impl AdapterRegistry {
                 .or(inferred_confidence),
         };
 
-        manifest.adapters.insert(cap_key, adapter_info);
+        // Through the inventory, so a scan that rediscovers adapters on disk
+        // records all of them rather than only the one holding each capability.
+        // `register_installed` rebuilds the active view, so what the resolver
+        // reads is unchanged when a capability already has a default.
+        let _ = cap_key;
+        Self::register_installed(manifest, &dir_name, adapter_info);
         true
     }
 
@@ -687,8 +826,11 @@ mod tests {
                 file_path: "base/model.gguf".to_string(),
                 size_bytes: 1,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: HashMap::new(),
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }
@@ -1078,8 +1220,11 @@ mod tests {
                 file_path: "base/Llama-3.2-1B-Instruct-Q8_0.gguf".to_string(),
                 size_bytes: 1_321_083_008,
                 checksum: None,
+                upstream_model_id: None,
             },
             adapters,
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1139,8 +1284,11 @@ mod tests {
                 file_path: "base/Llama-3.2-1B.gguf".to_string(),
                 size_bytes: 1_000_000,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: initial_adapters,
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1179,8 +1327,11 @@ mod tests {
                 file_path: "base/Llama-3.2-1B.gguf".to_string(),
                 size_bytes: 1_000_000,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: corrupted_adapters,
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1214,8 +1365,11 @@ mod tests {
                 file_path: "base/Llama-3.2-1B.gguf".to_string(),
                 size_bytes: 1_000_000,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: HashMap::new(),
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1236,5 +1390,141 @@ mod tests {
         assert_eq!(reasoning.size_bytes, Some(120_000));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn record(capability: &str, repo: &str) -> AdapterManifestInfo {
+        AdapterManifestInfo {
+            capability: capability.to_string(),
+            status: "installed".to_string(),
+            repo_id: Some(repo.to_string()),
+            adapter_file: Some(format!("adapters/{}/adapter.gguf", store::adapter_dir_name(repo))),
+            ..Default::default()
+        }
+    }
+
+    fn manifest() -> ModelPackageManifest {
+        ModelPackageManifest {
+            package_id: "pkg".to_string(),
+            provider_id: "huggingface".to_string(),
+            base_model: BaseManifestInfo {
+                model_id: "bartowski/Qwen2.5-7B-Instruct-GGUF".to_string(),
+                model_name: "Qwen2.5 7B".to_string(),
+                quantization: "Q4_K_M".to_string(),
+                file_path: "base/".to_string(),
+                size_bytes: 0,
+                checksum: None,
+                upstream_model_id: None,
+            },
+            adapters: HashMap::new(),
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+            updated_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    /// The requirement that motivated the inventory: a user installs a Python
+    /// specialist and a C++ specialist, and both are coding adapters.
+    #[test]
+    fn several_adapters_can_share_one_capability() {
+        let mut m = manifest();
+        AdapterRegistry::register_installed(&mut m, "org__python-lora", record("coding", "org/python-lora"));
+        AdapterRegistry::register_installed(&mut m, "org__cpp-lora", record("coding", "org/cpp-lora"));
+        AdapterRegistry::register_installed(&mut m, "org__math-lora", record("mathematics", "org/math-lora"));
+
+        assert_eq!(m.installed_adapters.len(), 3, "installing the second must not evict the first");
+        assert!(m.installed_adapters.contains_key("org__python-lora"));
+        assert!(m.installed_adapters.contains_key("org__cpp-lora"));
+    }
+
+    /// Only one adapter per capability is ever bound, because a turn resolves to
+    /// a capability and the runtime needs a single answer.
+    #[test]
+    fn the_first_installed_becomes_the_default_and_later_ones_do_not_displace_it() {
+        let mut m = manifest();
+        AdapterRegistry::register_installed(&mut m, "org__python-lora", record("coding", "org/python-lora"));
+        AdapterRegistry::register_installed(&mut m, "org__cpp-lora", record("coding", "org/cpp-lora"));
+
+        assert_eq!(m.capability_defaults.get("coding").unwrap(), "org__python-lora");
+        assert_eq!(m.adapters.len(), 1, "exactly one coding adapter is bound");
+        assert_eq!(m.adapters["coding"].repo_id.as_deref(), Some("org/python-lora"));
+    }
+
+    #[test]
+    fn choosing_a_default_rebinds_without_uninstalling_the_other() {
+        let mut m = manifest();
+        AdapterRegistry::register_installed(&mut m, "org__python-lora", record("coding", "org/python-lora"));
+        AdapterRegistry::register_installed(&mut m, "org__cpp-lora", record("coding", "org/cpp-lora"));
+
+        m.capability_defaults.insert("coding".to_string(), "org__cpp-lora".to_string());
+        AdapterRegistry::rebuild_active_bindings(&mut m);
+
+        assert_eq!(m.adapters["coding"].repo_id.as_deref(), Some("org/cpp-lora"));
+        assert_eq!(m.installed_adapters.len(), 2, "the displaced adapter stays installed");
+    }
+
+    /// Removing the adapter a capability points at leaves the capability unbound
+    /// rather than pointing at something that is no longer there.
+    #[test]
+    fn removing_the_default_clears_the_binding_rather_than_dangling() {
+        let mut m = manifest();
+        AdapterRegistry::register_installed(&mut m, "org__python-lora", record("coding", "org/python-lora"));
+
+        m.installed_adapters.remove("org__python-lora");
+        AdapterRegistry::rebuild_active_bindings(&mut m);
+
+        assert!(m.capability_defaults.is_empty());
+        assert!(m.adapters.is_empty(), "nothing is bound for coding any more");
+    }
+
+    /// A manifest written before the inventory existed must keep working
+    /// untouched: the same adapter stays bound to the same capability.
+    #[test]
+    fn a_legacy_manifest_migrates_to_the_same_bindings() {
+        let mut legacy = manifest();
+        legacy.adapters.insert("coding".to_string(), record("coding", "org/python-lora"));
+        legacy.adapters.insert("mathematics".to_string(), record("mathematics", "org/math-lora"));
+
+        AdapterRegistry::migrate_to_inventory(&mut legacy);
+
+        assert_eq!(legacy.installed_adapters.len(), 2);
+        // Derived by `adapter_id_for`, which is the install directory name.
+        assert_eq!(legacy.capability_defaults.get("coding").unwrap(), "org_python-lora");
+        assert_eq!(legacy.capability_defaults.get("mathematics").unwrap(), "org_math-lora");
+        // The binding the resolver reads is unchanged.
+        assert_eq!(legacy.adapters["coding"].repo_id.as_deref(), Some("org/python-lora"));
+    }
+
+    /// Migration must not re-run over an already-migrated manifest and undo a
+    /// default the user has since changed.
+    #[test]
+    fn migration_leaves_an_already_migrated_manifest_alone() {
+        let mut m = manifest();
+        AdapterRegistry::register_installed(&mut m, "org__python-lora", record("coding", "org/python-lora"));
+        AdapterRegistry::register_installed(&mut m, "org__cpp-lora", record("coding", "org/cpp-lora"));
+        m.capability_defaults.insert("coding".to_string(), "org__cpp-lora".to_string());
+        AdapterRegistry::rebuild_active_bindings(&mut m);
+
+        AdapterRegistry::migrate_to_inventory(&mut m);
+
+        assert_eq!(m.capability_defaults.get("coding").unwrap(), "org__cpp-lora");
+        assert_eq!(m.installed_adapters.len(), 2);
+    }
+
+    /// An unassigned adapter is installed and inert. It must not silently claim
+    /// a capability just by existing.
+    #[test]
+    fn an_adapter_with_no_capability_binds_nothing() {
+        let mut m = manifest();
+        AdapterRegistry::register_installed(&mut m, "org__mystery", record("", "org/mystery"));
+
+        assert_eq!(m.installed_adapters.len(), 1);
+        assert!(m.capability_defaults.is_empty());
+        assert!(m.adapters.is_empty());
     }
 }

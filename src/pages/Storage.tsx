@@ -25,13 +25,16 @@ import {
   listInstalledAdapters,
   removeAdapter,
   setAdapterCapability,
+  setCapabilityDefault,
+  findAdaptersForInstalledModel,
+  downloadAdapter,
   ASSIGNMENT_SOURCE,
   CAPABILITIES,
   CAPABILITY_LABELS,
   type Capability,
   type InstalledAdapter,
 } from '../services/adapters.service';
-import { formatSize } from '../services/catalog.service';
+import { formatSize, type AdapterPage } from '../services/catalog.service';
 import {
   GROUP_DESCRIPTIONS,
   GROUP_LABELS,
@@ -41,6 +44,31 @@ import {
   type ModelGroup,
 } from '../types/ai';
 import styles from './Storage.module.css';
+
+/**
+ * Groups adapters by the domain their own metadata claims.
+ *
+ * The key is whatever the adapter says it is — the author's tags first, its name
+ * only as a fallback — so this agrees with the slot it lands in once installed.
+ * Anything that claims nothing is collected under `Unsorted` rather than being
+ * filed under a guess, which would read as a fact.
+ */
+function byDomain<T extends { capability?: string }>(items: T[]): [string, T[]][] {
+  const buckets = new Map<string, T[]>();
+  for (const item of items) {
+    const key = item.capability ?? '';
+    const list = buckets.get(key);
+    if (list) list.push(item);
+    else buckets.set(key, [item]);
+  }
+  const named = CAPABILITIES.filter((c) => buckets.has(c)) as string[];
+  const extra = [...buckets.keys()].filter((k) => k !== '' && !named.includes(k));
+  const order = [...named, ...extra, ...(buckets.has('') ? [''] : [])];
+  return order.map((k) => [
+    k === '' ? 'Unsorted' : (CAPABILITY_LABELS[k as Capability] ?? k),
+    buckets.get(k) as T[],
+  ]);
+}
 
 /** Human-readable parameter count: `20.9B`, `7.6B`, `350M`. */
 function formatParams(n: number): string {
@@ -71,6 +99,27 @@ export const Storage: React.FC = () => {
   /** Adapters per model id, loaded when a model is expanded. */
   const [adapters, setAdapters] = useState<Record<string, InstalledAdapter[]>>({});
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  /** Compatible adapters found for a model, keyed by model id. */
+  const [available, setAvailable] = useState<Record<string, AdapterPage>>({});
+  /** Which half of the adapter section a model is showing. */
+  const [tab, setTab] = useState<Record<string, 'installed' | 'available'>>({});
+  /** Adapters ticked for a batch install, keyed by model id. */
+  const [picked, setPicked] = useState<Record<string, Set<string>>>({});
+  /**
+   * Where each adapter has got to, keyed by its repository id.
+   *
+   * A single `busy` flag could only say *something* was happening. Installing
+   * several adapters at once needs each row to report itself, and a failure has
+   * to stay on screen — a toast that has already faded cannot explain why an
+   * adapter is missing from Installed.
+   */
+  const [status, setStatus] = useState<
+    Record<string, { state: 'queued' | 'working' | 'done' | 'failed'; error?: string }>
+  >({});
+  /** Models whose unsupported-adapter list is expanded. */
+  const [showBlocked, setShowBlocked] = useState<Set<string>>(new Set());
+  /** Model whose adapter search is in flight. */
+  const [finding, setFinding] = useState<string | null>(null);
 
   /**
    * Installed models, split onto shelves and ordered.
@@ -224,6 +273,143 @@ export const Storage: React.FC = () => {
           ? `${a.name} will be used for ${CAPABILITY_LABELS[capability]}`
           : `${a.name} is no longer used`
       );
+    } catch (err) {
+      addToast('error', String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /**
+   * Finds adapters for a model the user already has.
+   *
+   * The point of doing this here rather than sending them to Discover is that
+   * Sarathi already knows which model this is. Making the user search a library
+   * of thousands for the model sitting in front of them risks them picking a
+   * near-identical repository, and adapter compatibility depends on getting
+   * that exactly right.
+   */
+  const handleFindAdapters = async (m: any, refresh = false) => {
+    setFinding(m.modelId);
+    try {
+      const page = await findAdaptersForInstalledModel(m.providerId, m.modelId, refresh);
+      setAvailable((prev) => ({ ...prev, [m.modelId]: page }));
+    } catch (err) {
+      addToast('error', String(err));
+    } finally {
+      setFinding(null);
+    }
+  };
+
+  /**
+   * Shows a half of the adapter section, fetching what it needs on first view.
+   *
+   * Available is searched lazily rather than with the installed list: opening a
+   * model to check what it already has should not cost a network request for a
+   * question the user has not asked.
+   */
+  const showTab = (m: any, which: 'installed' | 'available') => {
+    setTab((prev) => ({ ...prev, [m.modelId]: which }));
+    if (which === 'available' && !available[m.modelId]) void handleFindAdapters(m);
+  };
+
+  /**
+   * Installs one adapter.
+   *
+   * Per-adapter rather than a batch: each is its own decision, each can fail on
+   * its own — a conversion that refuses says so about that adapter — and a row
+   * that reports its own progress needs no separate confirmation step.
+   */
+  const handleGetAdapter = async (m: any, repoId: string) => {
+    await runInstalls(m, [repoId]);
+  };
+
+  /**
+   * Installs adapters one at a time, reporting each as it goes.
+   *
+   * Sequential and individually guarded: one adapter failing to convert must not
+   * abandon the others, and its reason stays on its own row rather than in a
+   * toast that outlives the explanation. The installed list is refetched once at
+   * the end, so an adapter appears under Installed without a manual refresh.
+   */
+  const runInstalls = async (m: any, repoIds: string[]) => {
+    if (repoIds.length === 0) return;
+
+    setStatus((prev) => {
+      const next = { ...prev };
+      for (const id of repoIds) next[id] = { state: 'queued' as const };
+      return next;
+    });
+
+    let installed = 0;
+    for (const repoId of repoIds) {
+      setStatus((prev) => ({ ...prev, [repoId]: { state: 'working' as const } }));
+      try {
+        await downloadAdapter(m.providerId, m.modelId, repoId);
+        setStatus((prev) => ({ ...prev, [repoId]: { state: 'done' as const } }));
+        installed += 1;
+      } catch (err) {
+        // Kept on the row. The backend explains refusals in plain language, and
+        // that explanation is the whole value of the failure.
+        setStatus((prev) => ({
+          ...prev,
+          [repoId]: { state: 'failed' as const, error: String(err) },
+        }));
+      }
+    }
+
+    try {
+      const found = await listInstalledAdapters(m.providerId, m.modelId);
+      setAdapters((prev) => ({ ...prev, [m.modelId]: found.adapters }));
+    } catch {
+      // The installs already reported themselves; a failed refresh only means
+      // the list is stale, which reopening fixes.
+    }
+
+    if (installed > 0) {
+      addToast('success', `${installed} adapter${installed === 1 ? '' : 's'} installed`);
+    }
+  };
+
+  const togglePicked = (modelId: string, repoId: string) => {
+    setPicked((prev) => {
+      const next = new Set(prev[modelId] ?? []);
+      if (next.has(repoId)) next.delete(repoId);
+      else next.add(repoId);
+      return { ...prev, [modelId]: next };
+    });
+  };
+
+  const clearPicked = (modelId: string) =>
+    setPicked((prev) => ({ ...prev, [modelId]: new Set() }));
+
+  /**
+   * Installs every ticked adapter, one after another.
+   *
+   * Sequential and individually guarded: one adapter failing to convert must not
+   * abandon the others the user asked for, and each failure names itself rather
+   * than collapsing into "some did not install".
+   */
+  const handleInstallPicked = async (m: any) => {
+    const chosen = Array.from(picked[m.modelId] ?? []);
+    clearPicked(m.modelId);
+    await runInstalls(m, chosen);
+  };
+
+  /**
+   * Chooses which of several same-capability adapters the model actually uses.
+   *
+   * Installing a second coding adapter no longer displaces the first, so with
+   * more than one there has to be a way to say which is bound.
+   */
+  const handleMakeDefault = async (m: any, a: InstalledAdapter) => {
+    if (!a.capability) return;
+    setBusy(a.id);
+    try {
+      await setCapabilityDefault(m.providerId, m.modelId, a.capability, a.id);
+      const found = await listInstalledAdapters(m.providerId, m.modelId);
+      setAdapters((prev) => ({ ...prev, [m.modelId]: found.adapters }));
+      addToast('success', `${a.name} will be used for ${CAPABILITY_LABELS[a.capability]}`);
     } catch (err) {
       addToast('error', String(err));
     } finally {
@@ -466,63 +652,317 @@ export const Storage: React.FC = () => {
                 </button>
               )}
 
-              {isOpen && (
-                <div className={styles.adapterList}>
-                  {mine === undefined && <span className={styles.muted}>Checking…</span>}
+              {isOpen &&
+                (() => {
+                  const which = tab[m.modelId] ?? 'installed';
+                  const page = available[m.modelId];
+                  const searching = finding === m.modelId;
 
-                  {mine?.length === 0 && (
-                    <span className={styles.muted}>
-                      None installed. Find adapters for this model in Discover.
-                    </span>
-                  )}
-
-                  {mine?.map((a) => (
-                    <div key={a.id} className={styles.adapterRow}>
-                      <span className={styles.adapterName}>{a.name}</span>
-
+                  return (
+                    <div className={styles.adapterList}>
                       {/*
-                        An adapter only ever runs through the capability it is
-                        assigned to. Where that assignment came from is spelled
-                        out beneath, because most of them are inferred from the
-                        adapter's name and a guess shown as a fact is worse than
-                        no guess at all.
+                        Two questions, asked separately: what this model has, and
+                        what it could have. Both are answered here — nothing sends
+                        the user back to Discover to find their own model again.
                       */}
-                      <label className={styles.adapterUse}>
-                        <span className={styles.srOnly}>Use {a.name} for</span>
-                        <select
-                          className={styles.capabilitySelect}
-                          value={a.capability ?? ''}
-                          disabled={busy === a.id}
-                          onChange={(e) => handleCapabilityChange(m, a, e.target.value)}
+                      <div className={styles.adapterTabs} role="tablist">
+                        <button
+                          role="tab"
+                          aria-selected={which === 'installed'}
+                          className={styles.adapterTab}
+                          onClick={() => showTab(m, 'installed')}
                         >
-                          <option value="">Not used</option>
-                          {CAPABILITIES.map((c) => (
-                            <option key={c} value={c}>
-                              {CAPABILITY_LABELS[c]}
-                            </option>
-                          ))}
-                        </select>
-                        {a.capability && a.assignmentConfidence && (
-                          <span className={styles.muted}>
-                            {ASSIGNMENT_SOURCE[a.assignmentConfidence]}
-                          </span>
-                        )}
-                      </label>
+                          Installed
+                          {mine !== undefined && <span className={styles.count}>{mine.length}</span>}
+                        </button>
+                        <button
+                          role="tab"
+                          aria-selected={which === 'available'}
+                          className={styles.adapterTab}
+                          onClick={() => showTab(m, 'available')}
+                        >
+                          Available
+                          {page && <span className={styles.count}>{page.adapters.length}</span>}
+                        </button>
 
-                      <span className={styles.muted}>{formatSize(a.sizeBytes)}</span>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => handleRemoveAdapter(m, a)}
-                        disabled={busy === a.id}
-                        title="Delete this adapter"
-                      >
-                        <Trash2 size={12} />
-                      </Button>
+                        {which === 'available' && page && (
+                          <button
+                            className={`${styles.adapterTab} ${styles.adapterSpacer}`}
+                            onClick={() => handleFindAdapters(m, true)}
+                            disabled={searching}
+                            title="Ask HuggingFace again rather than using the saved result"
+                          >
+                            <RefreshCw size={11} /> {searching ? 'Searching…' : 'Find more'}
+                          </button>
+                        )}
+                      </div>
+
+                      {which === 'installed' && (
+                        <>
+                          {mine === undefined && <span className={styles.muted}>Checking…</span>}
+
+                          {mine?.length === 0 && (
+                            <span className={styles.muted}>
+                              None yet — see Available to add a skill to this model.
+                            </span>
+                          )}
+
+                          {byDomain(mine ?? []).map(([domain, list]) => (
+                            <React.Fragment key={domain}>
+                              <span className={styles.adapterDomain}>{domain}</span>
+                              {list.map((a) => (
+                            <div key={a.id} className={styles.adapterRow}>
+                              <span className={styles.adapterName}>{a.name}</span>
+
+                              {/*
+                                An adapter only ever runs through the capability it
+                                is assigned to. Where that assignment came from is
+                                spelled out beside it, because most are inferred
+                                from the adapter's name, and a guess shown as a
+                                fact is worse than no guess at all.
+                              */}
+                              <label className={styles.adapterUse}>
+                                <span className={styles.srOnly}>Use {a.name} for</span>
+                                <select
+                                  className={styles.capabilitySelect}
+                                  value={a.capability ?? ''}
+                                  disabled={busy === a.id}
+                                  onChange={(e) => handleCapabilityChange(m, a, e.target.value)}
+                                >
+                                  <option value="">Not used</option>
+                                  {CAPABILITIES.map((c) => (
+                                    <option key={c} value={c}>
+                                      {CAPABILITY_LABELS[c]}
+                                    </option>
+                                  ))}
+                                </select>
+                                {a.capability && a.assignmentConfidence && (
+                                  <span className={styles.muted}>
+                                    {ASSIGNMENT_SOURCE[a.assignmentConfidence]}
+                                  </span>
+                                )}
+                              </label>
+
+                              {/*
+                                Several adapters can share a capability, but only
+                                one is bound. Saying which — and offering to switch
+                                — is the difference between a list of four coding
+                                adapters and knowing which one the model runs.
+                              */}
+                              {a.capability &&
+                                (a.isDefault ? (
+                                  <span
+                                    className={styles.muted}
+                                    title="This is the adapter this capability uses"
+                                  >
+                                    in use
+                                  </span>
+                                ) : (
+                                  <Button
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() => handleMakeDefault(m, a)}
+                                    disabled={busy === a.id}
+                                    title={`Use ${a.name} for ${CAPABILITY_LABELS[a.capability]} instead`}
+                                  >
+                                    Use this
+                                  </Button>
+                                ))}
+
+                              <span className={styles.muted}>{formatSize(a.sizeBytes)}</span>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => handleRemoveAdapter(m, a)}
+                                disabled={busy === a.id}
+                                title="Delete this adapter"
+                              >
+                                <Trash2 size={12} />
+                              </Button>
+                            </div>
+                              ))}
+                            </React.Fragment>
+                          ))}
+                        </>
+                      )}
+
+                      {which === 'available' && (
+                        <>
+                          {searching && !page && <span className={styles.muted}>Searching…</span>}
+
+                          {/*
+                            A notice explains an empty result — "none published"
+                            and "I could not tell which model this was built from"
+                            are different facts and must not both read as blank.
+                          */}
+                          {page?.notice && <span className={styles.muted}>{page.notice}</span>}
+
+                          {byDomain(
+                            (page?.adapters ?? []).filter((a) => a.installable)
+                          ).map(([domain, list]) => (
+                            <React.Fragment key={domain}>
+                              <span className={styles.adapterDomain}>{domain}</span>
+                              {list.map((cand) => {
+                                const installed = (mine ?? []).some(
+                                  (x) => x.repoId === cand.repoId
+                                );
+                                const st = status[cand.repoId];
+                                const working =
+                                  st?.state === 'queued' || st?.state === 'working';
+                                return (
+                                  <React.Fragment key={cand.repoId}>
+                                    <div className={styles.adapterRow}>
+                                      <input
+                                        type="checkbox"
+                                        checked={picked[m.modelId]?.has(cand.repoId) ?? false}
+                                        disabled={installed || working}
+                                        onChange={() => togglePicked(m.modelId, cand.repoId)}
+                                        aria-label={`Select ${cand.name}`}
+                                      />
+                                      <span className={styles.adapterName}>{cand.name}</span>
+                                      <span className={styles.muted}>
+                                        {cand.ggufReady ? 'ready' : 'converts on install'}
+                                      </span>
+                                      <span className={styles.muted}>
+                                        {cand.downloads.toLocaleString()} downloads
+                                      </span>
+                                      <span className={`${styles.muted} ${styles.adapterSpacer}`}>
+                                        {cand.author}
+                                      </span>
+
+                                      {/*
+                                        Each row says where it has got to. There is
+                                        no percentage because the backend fetches
+                                        the file in one call and reports no bytes as
+                                        it goes — a percentage here would be invented.
+                                      */}
+                                      {installed || st?.state === 'done' ? (
+                                        <span className={styles.muted}>installed</span>
+                                      ) : working ? (
+                                        <span className={styles.muted}>
+                                          <Spinner size="sm" />{' '}
+                                          {st?.state === 'queued'
+                                            ? 'queued'
+                                            : cand.ggufReady
+                                              ? 'downloading…'
+                                              : 'downloading & converting…'}
+                                        </span>
+                                      ) : (
+                                        <Button
+                                          variant="ghost"
+                                          size="sm"
+                                          onClick={() => handleGetAdapter(m, cand.repoId)}
+                                          title={`Install ${cand.name} for this model`}
+                                        >
+                                          <Download size={12} />{' '}
+                                          {st?.state === 'failed' ? 'Retry' : 'Get'}
+                                        </Button>
+                                      )}
+                                    </div>
+
+                                    {/* Stays until the row is retried — a toast
+                                      * cannot explain an absence later. */}
+                                    {st?.state === 'failed' && (
+                                      <div className={styles.adapterRow}>
+                                        <span className={styles.adapterError}>{st.error}</span>
+                                      </div>
+                                    )}
+                                  </React.Fragment>
+                                );
+                              })}
+                            </React.Fragment>
+                          ))}
+
+                          {/*
+                            The cost of the whole selection, before committing to
+                            it. Adapters are a couple of hundred megabytes each,
+                            so the number that matters is the total rather than
+                            any single row.
+                          */}
+                          {(picked[m.modelId]?.size ?? 0) > 0 && (
+                            <div className={styles.adapterRow}>
+                              <span className={styles.muted}>
+                                {picked[m.modelId].size} selected
+                                {(() => {
+                                  const total = (page?.adapters ?? [])
+                                    .filter(
+                                      (c) => c.installable && picked[m.modelId].has(c.repoId)
+                                    )
+                                    .reduce((sum, c) => sum + c.sizeBytes, 0);
+                                  return total > 0 ? ` · ${formatSize(total)}` : '';
+                                })()}
+                              </span>
+                              <Button
+                                variant="primary"
+                                size="sm"
+                                onClick={() => handleInstallPicked(m)}
+                                disabled={busy === m.modelId}
+                              >
+                                {busy === m.modelId ? 'Installing…' : 'Install selected'}
+                              </Button>
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                onClick={() => clearPicked(m.modelId)}
+                                disabled={busy === m.modelId}
+                              >
+                                Clear
+                              </Button>
+                            </div>
+                          )}
+
+                          {/*
+                            Kept, but out of the way and inert. Hiding them entirely
+                            would leave a user who came looking for a specific
+                            adapter with no explanation of where it went; listing
+                            them beside installable ones implied they were a choice.
+                          */}
+                          {(() => {
+                            const blocked = (page?.adapters ?? []).filter((a) => !a.installable);
+                            if (blocked.length === 0) return null;
+                            const open = showBlocked.has(m.modelId);
+                            return (
+                              <>
+                                <button
+                                  className={styles.adapterToggle}
+                                  onClick={() =>
+                                    setShowBlocked((prev) => {
+                                      const next = new Set(prev);
+                                      if (next.has(m.modelId)) next.delete(m.modelId);
+                                      else next.add(m.modelId);
+                                      return next;
+                                    })
+                                  }
+                                >
+                                  {open ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
+                                  Not supported for this model
+                                  <span className={styles.count}>{blocked.length}</span>
+                                </button>
+                                {open &&
+                                  blocked.map((cand) => (
+                                    <div key={cand.repoId} className={styles.adapterRow}>
+                                      <span className={styles.adapterName}>{cand.name}</span>
+                                      <span
+                                        className={`${styles.muted} ${styles.adapterSpacer}`}
+                                        title={cand.blockedReason ?? undefined}
+                                      >
+                                        {cand.blockedReason}
+                                      </span>
+                                    </div>
+                                  ))}
+                              </>
+                            );
+                          })()}
+
+                          {page?.ageHours != null && (
+                            <span className={styles.muted}>checked {page.ageHours}h ago</span>
+                          )}
+                        </>
+                      )}
                     </div>
-                  ))}
-                </div>
-              )}
+                  );
+                })()}
+
             </article>
           );
           })}

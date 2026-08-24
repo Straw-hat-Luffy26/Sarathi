@@ -4,6 +4,8 @@
 
 import { invoke } from '@tauri-apps/api/core';
 
+import type { AdapterPage } from './catalog.service';
+
 /**
  * Capability slots the runtime can route a turn to.
  *
@@ -48,6 +50,15 @@ export interface InstalledAdapter {
   /** Slot this adapter is bound to. Absent means installed but unused. */
   capability?: Capability;
   assignmentConfidence?: AssignmentConfidence;
+  /**
+   * Whether this is the adapter its capability actually binds.
+   *
+   * Several adapters can serve one capability — a Python specialist and a
+   * general coding adapter are both `coding` — but only one is used. Without
+   * this the list would show four coding adapters with no way to tell which one
+   * the model is running.
+   */
+  isDefault: boolean;
 }
 
 export interface InstalledAdapters {
@@ -88,9 +99,10 @@ export function removeAdapter(
 /**
  * Points a capability at this adapter, or unassigns it with `null`.
  *
- * Only one adapter can be bound per capability, so assigning a slot another
- * adapter already holds displaces that one. The displaced adapter is unassigned,
- * not deleted.
+ * Assigning is also a choice to use it, so this adapter becomes the
+ * capability's default. Any adapter previously bound to that capability stays
+ * installed and keeps its own capability — it is simply no longer the one the
+ * model runs with. Use `setCapabilityDefault` to switch between them.
  */
 export function setAdapterCapability(
   providerId: string,
@@ -139,4 +151,52 @@ export interface AdapterDetails {
  */
 export function getAdapterDetails(repoId: string): Promise<AdapterDetails> {
   return invoke<AdapterDetails>('get_adapter_details', { repoId });
+}
+
+/**
+ * Chooses which installed adapter a capability binds.
+ *
+ * Several adapters can serve one capability, but only one can be bound: a turn
+ * resolves to a capability and the runtime needs a single answer. This is how
+ * the user says which.
+ *
+ * Fails if the adapter does not serve that capability — binding a maths adapter
+ * to `coding` would apply weights trained for one task to another.
+ */
+export function setCapabilityDefault(
+  providerId: string,
+  modelId: string,
+  capability: Capability,
+  adapterId: string
+): Promise<void> {
+  return invoke<void>('set_capability_default', {
+    providerId,
+    modelId,
+    capability,
+    adapterId,
+  });
+}
+
+/**
+ * Finds adapters compatible with a model that is already installed.
+ *
+ * The point of this over `findModelAdapters` is that the caller does not need
+ * to know the base model id. Sarathi resolves it from the installed package, so
+ * the user never has to go back to the library and search for their own model
+ * again — and never risks picking the wrong repository while doing it.
+ *
+ * Returns a page with an explanatory `notice` and no adapters when the base
+ * model cannot be determined. That is deliberately distinct from an empty list:
+ * "no adapters exist" and "I do not know where to look" are different facts.
+ */
+export function findAdaptersForInstalledModel(
+  providerId: string,
+  modelId: string,
+  refresh = false
+): Promise<AdapterPage> {
+  return invoke<AdapterPage>('find_adapters_for_installed_model', {
+    providerId,
+    modelId,
+    refresh,
+  });
 }

@@ -596,21 +596,39 @@ impl InferenceManager {
         // Resolve the capability for this turn and apply it to the prompt and
         // sampler. Previously the routing result was computed in the UI purely
         // to render a badge, and generation ran on the unmodified base model.
-        let (final_messages, final_params, capability_backend) =
+        let (final_messages, final_params, capability_backend, announced) =
             self.prepare_capability_turn(app_handle, &messages, &params, manual_capability.as_deref());
 
         let app_handle_clone = app_handle.clone();
-        let result = {
+        let (result, adapter_failure) = {
             let mut runtime = self.runtime.lock().unwrap();
-            runtime.generate_with_capability(
+            let generated = runtime.generate_with_capability(
                 &final_messages,
                 &final_params,
                 capability_backend.as_ref(),
                 |chunk| {
                     let _ = app_handle_clone.emit("inference:token", &chunk);
                 },
-            )
+            );
+            (generated, runtime.take_adapter_failure())
         };
+
+        // The capability payload was emitted before generation, when binding was
+        // still only intended. If it did not happen, correct the record rather
+        // than leaving the badge claiming a specialization the reply never had.
+        if let (Some(reason), Some(mut corrected)) = (adapter_failure, announced) {
+            log::warn!(
+                "[CAPABILITY] '{}' was announced as {} but {} — correcting to base",
+                corrected.capability,
+                corrected.backend,
+                reason
+            );
+            corrected.backend = "base".to_string();
+            corrected.badge = corrected.display_name.clone();
+            corrected.adapter_path = None;
+            corrected.backend_reason = format!("Ran on the base model: {reason}");
+            let _ = app_handle.emit("capability:changed", &corrected);
+        }
 
         match result {
             Ok(_) => {
@@ -642,20 +660,32 @@ impl InferenceManager {
     /// Classifies the turn, resolves a capability backend, and layers it onto
     /// the prompt and sampling parameters.
     ///
-    /// Returns the messages and params to generate with, plus the backend to
-    /// bind. Falls back to the untouched inputs whenever no package context is
-    /// available or the turn resolves to general conversation.
+    /// Returns the messages and params to generate with, the backend to bind,
+    /// and the payload announced to the UI. Falls back to the untouched inputs
+    /// whenever no package context is available or the turn resolves to general
+    /// conversation.
+    ///
+    /// The announced payload comes back so the caller can correct it: it is
+    /// emitted before generation, when binding is still only an intention.
     fn prepare_capability_turn(
         &self,
         app_handle: &tauri::AppHandle,
         messages: &[ChatMessage],
         params: &GenerationParams,
         manual_capability: Option<&str>,
-    ) -> (Vec<ChatMessage>, GenerationParams, Option<capability::CapabilityBackend>) {
+    ) -> (
+        Vec<ChatMessage>,
+        GenerationParams,
+        Option<capability::CapabilityBackend>,
+        Option<CapabilityPayload>,
+    ) {
         // Explicitly typed: a bare `None` here would be ambiguous to infer.
-        let untouched = || -> (Vec<ChatMessage>, GenerationParams, Option<capability::CapabilityBackend>) {
-            (messages.to_vec(), params.clone(), None)
-        };
+        let untouched = || -> (
+            Vec<ChatMessage>,
+            GenerationParams,
+            Option<capability::CapabilityBackend>,
+            Option<CapabilityPayload>,
+        ) { (messages.to_vec(), params.clone(), None, None) };
 
         let Some(package) = self.active_package() else {
             log::debug!("[CAPABILITY] No active package context — generating on base model");
@@ -695,6 +725,14 @@ impl InferenceManager {
             return untouched();
         }
 
+        // Only a LoRA binding can fail after this point; a prompt profile is
+        // already applied by the time it is announced.
+        let announced = matches!(
+            turn.resolution.backend,
+            capability::CapabilityBackend::LoraAdapter { .. }
+        )
+        .then(|| payload.clone());
+
         log::info!(
             "[CAPABILITY] Applied '{}' via {} (temp {:.2} -> {:.2})",
             turn.resolution.capability,
@@ -703,7 +741,7 @@ impl InferenceManager {
             final_params.temperature
         );
 
-        (final_messages, final_params, Some(turn.resolution.backend))
+        (final_messages, final_params, Some(turn.resolution.backend), announced)
     }
 
     /// Direct generation without requiring a Tauri AppHandle (for test scripts & backend execution)

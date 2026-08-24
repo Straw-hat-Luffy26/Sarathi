@@ -344,5 +344,41 @@ pub fn bootstrap_models() -> Vec<ModelMetadata> {
             use_cases: vec!["chat".into(), "general".into(), "reasoning".into()],
             catalog_version: "1.0".into(),
         },
+        // ── NVIDIA Nemotron ─────────────────────────────────────
+        ModelMetadata {
+            id: "nvidia/NVIDIA-Nemotron-3-Nano-4B".into(),
+            name: "Nemotron 3 Nano 4B".into(),
+            family: "Nemotron".into(),
+            architecture: ModelArchitecture::Dense,
+            total_parameters: 3_973_556_832,
+            active_parameters: None,
+            num_layers: 32,
+            num_attention_heads: 32,
+            num_kv_heads: 8,
+            head_dimension: 128,
+            hidden_size: 3072,
+            max_context_length: 131072,
+            vocab_size: 131072,
+            default_dtype: "bf16".into(),
+            use_cases: vec!["chat".into(), "general".into(), "reasoning".into()],
+            catalog_version: "1.0".into(),
+        },
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_bootstrap_models_includes_nemotron() {
+        let models = bootstrap_models();
+        let nemotron = models.iter().find(|m| m.id == "nvidia/NVIDIA-Nemotron-3-Nano-4B");
+        assert!(nemotron.is_some(), "NVIDIA-Nemotron-3-Nano-4B must be in bootstrap catalog");
+        let model = nemotron.unwrap();
+        assert_eq!(model.name, "Nemotron 3 Nano 4B");
+        assert_eq!(model.family, "Nemotron");
+        assert_eq!(model.total_parameters, 3_973_556_832);
+    }
+}
+

@@ -134,6 +134,14 @@ pub struct GgufMetadata {
     /// its name — the two disagreed when a helper module was registered under
     /// the label parsed out of its filename.
     pub file_type: Option<u32>,
+    /// The original model this file was converted from, as `org/name`.
+    ///
+    /// Read from `general.base_model.0.repo_url`, which llama.cpp's conversion
+    /// script writes when the source model card declares a base model. Not every
+    /// converter writes it, so this is opportunistic — but when present it
+    /// settles the question offline, without asking HuggingFace who the parent
+    /// was.
+    pub base_model_repo: Option<String>,
 }
 
 impl GgufMetadata {
@@ -362,7 +370,40 @@ fn from_kv(kv: &HashMap<String, Scalar>, keys: &HashSet<String>) -> Result<GgufM
         has_vision: keys.iter().any(|k| k.contains(".vision.") || k.starts_with("clip.")),
         has_pooling: keys.iter().any(|k| k.ends_with(".pooling_type")),
         file_type: kv.get("general.file_type").and_then(Scalar::as_u32),
+        base_model_repo: kv
+            .get("general.base_model.0.repo_url")
+            .and_then(Scalar::as_str)
+            .and_then(repo_id_from_hf_url),
     })
+}
+
+/// Extracts `org/name` from a HuggingFace model URL.
+///
+/// Returns `None` for anything that is not recognisably a Hub model URL. That
+/// strictness is the point: a half-parsed id would be used to search for
+/// adapters, and an id that is merely *plausible* produces a confidently empty
+/// result rather than an error.
+fn repo_id_from_hf_url(url: &str) -> Option<String> {
+    let rest = url
+        .trim()
+        .trim_end_matches('/')
+        .strip_prefix("https://huggingface.co/")
+        .or_else(|| url.trim().trim_end_matches('/').strip_prefix("http://huggingface.co/"))
+        .or_else(|| url.trim().trim_end_matches('/').strip_prefix("https://hf.co/"))?;
+
+    // Model URLs are bare `org/name`. Anything deeper is a file or a revision,
+    // and anything under `datasets/` or `spaces/` is not a model at all.
+    let mut parts = rest.split('/');
+    let org = parts.next()?;
+    let name = parts.next()?;
+    if parts.next().is_some() || org.is_empty() || name.is_empty() {
+        return None;
+    }
+    if matches!(org, "datasets" | "spaces" | "collections") {
+        return None;
+    }
+
+    Some(format!("{org}/{name}"))
 }
 
 /// Names the quantization from GGUF's `general.file_type`.
@@ -1017,5 +1058,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(meta.role, GgufRole::Model, "the name is not evidence");
+    }
+}
+
+#[cfg(test)]
+mod base_model_url_tests {
+    use super::repo_id_from_hf_url;
+
+    #[test]
+    fn a_model_url_yields_its_repo_id() {
+        assert_eq!(
+            repo_id_from_hf_url("https://huggingface.co/Qwen/Qwen2.5-7B-Instruct").as_deref(),
+            Some("Qwen/Qwen2.5-7B-Instruct")
+        );
+        // Trailing slashes and the short host are both in the wild.
+        assert_eq!(
+            repo_id_from_hf_url("https://hf.co/meta-llama/Llama-3.1-8B/").as_deref(),
+            Some("meta-llama/Llama-3.1-8B")
+        );
+    }
+
+    /// Anything that is not plainly a model repository is refused rather than
+    /// half-parsed: the result is used to search for adapters, and an id that is
+    /// merely plausible returns a confidently empty list instead of an error.
+    #[test]
+    fn non_model_urls_are_refused() {
+        assert_eq!(repo_id_from_hf_url("https://huggingface.co/datasets/foo/bar"), None);
+        assert_eq!(repo_id_from_hf_url("https://huggingface.co/spaces/foo/bar"), None);
+        // A file or revision path is deeper than a model id.
+        assert_eq!(
+            repo_id_from_hf_url("https://huggingface.co/Qwen/Qwen2.5/blob/main/config.json"),
+            None
+        );
+        assert_eq!(repo_id_from_hf_url("https://example.com/Qwen/Qwen2.5"), None);
+        assert_eq!(repo_id_from_hf_url("Qwen/Qwen2.5-7B-Instruct"), None);
+        assert_eq!(repo_id_from_hf_url(""), None);
     }
 }

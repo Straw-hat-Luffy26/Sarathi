@@ -220,6 +220,67 @@
   border-top: 1px solid var(--border-default);
 }
 
+/*
+ * Installed and Available are two answers to different questions — what this
+ * model has, and what it could have — so they are shown one at a time rather
+ * than as one list the user has to read a status column to separate.
+ */
+.adapterTabs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding-bottom: var(--space-1);
+}
+
+.adapterTab {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px var(--space-2);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+
+.adapterTab:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--surface-raised);
+}
+
+.adapterTab[aria-selected='true'] {
+  color: var(--text-primary);
+  background: var(--surface-raised);
+}
+
+.adapterTab:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Pushes the trailing control of a row away from the columns before it. */
+.adapterSpacer {
+  margin-left: auto;
+}
+
+/* Domain heading inside the adapter list — a quiet divider, not a section. */
+.adapterDomain {
+  margin-top: var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-transform: capitalize;
+  letter-spacing: 0.02em;
+}
+
+/* An install failure, kept beside the adapter it belongs to. */
+.adapterError {
+  color: var(--danger, #d9534f);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
 .adapterRow {
   display: flex;
   align-items: center;

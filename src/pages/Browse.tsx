@@ -67,15 +67,12 @@ type Selection =
   | { tab: 'type'; value: ModelKind };
 
 /** How the grid is ordered. */
-type SortKey = 'best' | 'worst' | 'smallest' | 'largest' | 'popular' | 'newest';
+type SortKey = 'best' | 'small' | 'latest';
 
 const SORT_LABELS: Record<SortKey, string> = {
   best: 'Best first',
-  worst: 'Worst first',
-  smallest: 'Smallest download',
-  largest: 'Largest download',
-  popular: 'Most downloaded',
-  newest: 'Recently updated',
+  small: 'Small and fast first',
+  latest: 'Latest models first',
 };
 
 /**
@@ -104,9 +101,77 @@ function quality(card: ModelCard): number {
     (fitsVram ? 500 : 0) +
     (offloads ? 250 : 0) +
     (card.emitsReasoning ? -250 : 0) +
+    // A fine-tune or merge is somebody's variation on a model, not the model.
+    // Searching for a family surfaced things like "heretic abliterated" and
+    // "coder fable5 composer2.5" above the release they were built from,
+    // because a remix that went briefly viral out-downloads the plain build.
+    // The penalty is smaller than the fits-in-VRAM term on purpose: a
+    // fine-tune that runs on this machine is still a better answer than a base
+    // model that does not.
+    (card.isFinetune ? -200 : 0) +
     Math.log10(card.downloads + 1) * 20 +
     Math.log10(card.likes + 1) * 5
   );
+}
+
+/**
+ * A name with its separators removed, for comparing what people typed against
+ * what publishers named things.
+ *
+ * The same model is written `gemma 4`, `gemma-4`, and `gemma_4` depending on
+ * who uploaded it, so none of those may be the difference between a match and
+ * a miss. Dots are deliberately *kept*: a dot is part of a version number, and
+ * dropping it makes `Qwen3-8B` indistinguishable from `Qwen 3.8`.
+ */
+function squash(s: string): string {
+  return s.toLowerCase().replace(/[\s_\-/]+/g, '');
+}
+
+/**
+ * How well a card answers the term that was actually searched for.
+ *
+ * HuggingFace's `search=` is a loose substring match ordered by download count,
+ * so "gemma 4" comes back led by `gemma-3-4b-it` — it contains "gemma", it
+ * contains a "4", and it has been downloaded 187,000 times. Taking the Hub's
+ * order as the answer therefore responds to a question about one model with
+ * the most popular models that merely resemble its name.
+ */
+function relevance(card: ModelCard, query: string, brand?: string | null): number {
+  const q = squash(query);
+  if (!q) return 0;
+
+  // Whose model this is — the one piece of evidence the text cannot supply.
+  //
+  // Two separate questions, and both matter, because for most labs they have
+  // different answers. NVIDIA published exactly one GGUF chat model; the other
+  // ninety NVIDIA models a person can run were converted by `bartowski`,
+  // `unsloth`, and `lmstudio-community`. So promoting only what NVIDIA
+  // *uploaded* moves one card and leaves the rest of an "nvidia" search sorted
+  // by download count among unrelated repositories — which is exactly how it
+  // looked before this existed.
+  //
+  //   6  NVIDIA uploaded it        — the official release
+  //   3  it is an NVIDIA model     — somebody else's conversion of one
+  //   0  it merely says "NVIDIA"   — e.g. a Qwen model quantized to NVFP4
+  //
+  // Additive with the text score below rather than replacing it, so the tiers
+  // stay ordered internally: on "qwen coder", Qwen's coder models come before
+  // Qwen's other models, and both come before everyone else's coder builds.
+  const official = brand != null && card.publisherBrand === brand;
+  const sameBrand = brand != null && !official && card.sourceBrand === brand;
+  const provenance = official ? 6 : sameBrand ? 3 : 0;
+
+  // The whole term as one run: `gemma4` inside `gemma-4-12b-it`. This is what
+  // separates the model asked for from the model with a similar-looking name —
+  // `gemma-3-4b-it` squashes to `gemma34bit`, which does not contain `gemma4`.
+  if (squash(card.name).includes(q) || squash(card.repoId).includes(q)) return provenance + 2;
+
+  // Every word present, but not adjacently. Weaker evidence, and ranked below
+  // an exact run, but still a real match worth showing above unrelated models.
+  const words = query.split(/\s+/).map(squash).filter(Boolean);
+  if (words.length > 1 && words.every((w) => squash(card.repoId).includes(w))) return provenance + 1;
+
+  return provenance;
 }
 
 /** The size actually downloaded if the user presses the button on this card. */
@@ -114,22 +179,44 @@ function offerSize(card: ModelCard): number {
   return pickOffer(card).offer?.sizeBytes ?? Number.MAX_SAFE_INTEGER;
 }
 
-function sortCards(cards: ModelCard[], key: SortKey): ModelCard[] {
+function sortCards(
+  cards: ModelCard[],
+  key: SortKey,
+  query = '',
+  brand?: string | null
+): ModelCard[] {
   const sorted = [...cards];
+
+  // While a search is active, relevance outranks every ordering below it. The
+  // user named a model; a listing led by a different model has answered a
+  // question they did not ask, whichever sort happens to be selected. Within
+  // one relevance tier the chosen sort decides, and `quality` puts what runs on
+  // this machine above what does not — so the compatible builds of the model
+  // asked for come first, which is the whole point of searching for it.
+  const byRelevance = query
+    ? (a: ModelCard, b: ModelCard) => relevance(b, query, brand) - relevance(a, query, brand)
+    : () => 0;
+
   switch (key) {
     case 'best':
-      return sorted.sort((a, b) => quality(b) - quality(a));
-    case 'worst':
-      return sorted.sort((a, b) => quality(a) - quality(b));
-    case 'smallest':
-      return sorted.sort((a, b) => offerSize(a) - offerSize(b));
-    case 'largest':
-      return sorted.sort((a, b) => offerSize(b) - offerSize(a));
-    case 'popular':
-      return sorted.sort((a, b) => b.downloads - a.downloads);
-    case 'newest':
+      return sorted.sort((a, b) => byRelevance(a, b) || quality(b) - quality(a));
+    case 'small':
+      // Smaller downloads are the ones that load fastest and generate fastest,
+      // so size is the ordering. Every model with no runnable offer lands on
+      // the same sentinel size, and quality breaks the tie so that block at the
+      // bottom is still ordered usefully rather than arbitrarily.
+      return sorted.sort(
+        (a, b) =>
+          byRelevance(a, b) || offerSize(a) - offerSize(b) || quality(b) - quality(a)
+      );
+    case 'latest':
       // `lastModified` is ISO 8601, which sorts correctly as text.
-      return sorted.sort((a, b) => (b.lastModified ?? '').localeCompare(a.lastModified ?? ''));
+      return sorted.sort(
+        (a, b) =>
+          byRelevance(a, b) ||
+          (b.lastModified ?? '').localeCompare(a.lastModified ?? '') ||
+          quality(b) - quality(a)
+      );
   }
 }
 
@@ -259,9 +346,18 @@ export const Browse: React.FC = () => {
    */
   const all = useMemo(() => page?.cards ?? [], [page]);
 
+  /**
+   * The publisher this search turned out to be about, or null.
+   *
+   * Read off the response rather than worked out here: the backend owns the
+   * alias table — it is what knows "kimi" means `moonshotai` — and a second
+   * copy on this side would drift from it the first time a brand is added.
+   */
+  const matchedBrand = page?.matchedBrand ?? null;
+
   const visible = useMemo(
-    () => sortCards(all.filter((c) => inSelection(c, selection)), sort),
-    [all, selection, sort]
+    () => sortCards(all.filter((c) => inSelection(c, selection)), sort, activeSearch, matchedBrand),
+    [all, selection, sort, activeSearch, matchedBrand]
   );
 
   /**
@@ -334,9 +430,15 @@ export const Browse: React.FC = () => {
             * part of HuggingFace that runs here". Naming the models left out
             * keeps a short list from reading as a failed fetch. */}
           <p className={styles.subtitle}>
-            {activeSearch
-              ? `Results for “${activeSearch}”`
-              : 'Models that run on this computer, from HuggingFace.'}
+            {/* When the search named a publisher, say so. It reports that the
+              * word was understood as a company and that their own shelf was
+              * fetched — otherwise a listing led by first-party releases looks
+              * like the same download-ordered results as always. */}
+            {activeSearch && matchedBrand
+              ? `Results for “${activeSearch}” — ${matchedBrand} releases first`
+              : activeSearch
+                ? `Results for “${activeSearch}”`
+                : 'Models that run on this computer, from HuggingFace.'}
             {!activeSearch && (page?.hiddenIncompatible ?? 0) > 0 && (
               <span className={styles.filterNote}>
                 {' · '}
@@ -351,7 +453,11 @@ export const Browse: React.FC = () => {
           <Search size={15} className={styles.searchIcon} />
           <input
             className={styles.searchInput}
-            placeholder="Search all of HuggingFace…"
+            /* Names a company as well as a model, because nothing else on the
+             * screen says that typing one works. The examples are the whole
+             * hint — "search by publisher" describes the feature without
+             * telling anyone what to type. */
+            placeholder="Search HuggingFace — a model, or a company like Qwen or NVIDIA…"
             value={searchTerm}
             onChange={(e) => setSearchTerm(e.target.value)}
             aria-label="Search models"
@@ -555,6 +661,7 @@ export const Browse: React.FC = () => {
                   card={card}
                   open={detailCard?.repoId === card.repoId}
                   onOpen={() => setDetailCard(card)}
+                  matchedBrand={matchedBrand}
                 />
               ))}
             </>
@@ -577,6 +684,7 @@ export const Browse: React.FC = () => {
                 card={card}
                 open={detailCard?.repoId === card.repoId}
                 onOpen={() => setDetailCard(card)}
+                matchedBrand={matchedBrand}
               />
             ))}
         </section>
@@ -778,9 +886,24 @@ interface CardProps {
   card: ModelCard;
   open: boolean;
   onOpen: () => void;
+  /**
+   * The publisher the current search named, when it named one. A card whose
+   * own publisher matches is one of that company's releases rather than a
+   * third party's conversion of it, and says so.
+   */
+  matchedBrand?: string | null;
 }
 
-function Card({ card, open, onOpen }: CardProps) {
+function Card({ card, open, onOpen, matchedBrand }: CardProps) {
+  // Two different claims, and saying which one applies is the whole value.
+  //
+  // "Official" means the lab uploaded this. The weaker tag means the lab *made*
+  // the model and somebody else converted it to GGUF — true of almost every
+  // runnable NVIDIA, DeepSeek, Meta, and Moonshot model, because those labs
+  // publish weights rather than GGUF. Collapsing the two into one badge would
+  // put NVIDIA's name on a file NVIDIA never uploaded.
+  const official = matchedBrand != null && card.publisherBrand === matchedBrand;
+  const sameBrand = matchedBrand != null && !official && card.sourceBrand === matchedBrand;
   const [starting, setStarting] = useState(false);
   const { addToast } = useToast();
   const { isDownloading } = useDownloads();
@@ -801,7 +924,31 @@ function Card({ card, open, onOpen }: CardProps) {
   return (
     <article className={`${styles.card} ${open ? styles.cardOpen : ''}`}>
       <div className={styles.cardTop}>
-        <span className={styles.publisher}>{card.publisher}</span>
+        <span className={styles.publisher}>
+          {card.publisher}
+          {/* Only during a search that named this publisher. Outside that, a
+            * badge on every first-party repository would be decoration — the
+            * point is to answer "which of these is the real one" at the moment
+            * that question is being asked. */}
+          {official && (
+            <span
+              className={styles.officialTag}
+              title={`Published by ${card.publisherBrand} themselves, not converted by a third party.`}
+            >
+              Official
+            </span>
+          )}
+          {/* Quieter than "Official" on purpose: it is a claim about the model,
+            * not about who uploaded this copy of it. */}
+          {sameBrand && (
+            <span
+              className={styles.sourceTag}
+              title={`A ${card.sourceBrand} model, converted to GGUF by ${card.publisher}. ${card.sourceBrand} publish weights rather than GGUF, so this is how it becomes runnable.`}
+            >
+              {card.sourceBrand} model
+            </span>
+          )}
+        </span>
         <div className={styles.badges}>
           {/* What this *is* comes first: whether it can run on its own is the
             * thing a non-specialist most needs to know before downloading. */}
@@ -921,6 +1068,10 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
   const [loadingAdapters, setLoadingAdapters] = useState(true);
   const [installing, setInstalling] = useState<string | null>(null);
   const [installed, setInstalled] = useState<Set<string>>(new Set());
+  /** Adapters ticked for a batch install. */
+  const [picked, setPicked] = useState<Set<string>>(new Set());
+  /** True once the user has touched the selection, so defaults stop applying. */
+  const [touched, setTouched] = useState(false);
   const [installError, setInstallError] = useState<string | null>(null);
   const [starting, setStarting] = useState<string | null>(null);
   const { addToast } = useToast();
@@ -937,26 +1088,96 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
 
   // Looked up per model, not with the listing: one request per card would mean
   // a hundred extra calls per sweep and would hit the rate limit immediately.
+  const lookupAdapters = useCallback(
+    async (refresh: boolean) => {
+      const baseModelId = card.baseModel || card.repoId;
+      setLoadingAdapters(true);
+      try {
+        // Architecture is unknown for a model that is not installed, so
+        // compatibility cannot be judged here and nothing is hidden on a guess.
+        setAdapters(await findModelAdapters(baseModelId, null, refresh));
+      } catch (err) {
+        setAdapters({ baseModelId, adapters: [], readyCount: 0, notice: String(err) });
+      } finally {
+        setLoadingAdapters(false);
+      }
+    },
+    [card.repoId, card.baseModel]
+  );
+
   useEffect(() => {
     let cancelled = false;
     setAdapters(null);
-    setLoadingAdapters(true);
-
-    findModelAdapters(card.baseModel || card.repoId)
-      .then((found) => {
-        if (!cancelled) setAdapters(found);
-      })
-      .catch((err) => {
-        if (!cancelled) setAdapters({ adapters: [], readyCount: 0, notice: String(err) });
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingAdapters(false);
-      });
+    // Served from the shared cache when it is fresh, so reopening a card costs
+    // nothing. "Find more" is how the user forces a new request.
+    void lookupAdapters(false).then(() => {
+      if (cancelled) setAdapters(null);
+    });
 
     return () => {
       cancelled = true;
     };
-  }, [card.repoId, card.baseModel]);
+  }, [lookupAdapters]);
+
+  /**
+   * A small starting selection: the adapters that install without conversion.
+   *
+   * Deliberately not framed as *best*. There are no per-adapter benchmarks, and
+   * download counts favour whatever went viral — so the only claim made here is
+   * one that can be verified, that these load as they stand. It is a starting
+   * point the user edits, not a verdict, and it is capped so the default never
+   * proposes a multi-gigabyte download.
+   */
+  const recommended = useMemo(() => {
+    const ready = (adapters?.adapters ?? []).filter((a) => a.ggufReady && a.installable);
+    return new Set(ready.slice(0, 3).map((a) => a.repoId));
+  }, [adapters]);
+
+  // Applied once per adapter list. After the user ticks anything the default
+  // stops re-asserting itself, so unticking a suggestion makes it stay unticked.
+  useEffect(() => {
+    setPicked(new Set(recommended));
+    setTouched(false);
+  }, [recommended]);
+
+  const togglePicked = (repoId: string) => {
+    setTouched(true);
+    setPicked((prev) => {
+      const next = new Set(prev);
+      if (next.has(repoId)) next.delete(repoId);
+      else next.add(repoId);
+      return next;
+    });
+  };
+
+  const selected = useMemo(
+    () =>
+      (adapters?.adapters ?? []).filter(
+        (a) => a.installable && picked.has(a.repoId) && !installed.has(a.repoId)
+      ),
+    [adapters, picked, installed]
+  );
+  const selectedBytes = selected.reduce((sum, a) => sum + a.sizeBytes, 0);
+
+  /**
+   * Installs the whole selection, one adapter at a time.
+   *
+   * Each is guarded on its own: an adapter that refuses to convert reports that
+   * about itself and the rest still install.
+   */
+  const installSelected = async () => {
+    setInstallError(null);
+    for (const a of selected) {
+      setInstalling(a.repoId);
+      try {
+        await downloadAdapter('huggingface', card.baseModel || card.repoId, a.repoId);
+        setInstalled((prev) => new Set(prev).add(a.repoId));
+      } catch (err) {
+        setInstallError(String(err));
+      }
+    }
+    setInstalling(null);
+  };
 
   const install = async (adapterRepoId: string) => {
     setInstalling(adapterRepoId);
@@ -1108,13 +1329,37 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
 
             {loadingAdapters && <p className={styles.adapterNotice}>Looking for adapters…</p>}
             {adapters?.notice && <p className={styles.adapterNotice}>{adapters.notice}</p>}
+
+            {/* The saved result is reused until it expires, so this is the only
+              * way to ask HuggingFace again — and the age says why one might. */}
+            {adapters && !loadingAdapters && (
+              <p className={styles.adapterNotice}>
+                <button type="button" onClick={() => void lookupAdapters(true)}>
+                  Find more
+                </button>
+                {adapters.ageHours != null && ` · checked ${adapters.ageHours}h ago`}
+              </p>
+            )}
             {installError && <p className={styles.adapterError}>{installError}</p>}
 
             {adapters && adapters.adapters.length > 0 && (
               <>
+                {/*
+                  A starting selection, not a ranking. The claim is only that
+                  these install without conversion — everything else the Hub
+                  reports about an adapter is popularity, which is not quality.
+                */}
+                {recommended.size > 0 && !touched && (
+                  <p className={styles.sizeNote}>
+                    Recommended for this model: {recommended.size} that install as they
+                    stand. Untick any you do not want.
+                  </p>
+                )}
+
                 <table className={styles.adapterTable}>
                   <thead>
                     <tr className={styles.quantHead}>
+                      <th scope="col" aria-label="Select" />
                       <th scope="col">Adapter</th>
                       <th scope="col">By</th>
                       <th scope="col" className={styles.qFit}>
@@ -1124,17 +1369,58 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                     </tr>
                   </thead>
                   <tbody>
-                    {adapters.adapters.map((a) => (
+                    {adapters.adapters
+                      .filter((a) => a.installable)
+                      .map((a) => (
                       <AdapterRow
                         key={a.repoId}
                         adapter={a}
                         installing={installing === a.repoId}
                         installed={installed.has(a.repoId)}
+                        picked={picked.has(a.repoId)}
+                        onPick={() => togglePicked(a.repoId)}
                         onInstall={() => void install(a.repoId)}
                       />
                     ))}
                   </tbody>
                 </table>
+                {selected.length > 0 && (
+                  <p className={styles.sizeNote}>
+                    {selected.length} selected
+                    {selectedBytes > 0 && ` · ${formatSize(selectedBytes)}`}{' '}
+                    <Button
+                      variant="primary"
+                      size="sm"
+                      onClick={() => void installSelected()}
+                      disabled={installing !== null}
+                    >
+                      {installing !== null ? 'Installing…' : 'Install selected'}
+                    </Button>{' '}
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setTouched(true);
+                        setPicked(new Set());
+                      }}
+                      disabled={installing !== null}
+                    >
+                      Clear
+                    </Button>
+                  </p>
+                )}
+
+                {/* Explained rather than hidden: a user who came looking for a
+                  * specific adapter should learn why it is not offered, without
+                  * it sitting among the ones that are. */}
+                {adapters.adapters.some((a) => !a.installable) && (
+                  <p className={styles.sizeNote}>
+                    {adapters.adapters.filter((a) => !a.installable).length} adapter(s) are
+                    published for this model but not supported here:{' '}
+                    {adapters.adapters.find((a) => !a.installable)?.blockedReason}
+                  </p>
+                )}
+
                 <p className={styles.sizeNote}>
                   Select an adapter's name to see what it changes about the model.
                 </p>
@@ -1148,9 +1434,19 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
 }
 
 interface AdapterRowProps {
-  adapter: { repoId: string; name: string; author: string; focus: string; ggufReady: boolean };
+  adapter: {
+    repoId: string;
+    name: string;
+    author: string;
+    focus: string;
+    ggufReady: boolean;
+    installable: boolean;
+    blockedReason?: string | null;
+  };
   installing: boolean;
   installed: boolean;
+  picked: boolean;
+  onPick: () => void;
   onInstall: () => void;
 }
 
@@ -1160,7 +1456,14 @@ interface AdapterRowProps {
  * The detail is fetched on selection rather than with the list: one lookup per
  * adapter would hit HuggingFace's rate limit immediately.
  */
-function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRowProps) {
+function AdapterRow({
+  adapter: a,
+  installing,
+  installed,
+  picked,
+  onPick,
+  onInstall,
+}: AdapterRowProps) {
   const [open, setOpen] = useState(false);
   const [details, setDetails] = useState<AdapterDetails | null>(null);
   const [loading, setLoading] = useState(false);
@@ -1186,6 +1489,16 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
     <>
       <tr className={a.ggufReady ? styles.fits : styles.tooBig}>
         <td>
+          {/* Already installed means there is nothing left to select. */}
+          <input
+            type="checkbox"
+            checked={picked && !installed && a.installable}
+            disabled={installed || installing || !a.installable}
+            onChange={onPick}
+            aria-label={`Select ${a.name}`}
+          />
+        </td>
+        <td>
           <button
             className={styles.adapterNameBtn}
             onClick={() => void toggle()}
@@ -1198,7 +1511,14 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
         </td>
         <td className={styles.adapterAuthor}>{a.author}</td>
         <td className={styles.qFit}>
-          {a.ggufReady ? (
+          {/* An adapter the installer would refuse says so here, with the reason
+            * — the alternative is a Get button whose failure only arrives after
+            * the download. */}
+          {!a.installable ? (
+            <span className={styles.needsConversion} title={a.blockedReason ?? undefined}>
+              Incompatible
+            </span>
+          ) : a.ggufReady ? (
             'ready'
           ) : (
             <span
@@ -1210,10 +1530,14 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
           )}
         </td>
         <td className={styles.qAction}>
-          {/* Both kinds are installable now. A PEFT adapter is downloaded and
-            * converted in one step; if the conversion cannot be done the whole
-            * install is rolled back, so the button never leaves a file behind
-            * that llama.cpp would refuse. */}
+          {/* A PEFT adapter is downloaded and converted in one step; if the
+            * conversion cannot be done the whole install is rolled back, so the
+            * button never leaves a file behind that llama.cpp would refuse.
+            *
+            * No button at all when the conversion is known in advance to be
+            * impossible — offering one would only move the refusal to after the
+            * download. */}
+          {a.installable && (
           <button
             className={styles.getBtn}
             disabled={installing || installed}
@@ -1232,12 +1556,13 @@ function AdapterRow({ adapter: a, installing, installed, onInstall }: AdapterRow
                   : 'converting…'
                 : 'Get'}
           </button>
+          )}
         </td>
       </tr>
 
       {open && (
         <tr>
-          <td colSpan={4} className={styles.adapterDetailCell}>
+          <td colSpan={5} className={styles.adapterDetailCell}>
             {loading && <p className={styles.adapterNotice}>Reading its page…</p>}
             {failed && <p className={styles.adapterError}>{failed}</p>}
 

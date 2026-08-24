@@ -263,6 +263,31 @@ export interface ModelCard {
   repoId: string;
   /** HuggingFace org or user. */
   publisher: string;
+  /**
+   * The publisher's display name, when the account is one Sarathi recognises —
+   * "NVIDIA" for `nvidia`, "Unsloth" for `unsloth`, "Z.ai" for `zai-org`.
+   *
+   * Derived from the org slug, not from the repository's name, so a community
+   * conversion like `bartowski/nvidia_Nemotron-GGUF` reports Bartowski. That is
+   * what lets an official release be marked official rather than trusting the
+   * words in the title.
+   *
+   * Absent for the long tail of individual uploaders.
+   */
+  publisherBrand?: string | null;
+  /**
+   * Whose *model* this is, which is usually not who uploaded it.
+   *
+   * NVIDIA publishes one GGUF chat model; the ninety-odd NVIDIA models that can
+   * actually be run were converted by `bartowski`, `unsloth`, and
+   * `lmstudio-community`. Ranking on the publisher alone therefore promotes one
+   * card and leaves the rest in download order, which is what made a search for
+   * "nvidia" look like it had not worked.
+   *
+   * Derived in Rust from the `base_model` tag, falling back to the repository
+   * name. Absent when nothing identifies the source.
+   */
+  sourceBrand?: string | null;
   name: string;
   /** Factual one-liner assembled from metadata, not marketing copy. */
   summary: string;

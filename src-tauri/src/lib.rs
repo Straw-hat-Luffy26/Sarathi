@@ -348,7 +348,6 @@ pub fn run() {
             commands::intelligence::get_model_profile,
             commands::intelligence::update_model_profile,
             commands::intelligence::refresh_model_profile,
-            commands::intelligence::route_prompt_capability,
 
             // Launch section — start coding tools already connected
             commands::launcher::get_launch_overview,
@@ -378,12 +377,14 @@ pub fn run() {
             commands::catalog::refresh_model_library,
             commands::catalog::list_model_categories,
             commands::catalog::find_model_adapters,
+            commands::adapters::find_adapters_for_installed_model,
 
             // Adapter downloads and management
             commands::adapters::list_installed_adapters,
             commands::adapters::download_adapter,
             commands::adapters::remove_adapter,
             commands::adapters::set_adapter_capability,
+            commands::adapters::set_capability_default,
             commands::adapter_details::get_adapter_details,
 
             // Phase 6 Memory Engine Commands

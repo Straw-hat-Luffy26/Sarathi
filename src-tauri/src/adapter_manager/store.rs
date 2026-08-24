@@ -51,6 +51,13 @@ pub struct InstalledAdapter {
     /// UI can show a guess as a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub assignment_confidence: Option<String>,
+    /// Whether this is the adapter its capability actually binds.
+    ///
+    /// Several adapters can serve one capability; only one is used. Without this
+    /// the list would show four coding adapters with no way to tell which one
+    /// the model is running.
+    #[serde(default)]
+    pub is_default: bool,
 }
 
 /// Turns a repository id into a directory name safe on every platform.
@@ -77,7 +84,7 @@ pub fn adapters_root(package_dir: &Path) -> PathBuf {
 ///
 /// `config.json` alone is not enough to judge: adapters legitimately ship
 /// `adapter_config.json`, and the two must not be confused.
-fn looks_like_full_model(filenames: &[String]) -> bool {
+pub fn looks_like_full_model(filenames: &[String]) -> bool {
     let base = |f: &String| f.rsplit('/').next().unwrap_or(f).to_ascii_lowercase();
 
     let has_model_config = filenames.iter().any(|f| base(f) == "config.json");
@@ -89,6 +96,80 @@ fn looks_like_full_model(filenames: &[String]) -> bool {
     });
 
     has_model_config && has_full_weights
+}
+
+/// What a repository's *files* say it is, independent of what its tags claim.
+///
+/// Tags are authored by hand and routinely outlive the thing they described: a
+/// model fine-tuned *with* LoRA and then released as merged weights keeps the
+/// `lora` and `peft` tags PEFT added during training. Believing them lists a
+/// whole model as an add-on skill.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoKind {
+    /// Adapter files are present. This is a LoRA/PEFT adapter.
+    Adapter,
+    /// Complete model weights are present. Whatever the tags say, this is a
+    /// model — listing it as an adapter sends the user into a download that can
+    /// never be bound.
+    FullModel,
+    /// The file list settles nothing either way; the caller may fall back to
+    /// tags.
+    Unknown,
+}
+
+/// Classifies a repository from its file list.
+///
+/// This is the listing-time counterpart to [`check_installable_sized`], and
+/// deliberately shares its reasoning: the same evidence that decides whether an
+/// adapter can be *installed* decides whether it should be *offered*. Keeping
+/// the two in one module is what stops the browse list and the download button
+/// from disagreeing about what a repository is.
+///
+/// Sizes come from the Hub's blob listing; `0` means unknown and the adapter
+/// size ceiling is not applied, so callers without sizes lose nothing.
+pub fn classify_repo_files(files: &[(String, u64)]) -> RepoKind {
+    let filenames: Vec<String> = files.iter().map(|(n, _)| n.clone()).collect();
+    let base = |f: &String| f.rsplit('/').next().unwrap_or(f).to_ascii_lowercase();
+
+    // Complete weights are disqualifying and outrank every other signal.
+    if looks_like_full_model(&filenames) {
+        return RepoKind::FullModel;
+    }
+
+    let size_of = |name: &str| files.iter().find(|(n, _)| n == name).map(|(_, s)| *s).unwrap_or(0);
+    let adapter_sized = |name: &str| {
+        let s = size_of(name);
+        s == 0 || s <= MAX_ADAPTER_BYTES
+    };
+
+    // A PEFT config is the author stating what the repository holds.
+    let has_peft_config = filenames.iter().any(|f| base(f) == "adapter_config.json");
+    let has_peft_weights = filenames.iter().any(|f| base(f) == "adapter_model.safetensors");
+    if has_peft_config || has_peft_weights {
+        return RepoKind::Adapter;
+    }
+
+    let ggufs: Vec<&String> = filenames.iter().filter(|f| f.ends_with(".gguf")).collect();
+
+    // A GGUF that names itself an adapter, and is small enough to be one.
+    if ggufs.iter().any(|f| {
+        let lower = f.to_ascii_lowercase();
+        (lower.contains("lora") || lower.contains("adapter")) && adapter_sized(f)
+    }) {
+        return RepoKind::Adapter;
+    }
+
+    // GGUFs only, none of which claims to be an adapter, and no PEFT config.
+    //
+    // This is the case that motivated the whole classifier: repositories
+    // publishing only quantized fine-tunes carry no safetensors for
+    // `looks_like_full_model` to catch, so a whole model reached the adapter
+    // list on the strength of a leftover `lora` tag.
+    if !ggufs.is_empty() {
+        return RepoKind::FullModel;
+    }
+
+    RepoKind::Unknown
 }
 
 /// Rejects adapters that could not be loaded, before anything is downloaded.
@@ -248,21 +329,40 @@ pub fn list_installed(package_dir: &Path, base_model_id: &str) -> Vec<InstalledA
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|_| id.clone());
 
-        // Which slot, if any, this directory is wired to. Matching on the
-        // directory prefix rather than the exact filename means a record written
-        // against `adapter_model.safetensors` still resolves after conversion
-        // replaced it with `adapter.gguf`.
+        // What the inventory says about this directory.
+        //
+        // Looked up by directory id rather than by capability, because several
+        // adapters can now share a capability and only one of them is the one
+        // bound. Falls back to matching on the file path so a record written
+        // before the inventory existed still resolves — there the directory
+        // prefix is the only link, since the key was the capability name.
         let prefix = format!("adapters/{}/", id);
-        let assignment = manifest.as_ref().and_then(|m| {
-            m.adapters.iter().find(|(_, a)| {
-                a.adapter_file.as_deref().map(|f| f.starts_with(&prefix)).unwrap_or(false)
+        let record = manifest.as_ref().and_then(|m| {
+            m.installed_adapters.get(&id).or_else(|| {
+                m.installed_adapters
+                    .values()
+                    .chain(m.adapters.values())
+                    .find(|a| {
+                        a.adapter_file.as_deref().map(|f| f.starts_with(&prefix)).unwrap_or(false)
+                    })
             })
         });
 
+        // An adapter is bound only if its capability points back at it. Two
+        // coding adapters can both be installed and both say `coding`; exactly
+        // one is what the model actually runs with.
+        let capability = record.map(|a| a.capability.clone()).filter(|c| !c.is_empty());
+        let is_default = manifest
+            .as_ref()
+            .zip(capability.as_ref())
+            .map(|(m, cap)| m.capability_defaults.get(cap).map(|d| d == &id).unwrap_or(false))
+            .unwrap_or(false);
+
         out.push(InstalledAdapter {
             name: repo_id.split('/').next_back().unwrap_or(&id).replace(['-', '_'], " "),
-            capability: assignment.map(|(key, _)| key.clone()),
-            assignment_confidence: assignment.and_then(|(_, a)| a.assignment_confidence.clone()),
+            capability,
+            assignment_confidence: record.and_then(|a| a.assignment_confidence.clone()),
+            is_default,
             id,
             repo_id,
             base_model_id: base_model_id.to_string(),
@@ -536,5 +636,83 @@ mod tests {
 
         let err = remove(&pkg, "never-installed").unwrap_err().to_string();
         assert!(err.contains("not installed"), "got: {err}");
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::*;
+
+    fn files(names: &[(&str, u64)]) -> Vec<(String, u64)> {
+        names.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    /// A PEFT adapter states what it is through its config, and that is enough.
+    #[test]
+    fn a_peft_adapter_is_an_adapter() {
+        let f = files(&[
+            ("adapter_config.json", 512),
+            ("adapter_model.safetensors", 160 * 1024 * 1024),
+            ("README.md", 2048),
+        ]);
+        assert_eq!(classify_repo_files(&f), RepoKind::Adapter);
+    }
+
+    /// A GGUF that names itself an adapter, small enough to be one.
+    #[test]
+    fn a_gguf_named_adapter_is_an_adapter() {
+        let f = files(&[("Qwen2.5-7B-coding-lora-f16.gguf", 160 * 1024 * 1024)]);
+        assert_eq!(classify_repo_files(&f), RepoKind::Adapter);
+    }
+
+    /// The bug this classifier exists for: a model fine-tuned *with* LoRA and
+    /// released as merged weights keeps the `lora` and `peft` tags PEFT wrote
+    /// during training. Its files say plainly that it is a whole model.
+    #[test]
+    fn a_merged_finetune_is_a_full_model_whatever_its_tags_say() {
+        let f = files(&[
+            ("config.json", 1024),
+            ("model-00001-of-00004.safetensors", 4_000_000_000),
+            ("model-00002-of-00004.safetensors", 4_000_000_000),
+            ("tokenizer.json", 9_000_000),
+        ]);
+        assert_eq!(classify_repo_files(&f), RepoKind::FullModel);
+    }
+
+    /// A plain quantization repository publishes only GGUFs, so it carries no
+    /// safetensors for `looks_like_full_model` to catch. Falling back to "first
+    /// GGUF wins" is what listed a multi-gigabyte fine-tune as a ready adapter.
+    #[test]
+    fn a_gguf_only_model_repo_is_a_full_model() {
+        let f = files(&[
+            ("Qwen2.5-7B-Instruct-Q4_K_M.gguf", 4_400_000_000),
+            ("Qwen2.5-7B-Instruct-Q8_0.gguf", 7_500_000_000),
+            ("README.md", 2048),
+        ]);
+        assert_eq!(classify_repo_files(&f), RepoKind::FullModel);
+    }
+
+    /// A merged model whose GGUF happens to have "lora" in its name is still a
+    /// model: the size ceiling is what separates a low-rank delta from weights.
+    #[test]
+    fn a_model_sized_gguf_is_not_rescued_by_a_lora_in_its_name() {
+        let f = files(&[("my-lora-merged-7b-Q4_K_M.gguf", 4_400_000_000)]);
+        assert_eq!(classify_repo_files(&f), RepoKind::FullModel);
+    }
+
+    /// Nothing recognisable either way. The caller may fall back to tags rather
+    /// than having a verdict invented for it.
+    #[test]
+    fn an_uninformative_file_list_settles_nothing() {
+        let f = files(&[("README.md", 2048), ("LICENSE", 1024)]);
+        assert_eq!(classify_repo_files(&f), RepoKind::Unknown);
+    }
+
+    /// Sizes are frequently absent from the Hub listing. A missing size must not
+    /// silently disqualify a genuine adapter.
+    #[test]
+    fn an_unknown_size_does_not_disqualify_an_adapter() {
+        let f = files(&[("adapter.gguf", 0)]);
+        assert_eq!(classify_repo_files(&f), RepoKind::Adapter);
     }
 }

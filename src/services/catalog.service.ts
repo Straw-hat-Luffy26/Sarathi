@@ -38,6 +38,17 @@ export interface CatalogPage {
   /** Explains a partial result, e.g. rate limiting or browsing without a token. */
   notice?: string | null;
   /**
+   * The publisher this search turned out to be about, when the typed words
+   * named one — "NVIDIA" for "nvidia nemotron", "DeepSeek" for "deepseek".
+   *
+   * Resolved in Rust against the same table the sweep used, so the browser can
+   * rank that publisher's own releases first without keeping a second copy of
+   * the alias list here and letting the two drift.
+   *
+   * Absent for ordinary searches and for every non-search listing.
+   */
+  matchedBrand?: string | null;
+  /**
    * How many swept models were dropped for having no placement on this machine.
    *
    * Discover lists only models that run here, so this is the difference between
@@ -128,12 +139,49 @@ export interface AdapterListing {
   ggufReady: boolean;
   /** What the adapter is for, e.g. `text to sql`. */
   focus: string;
+  /**
+   * Bytes installing this adapter downloads — its weight file alone.
+   *
+   * `0` means the Hub did not report a size. Render that as unknown rather than
+   * as nothing, so a running total never quietly understates itself.
+   */
+  sizeBytes: number;
+  /**
+   * Capability slot this adapter fills, from its own metadata.
+   *
+   * The author's tags decide it where they exist; the repository name is only a
+   * fallback. `undefined` means neither settled it — shown as unsorted rather
+   * than filed under a guess.
+   */
+  capability?: string;
+  /** `stated` (author's tags) or `suggested` (read from the name). */
+  capabilityConfidence?: string;
+  /**
+   * Whether Sarathi can install this against the model being viewed.
+   *
+   * `false` means the installer would refuse it — the reason is in
+   * `blockedReason`, and no Get button should be offered.
+   */
+  installable: boolean;
+  /** Why it cannot be installed, in plain language. */
+  blockedReason?: string | null;
 }
 
 export interface AdapterPage {
+  /**
+   * The model these were found for.
+   *
+   * Shown so the list can say *which* model it searched: an answer is only
+   * meaningful alongside its question, and for an installed model the id
+   * searched is the original rather than the quantization on disk. Empty when
+   * the base model could not be determined.
+   */
+  baseModelId: string;
   adapters: AdapterListing[];
   /** How many are loadable as-is. */
   readyCount: number;
+  /** Whole hours since this was fetched, when served from cache and not fresh. */
+  ageHours?: number | null;
   /** Explains an empty or unusable result. */
   notice?: string | null;
 }
@@ -141,11 +189,24 @@ export interface AdapterPage {
 /**
  * LoRA adapters published for a base model.
  *
- * Uses HuggingFace's `base_model:adapter:` tag, which adapter authors set to
- * declare their parent — a real relationship, not a name-similarity guess.
+ * `baseModelId` must be the **original** model an adapter author declares, not
+ * a quantization repository. For a model already installed, use
+ * `findAdaptersForInstalledModel` instead — it resolves that id from the
+ * package rather than making the caller know it.
+ *
+ * `refresh` bypasses the cache. That is what "Find more" does, and the only way
+ * to make Sarathi ask HuggingFace again before the cache expires.
  */
-export function findModelAdapters(baseModelId: string): Promise<AdapterPage> {
-  return invoke<AdapterPage>('find_model_adapters', { baseModelId });
+export function findModelAdapters(
+  baseModelId: string,
+  architecture?: string | null,
+  refresh = false
+): Promise<AdapterPage> {
+  return invoke<AdapterPage>('find_model_adapters', {
+    baseModelId,
+    architecture: architecture ?? null,
+    refresh,
+  });
 }
 
 /** Bytes as GB with one decimal, e.g. `4.7 GB`. */

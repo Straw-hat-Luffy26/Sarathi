@@ -513,6 +513,25 @@ impl HuggingFaceCatalogProvider {
                 use_cases: vec!["chat".into(), "general".into()],
                 catalog_version: "live_hf".into(),
             })
+        } else if repo_lower.contains("nemotron-3-nano-4b") {
+            Some(ModelMetadata {
+                id: "nvidia/NVIDIA-Nemotron-3-Nano-4B".into(),
+                name: "Nemotron 3 Nano 4B".into(),
+                family: "Nemotron".into(),
+                architecture: ModelArchitecture::Dense,
+                total_parameters: 3_973_556_832,
+                active_parameters: None,
+                num_layers: 32,
+                num_attention_heads: 32,
+                num_kv_heads: 8,
+                head_dimension: 128,
+                hidden_size: 3072,
+                max_context_length: 131072,
+                vocab_size: 131072,
+                default_dtype: "bf16".into(),
+                use_cases: vec!["chat".into(), "general".into(), "reasoning".into()],
+                catalog_version: "live_hf".into(),
+            })
         } else {
             None
         }
@@ -535,4 +554,15 @@ mod tests {
         assert_eq!(models.len(), cached_models.len(), "Subsequent calls must return cached models");
         let _ = fs::remove_dir_all(temp_dir);
     }
+
+    #[test]
+    fn test_parse_nemotron_repo() {
+        let meta = HuggingFaceCatalogProvider::parse_hf_repo_to_metadata("nvidia/NVIDIA-Nemotron-3-Nano-4B-GGUF");
+        assert!(meta.is_some());
+        let m = meta.unwrap();
+        assert_eq!(m.name, "Nemotron 3 Nano 4B");
+        assert_eq!(m.family, "Nemotron");
+        assert_eq!(m.total_parameters, 3_973_556_832);
+    }
 }
+

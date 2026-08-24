@@ -1,5 +1,8 @@
 //! HuggingFace provider module
 
+pub mod adapter_discovery;
+pub mod brands;
+pub mod resolve_upstream;
 pub mod resolver;
 pub mod catalog_provider;
 pub mod adapter_provider;

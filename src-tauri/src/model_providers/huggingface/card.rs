@@ -378,6 +378,30 @@ pub struct ModelCard {
     pub repo_id: String,
     /// HuggingFace org or user, shown as the publisher.
     pub publisher: String,
+    /// The publisher's display name, when the account is one Sarathi recognises
+    /// — "NVIDIA" for `nvidia`, "Unsloth" for `unsloth`, "Z.ai" for `zai-org`.
+    ///
+    /// Set from the org slug rather than from the repository's name, so a
+    /// community conversion like `bartowski/nvidia_Nemotron-GGUF` reports
+    /// Bartowski. That is what lets the browser mark an official release as
+    /// official instead of trusting the words in the title.
+    ///
+    /// `None` for the long tail of individual uploaders, which is most of the
+    /// Hub and carries no claim either way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher_brand: Option<String>,
+    /// Whose *model* this is, which is usually not who uploaded it.
+    ///
+    /// NVIDIA publishes one GGUF chat model; the ninety-odd NVIDIA models that
+    /// can actually be run were converted by `bartowski`, `unsloth`, and
+    /// `lmstudio-community`. Without this, a search for "nvidia" can only
+    /// promote that single card and everything else stays ordered by download
+    /// count — which is what made the search look broken.
+    ///
+    /// Read from the `base_model` tag, falling back to the repository name. See
+    /// [`brand_of_model`](crate::model_providers::huggingface::brands::brand_of_model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_brand: Option<String>,
     pub name: String,
     /// Factual one-liner built from real metadata — never marketing copy.
     pub summary: String,
@@ -483,7 +507,15 @@ fn build_summary(repo: &GgufRepo, categories: &[ModelCategory]) -> String {
 /// Quality note for a quantization label.
 fn quality_note(label: &str) -> &'static str {
     let l = label.to_uppercase();
-    if l.starts_with("F16") || l.starts_with("F32") || l.starts_with("BF16") {
+
+    // `F16` and `FP16` are one format spelled two ways, and both spellings are
+    // in wide use in published filenames — the same holds for `F32`/`FP32`.
+    // Matching only the short form sent every `FP16` build past every branch
+    // below and into the catch-all, which announced the largest and most
+    // accurate file in a repository as its smallest and lossiest one.
+    const UNQUANTIZED: &[&str] = &["F16", "FP16", "F32", "FP32", "BF16"];
+
+    if UNQUANTIZED.iter().any(|p| l.starts_with(p)) {
         "Full precision — largest"
     } else if l.starts_with("Q8") {
         "Near-lossless"
@@ -491,14 +523,20 @@ fn quality_note(label: &str) -> &'static str {
         "Very high quality"
     } else if l.starts_with("Q5") {
         "High quality"
-    } else if l.starts_with("Q4") || l.starts_with("IQ4") {
+    } else if l.starts_with("Q4") || l.starts_with("IQ4") || l.starts_with("MXFP4") {
+        // MXFP4 is gpt-oss's *native* 4-bit format: those weights were trained
+        // and released at this precision rather than compressed down to it, so
+        // it is the reference build rather than a lossy copy of one.
         "Balanced — recommended"
     } else if l.starts_with("Q3") || l.starts_with("IQ3") {
         "Noticeable quality loss"
     } else if is_low_quality(label) {
         "Very low — may produce broken output"
     } else {
-        "Smallest — significant quality loss"
+        // An unrecognised label. Calling it "smallest — significant quality
+        // loss" stated a guess as fact, and the guess was wrong for every
+        // format that simply had not been listed above.
+        "Uncommon format"
     }
 }
 
@@ -509,7 +547,14 @@ fn quality_note(label: &str) -> &'static str {
 /// than a quality setting. Q4_K_M is the usual practical floor.
 fn is_low_quality(label: &str) -> bool {
     let l = label.to_uppercase();
-    l.starts_with("Q2") || l.starts_with("IQ2") || l.starts_with("Q1") || l.starts_with("IQ1")
+    // `TQ1_0` and `TQ2_0` are ternary — 1.7 to 2.1 bits per weight, below even
+    // Q2 — so they belong in the same warned-about band rather than in the
+    // unrecognised-format catch-all.
+    l.starts_with("Q2")
+        || l.starts_with("IQ2")
+        || l.starts_with("Q1")
+        || l.starts_with("IQ1")
+        || l.starts_with("TQ")
 }
 
 /// Sizes one quantization against this machine, both ways it could run.
@@ -604,6 +649,13 @@ pub fn build_card(
     ModelCard {
         repo_id: repo.repo_id.clone(),
         publisher: repo.author.clone(),
+        publisher_brand: crate::model_providers::huggingface::brands::brand_of_repo(&repo.repo_id)
+            .map(|b| b.label.to_string()),
+        source_brand: crate::model_providers::huggingface::brands::brand_of_model(
+            &repo.repo_id,
+            repo.base_model.as_deref(),
+        )
+        .map(|b| b.label.to_string()),
         name: repo.display_name(),
         summary: build_summary(repo, &categories),
         categories,
@@ -913,6 +965,43 @@ mod tests {
 
         assert_eq!(fitting, vec!["Q2_K"], "only the 3 GB option fits a 4 GB budget");
         assert!(card.quantizations.iter().any(|q| q.quality_note.contains("recommended")));
+    }
+
+    /// The full-precision build is the largest and most faithful file in a
+    /// repository. Published filenames spell it both `F16` and `FP16`, and only
+    /// the short spelling was recognised — so every `FP16` build fell through
+    /// to the catch-all and was presented to the user as the *smallest* option,
+    /// carrying "significant quality loss", directly above a 3.8 GB Q8_0 that
+    /// was correctly labelled near-lossless.
+    #[test]
+    fn full_precision_is_never_described_as_the_lossiest_option() {
+        for label in ["F16", "FP16", "F32", "FP32", "BF16"] {
+            let note = quality_note(label);
+            assert_eq!(note, "Full precision — largest", "{label} was described as {note:?}");
+            assert!(!is_low_quality(label), "{label} is not a degraded build");
+        }
+    }
+
+    /// MXFP4 is gpt-oss's native format rather than a compression of one, and
+    /// ternary builds are below even Q2. Neither was recognised, so both landed
+    /// in the same catch-all — which understated one and overstated the other.
+    #[test]
+    fn native_and_ternary_formats_are_placed_on_the_right_side_of_the_warning() {
+        assert_eq!(quality_note("MXFP4"), "Balanced — recommended");
+        assert!(!is_low_quality("MXFP4"));
+
+        for label in ["TQ1_0", "TQ2_0"] {
+            assert!(is_low_quality(label), "{label} is ternary and should be warned about");
+            assert_eq!(quality_note(label), "Very low — may produce broken output");
+        }
+    }
+
+    /// An unrecognised label is unknown, not known to be bad. Asserting it is
+    /// the smallest and lossiest build was a guess stated as a measurement.
+    #[test]
+    fn an_unrecognised_format_is_not_accused_of_quality_loss() {
+        let note = quality_note("ZZ9_PLURAL_Z_ALPHA");
+        assert!(!note.contains("loss"), "unknown format described as lossy: {note:?}");
     }
 
     /// A recommendation is a claim the model is good on this machine. A 27B

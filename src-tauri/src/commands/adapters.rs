@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use tauri::{AppHandle, Manager};
 
 use crate::adapter_manager::store::{self, InstalledAdapter};
+use crate::model_providers::huggingface::{adapter_discovery, resolve_upstream};
 use crate::adapter_manager::AdapterRegistry;
 
 /// Largest file accepted as a LoRA adapter.
@@ -105,6 +106,64 @@ fn package_dir_for(app: &AppHandle, provider_id: &str, model_id: &str) -> Result
         .app_data_dir()
         .map_err(|e| format!("could not resolve the app data folder: {e}"))?;
     Ok(AdapterRegistry::resolve_package_dir(&dir, provider_id, model_id))
+}
+
+/// Finds adapters compatible with a model the user already has installed.
+///
+/// This is the Storage path: the user opens a model they installed and asks for
+/// skills for *that* model, without going back to the library and searching for
+/// it again. Sarathi already knows which model it is, so it should not have to
+/// be told.
+///
+/// The only work here is turning an installed package into the id adapters are
+/// published against — see
+/// [`resolve_upstream`](crate::model_providers::huggingface::resolve_upstream)
+/// for why that is not simply the package's own name. Everything after that is
+/// the same call Discover makes, so both screens show the same adapters for the
+/// same model.
+#[tauri::command]
+pub async fn find_adapters_for_installed_model(
+    app: AppHandle,
+    provider_id: String,
+    model_id: String,
+    refresh: Option<bool>,
+) -> Result<adapter_discovery::AdapterPage, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve the app data folder: {e}"))?;
+    let package = AdapterRegistry::resolve_package_dir(&app_data_dir, &provider_id, &model_id);
+    let token = crate::config::hf_token::get();
+
+    let Some(upstream) = resolve_upstream::resolve(&package, token.as_deref()).await else {
+        // Not an error: the model is installed and usable, Sarathi just cannot
+        // vouch for adapter compatibility. Saying so beats an empty list, which
+        // would read as "no adapters exist for this model".
+        return Ok(adapter_discovery::AdapterPage::unknown_base_model(&model_id));
+    };
+
+    log::info!(
+        "[ADAPTERS] '{model_id}' resolves to upstream '{}' (via {:?})",
+        upstream.model_id,
+        upstream.source
+    );
+
+    // Read from the weights themselves rather than from anything the manifest
+    // recorded: the GGUF header is what the converter will consult, so asking it
+    // the same question is what keeps the listing and the installer in agreement.
+    let architecture = crate::lora::convert::arch::resolve_base_gguf(&package)
+        .ok()
+        .and_then(|gguf| crate::lora::convert::arch::read_architecture(&gguf).ok());
+
+    adapter_discovery::compatible_adapters(
+        &app_data_dir,
+        &upstream.model_id,
+        architecture.as_deref(),
+        token.as_deref(),
+        refresh.unwrap_or(false),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -367,6 +426,20 @@ pub async fn download_adapter(
         capability.as_deref().unwrap_or("unassigned"),
     );
 
+    // The first adapter installed for a capability becomes its default; a later
+    // one joins the inventory without displacing it. `register_adapter` has
+    // already decided which happened, so this reports the outcome rather than
+    // deciding it again.
+    let is_default = capability
+        .as_ref()
+        .and_then(|cap| {
+            AdapterRegistry::read_manifest(&install_package)
+                .ok()
+                .and_then(|m| m.capability_defaults.get(cap).cloned())
+        })
+        .map(|default_id| default_id == dir_name)
+        .unwrap_or(false);
+
     Ok(InstalledAdapter {
         id: dir_name,
         name: adapter_repo_id
@@ -379,6 +452,7 @@ pub async fn download_adapter(
         file_path: file_path.to_string_lossy().to_string(),
         size_bytes: downloaded_bytes as u64,
         assignment_confidence: assignment.map(|a| a.confidence.as_str().to_string()),
+        is_default,
         capability,
     })
 }
@@ -436,7 +510,13 @@ fn register_adapter(
         assignment_confidence: Some(assignment.confidence.as_str().to_string()),
     };
 
-    manifest.adapters.insert(assignment.capability.clone(), record);
+    // Registered into the inventory rather than written straight into the
+    // capability slot. Installing a second coding adapter must not evict the
+    // first: the user may be trying a Python specialist alongside a general one,
+    // and silently swapping what is bound would change how the model answers
+    // without them asking. The first adapter for a capability still becomes its
+    // default, so installing one skill and using it is unchanged.
+    AdapterRegistry::register_installed(&mut manifest, dir_name, record);
     manifest.updated_at = chrono::Utc::now().to_rfc3339();
     AdapterRegistry::write_manifest(install_package, &manifest)
 }
@@ -509,6 +589,53 @@ fn clear_assignment(
     AdapterRegistry::write_manifest_user_initiated(package, &manifest)?;
 
     Ok(Some(record))
+}
+
+/// Chooses which installed adapter a capability binds.
+///
+/// Several adapters can serve one capability — a Python specialist, a C++
+/// specialist and a general coding adapter are all `coding` — but only one can
+/// be bound, because a turn resolves to a capability and the runtime needs a
+/// single answer. This is how the user says which.
+///
+/// Automatic selection among them is a later phase. This stays the fallback when
+/// that arrives: a ranking that cannot separate two adapters should defer to
+/// what the user picked rather than choose arbitrarily.
+#[tauri::command]
+pub async fn set_capability_default(
+    app: AppHandle,
+    provider_id: String,
+    model_id: String,
+    capability: String,
+    adapter_id: String,
+) -> Result<(), String> {
+    let package = package_dir_for(&app, &provider_id, &model_id)?;
+    let mut manifest = AdapterRegistry::read_manifest(&package)
+        .map_err(|e| format!("could not read the model's manifest: {e}"))?;
+
+    let Some(record) = manifest.installed_adapters.get(&adapter_id) else {
+        return Err(format!("'{adapter_id}' is not installed for this model."));
+    };
+
+    // Binding an adapter to a capability it does not serve would apply weights
+    // trained for one task to another. The user picks among an capability's own
+    // adapters, not across capabilities — that is what `set_adapter_capability`
+    // is for.
+    if record.capability != capability {
+        return Err(format!(
+            "'{adapter_id}' is a '{}' adapter, so it cannot be the default for '{capability}'.",
+            record.capability
+        ));
+    }
+
+    manifest.capability_defaults.insert(capability.clone(), adapter_id.clone());
+    AdapterRegistry::rebuild_active_bindings(&mut manifest);
+    manifest.updated_at = chrono::Utc::now().to_rfc3339();
+    AdapterRegistry::write_manifest_user_initiated(&package, &manifest)
+        .map_err(|e| e.to_string())?;
+
+    log::info!("[ADAPTERS] '{capability}' now binds '{adapter_id}' for '{model_id}'");
+    Ok(())
 }
 
 /// Points a capability at an installed adapter, or unassigns one.
@@ -593,7 +720,13 @@ pub async fn set_adapter_capability(
         ),
     };
 
-    manifest.adapters.insert(key.clone(), record);
+    // An explicit assignment is also an explicit choice to use it, so this
+    // becomes the capability's default. Any adapter previously holding that
+    // capability stays installed and keeps its own capability — it is no longer
+    // the one bound, which is the whole difference from the old behaviour.
+    AdapterRegistry::register_installed(&mut manifest, &adapter_id, record);
+    manifest.capability_defaults.insert(key.clone(), adapter_id.clone());
+    AdapterRegistry::rebuild_active_bindings(&mut manifest);
     manifest.updated_at = chrono::Utc::now().to_rfc3339();
     AdapterRegistry::write_manifest_user_initiated(&package, &manifest)
         .map_err(|e| e.to_string())?;
@@ -638,8 +771,11 @@ mod tests {
                 file_path: "base/model.gguf".to_string(),
                 size_bytes: 1,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: HashMap::new(),
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: String::new(),
             updated_at: String::new(),
         };

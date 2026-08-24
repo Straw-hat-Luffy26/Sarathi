@@ -27,6 +27,8 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::model_providers::huggingface::adapter_discovery;
+use crate::model_providers::huggingface::brands;
 use crate::model_providers::huggingface::card::{build_card, ModelCard, ModelCategory};
 use crate::model_providers::huggingface::catalog_cache::{self, Freshness};
 use crate::model_providers::huggingface::discovery::GgufRepo;
@@ -138,6 +140,16 @@ pub struct CatalogPage {
     /// still usable; the message explains why there are fewer than expected.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notice: Option<String>,
+    /// The publisher this search turned out to be about, when the typed words
+    /// named one — "NVIDIA" for "nvidia nemotron", "DeepSeek" for "deepseek".
+    ///
+    /// Carried so the browser can rank that publisher's own releases to the top
+    /// and label them, without shipping a second copy of the alias table to the
+    /// front end and letting the two drift.
+    ///
+    /// `None` for ordinary searches and for every non-search listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matched_brand: Option<String>,
     /// How many swept models were dropped for having no placement here.
     ///
     /// Reported so the browser can say that a listing is filtered rather than
@@ -391,6 +403,7 @@ fn page_from(
         age_seconds,
         refreshing,
         notice,
+        matched_brand: None,
         hidden_incompatible,
     }
 }
@@ -418,11 +431,32 @@ async fn sweep(app: &AppHandle, token: Option<&str>, background: bool) -> Result
     };
 
     let pages = live_catalog::pages_for(token);
-    let repos = live_catalog::discover_repos_reporting(None, pages, token, Some(&report))
+    let mut repos = live_catalog::discover_repos_reporting(None, pages, token, Some(&report))
         .await
         // Rate limiting is the common, fixable case and its message says what to
         // do, so it is passed through unchanged.
         .map_err(|e| e.to_string())?;
+
+    // Families the popularity sweep does not reach — see `SEED_QUERIES`. One
+    // page each: this is about making them *present*, not about listing every
+    // build of them, and each extra page is another hundred requests.
+    //
+    // A seed that fails is logged and skipped. The main sweep already succeeded,
+    // and a rate limit part-way through must not turn a good library into an
+    // error.
+    for seed in live_catalog::SEED_QUERIES {
+        match live_catalog::discover_repos_reporting(Some(seed), 1, token, Some(&report)).await {
+            Ok(found) => {
+                log::info!("[HF_CATALOG] Seed '{seed}' contributed {} repositories", found.len());
+                repos.extend(found);
+            }
+            Err(e) => log::warn!("[HF_CATALOG] Seed '{seed}' failed, skipping: {e}"),
+        }
+    }
+
+    // A seed can return something the main sweep already found.
+    repos.sort_by(|a, b| a.repo_id.cmp(&b.repo_id));
+    repos.dedup_by(|a, b| a.repo_id == b.repo_id);
 
     let _ = app.emit(
         PROGRESS_EVENT,
@@ -545,15 +579,34 @@ pub async fn browse_model_cards(
             let _ = emitter.emit(PROGRESS_EVENT, ProgressPayload::from_sweep(p, false));
         };
 
-        let repos = live_catalog::discover_repos_reporting(Some(term), 1, token.as_deref(), Some(&report))
-            .await
-            .map_err(|e| e.to_string())?;
+        // Searched pages, not the single page this used to ask for.
+        //
+        // One page is 100 repositories ordered by *download count*, so a search
+        // for a model released last month was answered out of the hundred
+        // most-downloaded repositories whose name happened to match — which is
+        // how "gemma 4" returned `gemma-3-4b-it` and a set of community remixes
+        // while the actual Gemma 4 conversions sat on later pages. Search is
+        // the one path meant to reach past the popular sweep, so it is given
+        // the same depth the sweep has.
+        let pages = live_catalog::pages_for(token.as_deref());
+        let repos = live_catalog::discover_repos_reporting(
+            Some(term),
+            pages,
+            token.as_deref(),
+            Some(&report),
+        )
+        .await
+        .map_err(|e| e.to_string())?;
 
         let _ = app.emit(
             PROGRESS_EVENT,
             ProgressPayload::simple("done", format!("{} results", repos.len()), false),
         );
-        return Ok(page_from(&repos, CatalogSource::Live, None, false, None));
+        let mut page = page_from(&repos, CatalogSource::Live, None, false, None);
+        // Resolved from the same table the sweep used, so the browser is told
+        // exactly which publisher it went and fetched.
+        page.matched_brand = brands::resolve(term).map(|b| b.label.to_string());
+        return Ok(page);
     }
 
     let authenticated = token.is_some();
@@ -648,46 +701,44 @@ pub async fn refresh_model_library(app: AppHandle) -> Result<CatalogPage, String
     ))
 }
 
-/// Adapters published for a model, plus how usable they are here.
-#[derive(Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct AdapterPage {
-    pub adapters: Vec<live_catalog::AdapterListing>,
-    /// How many can be loaded as they are. The rest are PEFT safetensors, which
-    /// Sarathi converts to GGUF during installation.
-    pub ready_count: usize,
-    /// Shown when none are directly usable, explaining what that means.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub notice: Option<String>,
-}
-
 /// Lists LoRA adapters published for a base model.
 ///
-/// Looks up HuggingFace's `base_model:adapter:` tag, which adapter authors set
-/// to declare their parent — a real relationship, not a name-similarity guess.
+/// `base_model_id` is the **original** model an adapter author declares, not a
+/// quantization repository. Discover already holds it on the card it is showing;
+/// Storage has to resolve it first, which is what
+/// `commands::adapters::find_adapters_for_installed_model` does before calling
+/// this same service.
+///
+/// The work itself lives in
+/// [`adapter_discovery`](crate::model_providers::huggingface::adapter_discovery)
+/// so every screen asking this question gets the same answer, from the same
+/// cache, filtered the same way.
 #[tauri::command]
-pub async fn find_model_adapters(base_model_id: String) -> Result<AdapterPage, String> {
+pub async fn find_model_adapters(
+    app: tauri::AppHandle,
+    base_model_id: String,
+    // The base model's GGUF architecture, when the caller knows it.
+    //
+    // `None` for a model that is not installed: nothing local can be read, and
+    // guessing would either offer downloads that fail or hide ones that work.
+    architecture: Option<String>,
+    refresh: Option<bool>,
+) -> Result<adapter_discovery::AdapterPage, String> {
+    let app_data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("could not resolve the app data folder: {e}"))?;
     let token = crate::config::hf_token::get();
 
-    let adapters = live_catalog::find_adapters(&base_model_id, 20, token.as_deref())
-        .await
-        .map_err(|e| e.to_string())?;
-
-    let ready_count = adapters.iter().filter(|a| a.gguf_ready).count();
-
-    let notice = if adapters.is_empty() {
-        Some("No LoRA adapters published for this model yet.".to_string())
-    } else if ready_count == 0 {
-        Some(format!(
-            "{} adapter(s) found. None ship GGUF, so Sarathi converts them during install — \
-             which needs this base model installed and its family supported.",
-            adapters.len()
-        ))
-    } else {
-        None
-    };
-
-    Ok(AdapterPage { adapters, ready_count, notice })
+    adapter_discovery::compatible_adapters(
+        &app_data_dir,
+        &base_model_id,
+        architecture.as_deref(),
+        token.as_deref(),
+        refresh.unwrap_or(false),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// Every category the app knows about, for a sidebar that stays stable while

@@ -193,7 +193,29 @@ impl RawModelInfo {
 
         let base_model = base_model_from_tags(&self.tags);
         let is_finetune = is_finetune(&self.tags);
-        let is_lora_adapter = is_lora_adapter(&self.tags);
+
+        // Files outrank tags.
+        //
+        // A model fine-tuned *with* LoRA and released as merged weights keeps
+        // the `lora` and `peft` tags PEFT wrote during training, so trusting the
+        // tag alone listed whole models as add-on skills. The file list is the
+        // author's actual output rather than their description of it, and the
+        // same classifier decides installability, so the browse list and the
+        // download button cannot disagree about what a repository is.
+        //
+        // Tags still decide when the files settle nothing, which keeps adapters
+        // whose repositories publish no recognisable evidence listed as before.
+        let files: Vec<(String, u64)> = self
+            .siblings
+            .iter()
+            .map(|s| (s.rfilename.clone(), s.size.unwrap_or(0)))
+            .collect();
+
+        let is_lora_adapter = match crate::adapter_manager::store::classify_repo_files(&files) {
+            crate::adapter_manager::store::RepoKind::Adapter => true,
+            crate::adapter_manager::store::RepoKind::FullModel => false,
+            crate::adapter_manager::store::RepoKind::Unknown => is_lora_adapter(&self.tags),
+        };
 
         Some(GgufRepo {
             repo_id: self.id,
@@ -527,6 +549,34 @@ pub fn search_url(query: Option<&str>, limit: u32, page: u32) -> String {
     }
     if let Some(q) = query.map(str::trim).filter(|q| !q.is_empty()) {
         url.push_str(&format!("&search={}", urlencode(q)));
+    }
+    url
+}
+
+/// Builds a search URL scoped to one publisher.
+///
+/// `author=` is an exact-match filter on the owner half of the repo id, which is
+/// what makes it able to answer "models NVIDIA published" rather than "models
+/// with 'nvidia' somewhere in the name". It is **case-sensitive** — `author=Qwen`
+/// returns 54 repositories and `author=qwen` returns none — so the org slug must
+/// arrive already correctly cased. [`brands`](super::brands) is what does that.
+///
+/// No `pipeline_tag` filter is applied, even though NVIDIA's org is mostly
+/// speech models and filtering here would remove them. Whether a repository can
+/// serve chat is [`is_servable_pipeline`]'s decision everywhere else, and it
+/// deliberately accepts an absent tag because many quantization repos leave it
+/// unset. Adding a second, stricter rule on this path would silently drop those
+/// — `author=google` falls from 37 repositories to 13 under it. First-party orgs
+/// are small enough (Qwen 54, Google 37, NVIDIA 8) to fit in one page whole, so
+/// filtering earlier would buy nothing to pay for that.
+pub fn org_search_url(org: &str, limit: u32, page: u32) -> String {
+    let mut url = format!(
+        "https://huggingface.co/api/models?filter=gguf&author={}&sort=downloads&direction=-1&limit={}&full=true",
+        urlencode(org),
+        limit.clamp(1, 100)
+    );
+    if page > 0 {
+        url.push_str(&format!("&skip={}", page * limit));
     }
     url
 }
@@ -1028,6 +1078,38 @@ mod tests {
     fn search_limit_is_clamped_to_the_api_maximum() {
         assert!(search_url(None, 5000, 0).contains("limit=100"));
         assert!(search_url(None, 0, 0).contains("limit=1"));
+    }
+
+    #[test]
+    fn an_org_search_filters_by_author_rather_than_by_name() {
+        let url = org_search_url("nvidia", 100, 0);
+        assert!(url.contains("author=nvidia"));
+        assert!(url.contains("filter=gguf"));
+        assert!(url.contains("full=true"), "siblings require full=true");
+        assert!(
+            !url.contains("search="),
+            "a free-text term would re-admit the substring matches this exists to exclude"
+        );
+        assert!(
+            !url.contains("pipeline_tag"),
+            "is_servable_pipeline is the single rule for what can serve chat"
+        );
+    }
+
+    #[test]
+    fn an_org_search_preserves_the_case_the_hub_stores() {
+        // `author=` is case-sensitive: lowercasing this returns zero results.
+        assert!(org_search_url("Qwen", 100, 0).contains("author=Qwen"));
+        assert!(org_search_url("LiquidAI", 100, 0).contains("author=LiquidAI"));
+        // A hyphen survives encoding, so `deepseek-ai` is not mangled into a space.
+        assert!(org_search_url("deepseek-ai", 100, 0).contains("author=deepseek-ai"));
+    }
+
+    #[test]
+    fn org_searches_page_and_clamp_like_ordinary_ones() {
+        assert!(!org_search_url("Qwen", 50, 0).contains("skip="));
+        assert!(org_search_url("Qwen", 50, 2).contains("skip=100"));
+        assert!(org_search_url("Qwen", 5000, 0).contains("limit=100"));
     }
 
     #[test]

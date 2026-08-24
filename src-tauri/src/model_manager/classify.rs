@@ -277,6 +277,7 @@ mod tests {
             has_vision: false,
             has_pooling: false,
             file_type: Some(15),
+                                base_model_repo: None,
         }
     }
 

@@ -681,8 +681,11 @@ impl DownloadManager {
                     file_path: "base/".to_string(),
                     size_bytes: 0,
                     checksum: None,
+                upstream_model_id: None,
                 },
                 adapters: final_adapters,
+                installed_adapters: HashMap::new(),
+                capability_defaults: HashMap::new(),
                 created_at: existing_manifest.as_ref().map(|m| m.created_at.clone()).unwrap_or_else(|| chrono::Utc::now().to_rfc3339()),
                 updated_at: chrono::Utc::now().to_rfc3339(),
             };
@@ -1621,8 +1624,11 @@ mod tests {
                 file_path: "base/".to_string(),
                 size_bytes: artifact.size_bytes,
                 checksum: None,
+            upstream_model_id: None,
             },
             adapters: HashMap::new(),
+            installed_adapters: HashMap::new(),
+            capability_defaults: HashMap::new(),
             created_at: chrono::Utc::now().to_rfc3339(),
             updated_at: chrono::Utc::now().to_rfc3339(),
         };

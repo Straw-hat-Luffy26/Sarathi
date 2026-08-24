@@ -25,7 +25,7 @@
 
 use std::collections::HashSet;
 
-use crate::model_intelligence::intent::PromptIntent;
+use crate::capability::intent::PromptIntent;
 
 /// A lexical signal and the evidence weight it contributes.
 ///

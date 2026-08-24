@@ -350,6 +350,7 @@ mod tests {
             has_vision: false,
             has_pooling: false,
             file_type: Some(38),
+                                base_model_repo: None,
         }
         .expert_bytes(file_bytes, None);
 

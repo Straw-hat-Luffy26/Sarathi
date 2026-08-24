@@ -48,11 +48,3 @@ export interface ModelProfile {
   updatedAt: string;
 }
 
-export interface AdapterRouteResult {
-  intent: string;
-  targetCapability: string;
-  selectedAdapterName?: string;
-  adapterFilePath?: string;
-  isAutoRouted: boolean;
-  reasoning: string;
-}

@@ -25,6 +25,7 @@
 pub mod assign;
 pub mod classifier;
 pub mod eval;
+pub mod intent;
 pub mod policy;
 pub mod profile;
 pub mod resolver;
@@ -39,6 +40,7 @@ use crate::ai_engine::traits::{ChatMessage, GenerationParams};
 
 pub use assign::{AssignmentConfidence, CapabilityAssignment};
 pub use classifier::{ClassificationResult, IntentClassifier};
+pub use intent::PromptIntent;
 pub use policy::{CapabilityTracker, SwitchDecision, SwitchPolicy, GENERAL};
 pub use profile::{CapabilityBackend, CapabilitySpec, SamplingOverrides, DEFAULT_LORA_SCALE};
 pub use resolver::{CapabilityResolution, CapabilityResolver};

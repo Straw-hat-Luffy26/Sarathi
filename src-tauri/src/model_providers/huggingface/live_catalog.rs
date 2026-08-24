@@ -21,8 +21,10 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
+use crate::model_providers::huggingface::brands;
 use crate::model_providers::huggingface::discovery::{
-    detail_url, estimate_architecture, family_name, search_url, GgufRepo, RawModelInfo,
+    detail_url, estimate_architecture, family_name, org_search_url, search_url, GgufRepo,
+    RawModelInfo,
 };
 use crate::model_recommendation::traits::{ModelArchitecture, ModelMetadata};
 
@@ -130,10 +132,35 @@ pub async fn search_repos(
     page: u32,
     token: Option<&str>,
 ) -> Result<Vec<String>> {
-    let client = client(token)?;
-    let url = search_url(query, limit, page);
+    ids_from_search(&search_url(query, limit, page), token, MIN_DOWNLOADS).await
+}
 
-    let resp = client.get(&url).send().await?;
+/// Lists the GGUF repositories one publisher owns.
+///
+/// Unlike [`search_repos`], `org` is matched exactly against the owner half of
+/// the repo id, so this returns what NVIDIA *published* rather than what merely
+/// mentions NVIDIA. The slug must already be cased as the Hub stores it; see
+/// [`org_search_url`].
+///
+/// The download floor is not applied here. It exists to keep abandoned personal
+/// uploads out of a popularity sweep, and a first-party release is not that: a
+/// model NVIDIA published last week has few downloads *because it is new*, and
+/// dropping it is precisely the failure someone searching "nvidia" would notice.
+/// Naming the publisher is the quality signal the floor was standing in for.
+pub async fn search_org_repos(
+    org: &str,
+    limit: u32,
+    page: u32,
+    token: Option<&str>,
+) -> Result<Vec<String>> {
+    ids_from_search(&org_search_url(org, limit, page), token, 0).await
+}
+
+/// Runs one search request and returns the repo ids it yielded.
+async fn ids_from_search(url: &str, token: Option<&str>, min_downloads: u64) -> Result<Vec<String>> {
+    let client = client(token)?;
+
+    let resp = client.get(url).send().await?;
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(RateLimited { had_token: token.is_some() }.into());
@@ -145,7 +172,7 @@ pub async fn search_repos(
     let raw: Vec<RawModelInfo> = resp.json().await?;
     Ok(raw
         .into_iter()
-        .filter(|r| r.downloads >= MIN_DOWNLOADS)
+        .filter(|r| r.downloads >= min_downloads)
         .map(|r| r.id)
         .collect())
 }
@@ -269,6 +296,41 @@ pub struct AdapterListing {
     pub gguf_ready: bool,
     /// Short description derived from the repo name, e.g. `text to sql`.
     pub focus: String,
+    /// Bytes the adapter's own weight file occupies, when the Hub reports it.
+    ///
+    /// Only the weight file, not the repository: an adapter repo also carries a
+    /// config, a README and often a tokenizer copy, none of which is downloaded.
+    /// Summing the repository would overstate what installing costs.
+    ///
+    /// `0` means the Hub did not report a size. Shown as unknown rather than as
+    /// zero, so a total never quietly understates itself.
+    #[serde(default)]
+    pub size_bytes: u64,
+    /// Capability slot this adapter fills, when its metadata says.
+    ///
+    /// Read the same way the details panel reads it — the author's tags first,
+    /// the repository name only as a fallback — so the grouping shown here and
+    /// the slot it lands in after install cannot disagree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability: Option<String>,
+    /// `stated` when the author's tags said so, `suggested` when it was read out
+    /// of the name. Absent when neither settled it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_confidence: Option<String>,
+    /// Whether Sarathi can actually install this against the current base model.
+    ///
+    /// Defaults to `true` so a listing cached before this existed keeps working;
+    /// the judgement is recomputed on every read anyway.
+    #[serde(default = "yes")]
+    pub installable: bool,
+    /// Why it cannot be installed, in the user's words. `None` when it can.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+}
+
+/// Serde default for [`AdapterListing::installable`].
+fn yes() -> bool {
+    true
 }
 
 /// Finds LoRA adapters published for a given base model.
@@ -302,7 +364,35 @@ pub async fn find_adapters(
     }
 
     let raw: Vec<RawModelInfo> = resp.json().await?;
-    Ok(raw.into_iter().map(to_adapter_listing).collect())
+
+    // Carrying the `base_model:adapter:` tag is a claim, not evidence.
+    //
+    // Repositories publishing merged fine-tunes keep that tag, and marking them
+    // `gguf_ready: false` was not enough — they still appeared as adapters the
+    // user could try to install, and the failure only surfaced after the
+    // download had been started. Dropping them here means the list never offers
+    // something that cannot be an adapter.
+    Ok(raw
+        .into_iter()
+        .filter(|r| {
+            let files: Vec<(String, u64)> = r
+                .siblings
+                .iter()
+                .map(|s| (s.rfilename.clone(), s.size.unwrap_or(0)))
+                .collect();
+
+            let kind = crate::adapter_manager::store::classify_repo_files(&files);
+            if kind == crate::adapter_manager::store::RepoKind::FullModel {
+                log::debug!(
+                    "[ADAPTERS] '{}' claims to be an adapter but ships model weights — not listed",
+                    r.id
+                );
+                return false;
+            }
+            true
+        })
+        .map(to_adapter_listing)
+        .collect())
 }
 
 fn to_adapter_listing(raw: RawModelInfo) -> AdapterListing {
@@ -320,6 +410,26 @@ fn to_adapter_listing(raw: RawModelInfo) -> AdapterListing {
     // cannot disagree about what is loadable.
     let filenames: Vec<String> = raw.siblings.iter().map(|s| s.rfilename.clone()).collect();
     let gguf_ready = crate::adapter_manager::store::check_installable(&filenames).is_ok();
+
+    // What installing actually downloads: the GGUF when one is loadable as it
+    // stands, otherwise the PEFT weights that will be converted. Anything else
+    // in the repository stays on the Hub.
+    let wanted = crate::adapter_manager::store::check_installable(&filenames)
+        .ok()
+        .or_else(|| {
+            filenames
+                .iter()
+                .find(|f| f.ends_with("adapter_model.safetensors"))
+                .cloned()
+        });
+    let size_bytes = wanted
+        .and_then(|name| {
+            raw.siblings
+                .iter()
+                .find(|s| s.rfilename == name)
+                .and_then(|s| s.size)
+        })
+        .unwrap_or(0);
 
     let short = raw.id.split('/').next_back().unwrap_or(&raw.id);
     let name = short.replace(['-', '_'], " ");
@@ -341,7 +451,20 @@ fn to_adapter_listing(raw: RawModelInfo) -> AdapterListing {
         if cleaned.is_empty() { name.clone() } else { cleaned.to_string() }
     };
 
+    // The author's tags outrank the repository name, which is the same order
+    // `capability/assign.rs` uses when the adapter is installed.
+    let assignment = crate::capability::assign::infer(&raw.id, &raw.tags);
+
     AdapterListing {
+        size_bytes,
+        capability: assignment.as_ref().map(|a| a.capability.clone()),
+        capability_confidence: assignment
+            .as_ref()
+            .map(|a| a.confidence.as_str().to_string()),
+        // Judged against the base model by `adapter_discovery`, which is the only
+        // caller that knows which model the question is being asked about.
+        installable: true,
+        blocked_reason: None,
         repo_id: raw.id,
         name,
         author,
@@ -427,6 +550,45 @@ pub fn to_model_metadata(repo: &GgufRepo) -> Option<ModelMetadata> {
 /// `pages` controls breadth: each page is up to 100 repositories, so 5 pages
 /// sweeps roughly 500 candidates — versus the 16 hardcoded entries this
 /// replaces.
+/// Families the popularity sweep does not reliably reach.
+///
+/// The main sweep is `filter=gguf&sort=downloads`, which returns whatever is
+/// most downloaded overall. That misses two cases:
+///
+/// - Labs that publish **safetensors only**, whose GGUF builds exist solely
+///   under quantizers' accounts. `author=deepseek-ai&filter=gguf` and
+///   `author=moonshotai&filter=gguf` both return nothing, so seeding by
+///   organisation would find neither — the conversions live at
+///   `unsloth/DeepSeek-V3.2-GGUF` and `unsloth/Kimi-K2-Instruct-GGUF`.
+/// - Labs whose most-downloaded GGUFs are a different modality: `nvidia`'s top
+///   GGUF results are speech models, so its text models never surface.
+///
+/// These are therefore *name* seeds, not organisation seeds, and nothing here
+/// names a specific repository — whatever the Hub actually returns is what gets
+/// listed. Each result still goes through the same `to_model_metadata`
+/// conversion and the same compatibility and format checks as the main sweep,
+/// so seeding widens what is *considered*, never what is *vouched for*.
+pub const SEED_QUERIES: &[&str] = &[
+    "DeepSeek",
+    "Kimi",
+    "Nemotron",
+    "GLM",
+    "MiniMax",
+];
+
+/// Drops repeated ids, keeping the position of the first occurrence.
+///
+/// The org sweep and the free-text search overlap whenever a publisher's own
+/// build also matches the typed word, which for `Qwen/Qwen3-8B-GGUF` on a
+/// search for "qwen" is always. Keeping the *first* occurrence is what makes
+/// the org sweep worth running: it ran first, so the official copy holds the
+/// place it earned there instead of falling back to wherever download-ordered
+/// text search happened to put it.
+fn dedupe_preserving_order(ids: &mut Vec<String>) {
+    let mut seen = std::collections::HashSet::new();
+    ids.retain(|id| seen.insert(id.clone()));
+}
+
 pub async fn discover(
     query: Option<&str>,
     pages: u32,
@@ -476,6 +638,40 @@ pub async fn discover_repos_reporting(
     let mut repo_ids = Vec::new();
     let total_pages = pages.max(1);
 
+    // A query that names a publisher gets that publisher's shelf first.
+    //
+    // The Hub's `search=` is a substring match ordered by downloads, so "nvidia"
+    // leads with `nvidia/parakeet-ctc-1.1b` — a speech recogniser — and the
+    // Nemotron builds someone actually wanted are further down, if they made the
+    // page at all. Asking `author=nvidia` separately puts the official releases
+    // at the front of the candidate list, where the front end's relevance
+    // ordering keeps them.
+    //
+    // This runs *in addition to* the free-text search, never instead of it.
+    // DeepSeek, Meta, and Moonshot publish no GGUF themselves, so their org
+    // query is legitimately empty and the community conversions found by
+    // free text are the entire answer. Replacing one with the other would
+    // report that DeepSeek has no models.
+    let brand = query.and_then(brands::resolve);
+    if let Some(brand) = brand {
+        for org in brand.orgs {
+            match search_org_repos(org, 100, 0, token).await {
+                Ok(ids) => {
+                    log::info!(
+                        "[HF_CATALOG] '{}' resolved to {} — {} repositories published by {org}",
+                        query.unwrap_or_default(),
+                        brand.label,
+                        ids.len()
+                    );
+                    repo_ids.extend(ids);
+                }
+                // An org sweep is an enrichment, not the answer. Losing it costs
+                // ranking; failing the search would cost the results themselves.
+                Err(e) => log::warn!("[HF_CATALOG] Org sweep for {org} failed, skipping: {e}"),
+            }
+        }
+    }
+
     for page in 0..total_pages {
         if let Some(report) = progress {
             report(SweepProgress::Searching {
@@ -488,13 +684,18 @@ pub async fn discover_repos_reporting(
         match search_repos(query, 100, page, token).await {
             Ok(ids) if ids.is_empty() => break, // no more results
             Ok(ids) => repo_ids.extend(ids),
-            Err(e) if page == 0 => return Err(e), // first page failing is fatal
+            // The first page failing is fatal — unless the org sweep already
+            // found the brand's models, in which case there is a real answer to
+            // return and erroring would throw it away.
+            Err(e) if page == 0 && repo_ids.is_empty() => return Err(e),
             Err(e) => {
                 log::warn!("[HF_CATALOG] Page {page} failed, continuing with what we have: {e}");
                 break;
             }
         }
     }
+
+    dedupe_preserving_order(&mut repo_ids);
 
     log::info!("[HF_CATALOG] {} candidate repositories found", repo_ids.len());
 
@@ -505,6 +706,47 @@ pub async fn discover_repos_reporting(
 mod tests {
     use super::*;
     use crate::model_providers::huggingface::discovery::{GgufMeta, Quantization};
+
+    fn ids(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_official_copy_keeps_the_place_the_org_sweep_gave_it() {
+        // How a search for "qwen" arrives: the org sweep first, then the
+        // download-ordered text search, which repeats the same repository far
+        // down its own list behind more popular third-party conversions.
+        let mut merged = ids(&[
+            "Qwen/Qwen3-8B-GGUF",
+            "Qwen/Qwen3-4B-GGUF",
+            "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+            "bartowski/Qwen3-8B-GGUF",
+            "Qwen/Qwen3-8B-GGUF",
+        ]);
+        dedupe_preserving_order(&mut merged);
+
+        assert_eq!(
+            merged,
+            ids(&[
+                "Qwen/Qwen3-8B-GGUF",
+                "Qwen/Qwen3-4B-GGUF",
+                "unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF",
+                "bartowski/Qwen3-8B-GGUF",
+            ]),
+            "the duplicate must collapse into the earlier position, not the later one"
+        );
+    }
+
+    #[test]
+    fn deduping_leaves_a_list_without_repeats_alone() {
+        let mut only_search = ids(&["a/one-GGUF", "b/two-GGUF"]);
+        dedupe_preserving_order(&mut only_search);
+        assert_eq!(only_search, ids(&["a/one-GGUF", "b/two-GGUF"]));
+
+        let mut empty: Vec<String> = Vec::new();
+        dedupe_preserving_order(&mut empty);
+        assert!(empty.is_empty());
+    }
 
     fn repo(params: u64, arch: &str, id: &str) -> GgufRepo {
         GgufRepo {

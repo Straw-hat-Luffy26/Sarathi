@@ -21,7 +21,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::capability::classifier::ClassificationResult;
-use crate::model_intelligence::intent::PromptIntent;
+use crate::capability::intent::PromptIntent;
 
 /// The capability key meaning "no specialization".
 pub const GENERAL: &str = "general";

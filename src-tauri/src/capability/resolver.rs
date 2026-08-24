@@ -236,8 +236,11 @@ mod tests {
                 file_path: "base/model.gguf".to_string(),
                 size_bytes: 1,
                 checksum: None,
+                upstream_model_id: None,
             },
             adapters,
+            installed_adapters: std::collections::HashMap::new(),
+            capability_defaults: std::collections::HashMap::new(),
             created_at: String::new(),
             updated_at: String::new(),
         }
