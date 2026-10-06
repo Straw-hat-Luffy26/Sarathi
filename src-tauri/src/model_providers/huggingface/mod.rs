@@ -14,6 +14,8 @@ pub mod curation;
 pub mod moe_fit;
 pub mod moe_geometry;
 pub mod probe;
+pub mod runtime_arch;
+pub mod use_case;
 
 use crate::model_providers::provider::{ModelProvider, ProviderType};
 

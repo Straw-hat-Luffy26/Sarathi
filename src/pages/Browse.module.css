@@ -1091,6 +1091,30 @@
   text-transform: capitalize;
 }
 
+/* What an adapter is for. A filled chip when the metadata says; a dashed one
+ * for "Not stated", so an unknown never looks like an answer. */
+.useCase,
+.useCaseUnknown {
+  display: inline-block;
+  max-width: 100%;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  cursor: help;
+}
+
+.useCase {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.useCaseUnknown {
+  border: 1px dashed var(--border-default);
+  color: var(--text-tertiary);
+}
+
 /* Ready to load as-is versus needing conversion first — the practical
  * difference between "this works" and "this silently fails to load". */
 .ready {

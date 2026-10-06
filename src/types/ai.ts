@@ -363,6 +363,12 @@ export interface CapabilityPayload {
   badge: string;
   backend: CapabilityBackend;
   confidence: number;
+  /**
+   * Which classifier decided the turn: `laya` (calibrated probability from the
+   * Laya sidecar) or `lexical` (keyword weights, used when Laya is off, not
+   * installed, or did not answer in time).
+   */
+  classifier: 'laya' | 'lexical';
   switched: boolean;
   /** Why this capability is active (classification / hysteresis / override). */
   reason: string;

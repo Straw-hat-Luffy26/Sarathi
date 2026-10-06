@@ -179,7 +179,15 @@ impl CapabilityTracker {
         }
 
         // 4. A confident, different verdict crosses the upper threshold.
-        if confidence >= self.policy.enter_threshold {
+        //
+        //    General is not a specialization to enter; it is the absence of
+        //    one, reached only by step 5's release. Laya reports a calibrated
+        //    probability for "general" too, so without this a confident
+        //    "thanks!" between two coding turns would unbind the adapter and
+        //    rebind it a turn later — the thrashing this policy exists to stop.
+        if confidence >= self.policy.enter_threshold
+            && classification.intent != PromptIntent::GeneralChat
+        {
             return self.commit(
                 candidate,
                 format!(
@@ -388,6 +396,29 @@ mod tests {
             "hysteresis should suppress most switches in an alternating conversation, saw {}",
             switches
         );
+    }
+
+    fn verdict(intent: PromptIntent, confidence: f32) -> ClassificationResult {
+        ClassificationResult { intent, confidence, raw_score: confidence, runner_up: None }
+    }
+
+    /// Laya gives "general" a real probability, unlike the keyword classifier.
+    /// A confident small-talk turn must not unbind an adapter on its own.
+    #[test]
+    fn a_confident_general_turn_does_not_drop_the_adapter_at_once() {
+        let mut t = tracker();
+        t.decide(&verdict(PromptIntent::Coding, 0.9), None);
+        assert_eq!(t.active_capability(), "coding");
+
+        let d = t.decide(&verdict(PromptIntent::GeneralChat, 0.97), None);
+        assert!(!d.is_switch(), "one 'thanks!' must not release coding: {d:?}");
+        assert_eq!(t.active_capability(), "coding");
+
+        // Sustained general conversation still releases it, as before.
+        t.decide(&verdict(PromptIntent::GeneralChat, 0.97), None);
+        let released = t.decide(&verdict(PromptIntent::GeneralChat, 0.97), None);
+        assert!(released.is_switch());
+        assert_eq!(t.active_capability(), GENERAL);
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub mod assign;
 pub mod classifier;
 pub mod eval;
 pub mod intent;
+pub mod laya;
 pub mod policy;
 pub mod profile;
 pub mod resolver;
@@ -48,6 +49,8 @@ pub use resolver::{CapabilityResolution, CapabilityResolver};
 /// Everything decided for a single turn.
 pub struct CapabilityTurn {
     pub classification: ClassificationResult,
+    /// Which classifier produced `classification`: `laya` or `lexical`.
+    pub classifier: &'static str,
     pub decision: SwitchDecision,
     pub resolution: CapabilityResolution,
 }
@@ -65,6 +68,7 @@ impl CapabilityTurn {
             badge: self.resolution.badge(),
             backend: self.resolution.backend.label().to_string(),
             confidence: self.classification.confidence,
+            classifier: self.classifier.to_string(),
             switched: self.decision.is_switch(),
             reason: self.decision.reason().to_string(),
             backend_reason: self.resolution.backend_reason.clone(),
@@ -93,6 +97,9 @@ pub struct CapabilityPayload {
     /// `base` | `prompt-profile` | `lora`.
     pub backend: String,
     pub confidence: f32,
+    /// `laya` when Laya's calibrated probability decided the turn, `lexical`
+    /// when the keyword classifier did (Laya off, not installed, or late).
+    pub classifier: String,
     pub switched: bool,
     pub reason: String,
     pub backend_reason: String,
@@ -142,7 +149,16 @@ impl CapabilityLayer {
         manifest: &ModelPackageManifest,
         manual_override: Option<&str>,
     ) -> CapabilityTurn {
-        let classification = IntentClassifier::classify(prompt);
+        // A pinned capability never consults a classifier, so Laya is not
+        // asked for a verdict that would be thrown away.
+        let pinned = manual_override
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("none"));
+        let (classification, classifier) = if pinned {
+            (IntentClassifier::classify(prompt), "lexical")
+        } else {
+            classify(prompt)
+        };
 
         let decision = {
             // A poisoned lock must not take inference down; recover the tracker.
@@ -157,9 +173,10 @@ impl CapabilityLayer {
             CapabilityResolver::resolve(decision.resulting_capability(), package_dir, manifest);
 
         log::info!(
-            "[CAPABILITY] intent={:?} confidence={:.2} -> capability='{}' backend={} ({})",
+            "[CAPABILITY] intent={:?} confidence={:.2} via {} -> capability='{}' backend={} ({})",
             classification.intent,
             classification.confidence,
+            classifier,
             resolution.capability,
             resolution.backend.label(),
             decision.reason()
@@ -167,10 +184,20 @@ impl CapabilityLayer {
 
         CapabilityTurn {
             classification,
+            classifier,
             decision,
             resolution,
         }
     }
+}
+
+/// Laya's calibrated verdict when it is ready and answers in time, otherwise
+/// the keyword classifier's.
+fn classify(prompt: &str) -> (ClassificationResult, &'static str) {
+    if let Some(verdict) = laya::global().and_then(|router| router.classify(prompt)) {
+        return (verdict, "laya");
+    }
+    (IntentClassifier::classify(prompt), "lexical")
 }
 
 impl Default for CapabilityLayer {

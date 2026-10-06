@@ -55,6 +55,12 @@ impl HuggingFaceCatalogProvider {
         if cached.models.is_empty() || cached.timestamp < min_timestamp {
             return None;
         }
+        // Before the empty-sweep check in `query_hf_api`, a rate-limited sweep
+        // stored the bootstrap list alone as if it were live. A cache holding
+        // no live record is that, and serving it for a day is the bug.
+        if !cached.models.iter().any(|m| m.catalog_version.starts_with("live")) {
+            return None;
+        }
         Some(cached.models)
     }
 
@@ -96,7 +102,24 @@ impl HuggingFaceCatalogProvider {
             return models;
         }
 
-        // 4. Fetch live catalog from Hugging Face Hub API
+        // 4. Reuse the library the model browser already swept.
+        //
+        // Both this and the browser used to run their own full sweep on
+        // launch, concurrently and under separate locks. Together they asked
+        // the Hub for roughly twice its five-minute allowance, so whichever ran
+        // second was rate-limited into an empty result — and every search the
+        // user made for the next five minutes failed the same way.
+        if !force_refresh {
+            if let Some(models) = Self::from_stored_library(app_data_dir) {
+                log::info!(
+                    "[HF_CATALOG] Using {} models from the stored model library",
+                    models.len()
+                );
+                return models;
+            }
+        }
+
+        // 5. Fetch live catalog from Hugging Face Hub API
         log::info!("[HF_CATALOG] Querying live Hugging Face Hub API for GGUF model repositories...");
         match Self::query_hf_api(Self::resolve_token().as_deref()).await {
             Ok(live_models) if !live_models.is_empty() => {
@@ -132,6 +155,42 @@ impl HuggingFaceCatalogProvider {
                 bootstrap_models()
             }
         }
+    }
+
+    /// Engine records from the model browser's stored library, when it holds a
+    /// usable one.
+    ///
+    /// The library is the same Hub data this provider would sweep for — every
+    /// repository with its GGUF metadata — so converting it costs a file read
+    /// instead of up to two thousand requests. Past `USABLE_FOR` it is refused
+    /// for the same reason the browser refuses to show it.
+    fn from_stored_library(app_data_dir: &Path) -> Option<Vec<ModelMetadata>> {
+        use crate::model_providers::huggingface::catalog_cache;
+
+        let stored = catalog_cache::load(app_data_dir)?;
+        let usable = stored
+            .age_at(chrono::Utc::now())
+            .is_some_and(|age| age < catalog_cache::USABLE_FOR);
+        if !usable {
+            return None;
+        }
+
+        let mut models: Vec<ModelMetadata> = stored
+            .repos
+            .iter()
+            .filter(|r| !r.is_lora_adapter)
+            .filter_map(live_catalog::to_model_metadata)
+            .collect();
+        if models.is_empty() {
+            return None;
+        }
+
+        for b_model in bootstrap_models() {
+            if !models.iter().any(|m| m.id == b_model.id) {
+                models.push(b_model);
+            }
+        }
+        Some(models)
     }
 
     /// Resolves an optional HuggingFace token from the environment.
@@ -172,6 +231,16 @@ impl HuggingFaceCatalogProvider {
         }
 
         let mut discovered = live_catalog::discover(None, pages, token).await?;
+
+        // A sweep that resolved nothing did not succeed, however it returned.
+        // Padding it with the bootstrap list below and storing the result made
+        // a rate-limited sweep look like a fresh live catalog of 16 models, and
+        // served it for a day.
+        if discovered.is_empty() {
+            return Err(anyhow::anyhow!(
+                "the live sweep resolved no models (most often a HuggingFace rate limit)"
+            ));
+        }
 
         // Keep the curated families as a floor. They carry hand-verified
         // architecture details, and guarantee a usable catalog if the Hub is
@@ -548,11 +617,44 @@ mod tests {
         let models = HuggingFaceCatalogProvider::fetch_catalog(&temp_dir, true).await;
         assert!(!models.is_empty(), "Live catalog discovery or fallback must return model metadata");
         let cache_file = temp_dir.join("hf_catalog_cache.json");
+
+        // Offline or rate-limited, the sweep resolves nothing and the bootstrap
+        // list is served — and must *not* be stored as a live catalog, which is
+        // what used to pin a machine to 16 models for a day.
+        if !models.iter().any(|m| m.catalog_version.starts_with("live")) {
+            assert!(!cache_file.exists(), "a bootstrap-only result must not be cached as live");
+            let _ = fs::remove_dir_all(temp_dir);
+            return;
+        }
         assert!(cache_file.exists(), "Catalog metadata must be cached locally to disk");
 
         let cached_models = HuggingFaceCatalogProvider::fetch_catalog(&temp_dir, false).await;
         assert_eq!(models.len(), cached_models.len(), "Subsequent calls must return cached models");
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    /// The cache found on a real machine: 16 bootstrap records stored as a
+    /// fresh "live" catalog after a sweep that resolved nothing.
+    #[test]
+    fn a_cache_with_no_live_record_is_not_served() {
+        let dir = std::env::temp_dir().join(format!("sarathi_cat_bootstrap_{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hf_catalog_cache.json");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let bootstrap_only = CatalogCache { timestamp: now, models: bootstrap_models() };
+        fs::write(&file, serde_json::to_string(&bootstrap_only).unwrap()).unwrap();
+        assert!(HuggingFaceCatalogProvider::read_cache(&file, 0).is_none());
+
+        let mut models = bootstrap_models();
+        models[0].catalog_version = "live_hf_v2".into();
+        fs::write(&file, serde_json::to_string(&CatalogCache { timestamp: now, models }).unwrap()).unwrap();
+        assert!(HuggingFaceCatalogProvider::read_cache(&file, 0).is_some());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

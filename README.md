@@ -77,11 +77,11 @@ is partial or not yet wired everywhere. ❌ means it is designed but not built.
 | :--- | :---: | :--- |
 | **Hardware profiler** — reads your real GPU, VRAM, RAM and OS | ✅ | Windows WMI/CIM, DirectX 12 (DXGI) and Vulkan. Separates dedicated VRAM from shared memory. |
 | **Model catalog matched to your PC** — sorts models into Recommended / Compatible / May Run | ✅ | Live Hugging Face sweep, cached on disk. Sizing is computed from the real GGUF header, not the filename. |
-| **Resumable model downloads** | ✅ | HTTP Range resume for interrupted files; no zero-byte resets. |
+| **Resumable model downloads** | ✅ | HTTP Range resume for interrupted files; no zero-byte resets. Split models (`-00001-of-0000N`, including builds kept in per-quantization folders) download every shard, each SHA-256 verified, and appear on the shelf only once all are in place. |
 | **Runs the model on your GPU** — in-process GGUF inference | ✅ | `llama-cpp-2`. Layer offload decided at runtime from measured VRAM. |
 | **LoRA skill files: download + validation** | ✅ | Structural validation and a manifest registry, so a corrupt or non-LoRA file is refused before it is used. See [`24b9547`](#verified-claims--key-commits). |
 | **LoRA skill files: applied to the running model** | ✅ | Real `llama_adapter_lora_init` / `llama_set_adapters_lora` binding via [`lora_binding.rs`](src-tauri/src/ai_engine/lora_binding.rs), with an adapter cache. |
-| **Picking the right skill for a prompt** — intent classifier | ✅ | Weighted, confidence-scored classifier ([`capability/classifier.rs`](src-tauri/src/capability/classifier.rs)); won't switch skills on a single weak keyword. |
+| **Picking the right skill for a prompt** — intent classifier | ✅ | [Laya](https://github.com/NandhaKishorM/laya) decides each turn's capability slot (and so its LoRA adapter) with a calibrated probability ([`capability/laya.rs`](src-tauri/src/capability/laya.rs)), once `scripts/laya-setup.ps1` has installed it. Without it, the weighted keyword classifier ([`capability/classifier.rs`](src-tauri/src/capability/classifier.rs)) decides. Either way, the switch policy's hysteresis keeps one stray turn from rebinding the adapter. |
 | **Converting community PEFT adapters to loadable GGUF** | ✅ | [`src-tauri/src/lora/convert/`](src-tauri/src/lora/convert/). DoRA and non-LoRA adapters are refused early rather than half-converted. |
 | **Local server your coding agent connects to** | ✅ | OpenAI- **and** Anthropic-compatible endpoints on a loopback address. Tool calls are carried through to the chat template and parsed back out. |
 | **Launching coding agents from Sarathi** | ✅ | Each tool gets its own terminal window and its own startup screen showing what actually loaded. |

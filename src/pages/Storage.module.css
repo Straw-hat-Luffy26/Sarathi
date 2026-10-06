@@ -295,6 +295,28 @@
   overflow-wrap: anywhere;
 }
 
+/* What an adapter is for — matches the chip in Browse. Dashed when nothing
+ * said, so an unknown never looks like an answer. */
+.useCase,
+.useCaseUnknown {
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+  cursor: help;
+}
+
+.useCase {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.useCaseUnknown {
+  border: 1px dashed var(--border-default);
+  color: var(--text-tertiary);
+}
+
 .muted {
   color: var(--text-tertiary);
   font-size: var(--text-xs);

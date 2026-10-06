@@ -81,7 +81,7 @@ if ($model) {
 # 4. The gateway should be unaffected by any of this.
 Write-Host "`nGateway still serving"
 try {
-    $h = Invoke-RestMethod -Uri 'http://127.0.0.1:11435/health' -TimeoutSec 8
+    $h = Invoke-RestMethod -Uri 'http://127.0.0.1:11535/health' -TimeoutSec 8
     Check "gateway healthy with a model loaded" ($h.modelLoaded -eq $true) "modelLoaded=$($h.modelLoaded)"
 } catch {
     Check "gateway healthy" $false "is the app running? $($_.Exception.Message)"

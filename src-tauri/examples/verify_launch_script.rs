@@ -15,7 +15,7 @@ use sarathi_lib::launcher::spec::{builtin_tools, resolve_args, LaunchContext, Ru
 
 fn main() {
     let ctx = LaunchContext {
-        port: 11435,
+        port: 11535,
         model_id: "unsloth/gpt-oss-20b-GGUF".into(),
         model_name: "gpt-oss 20B".into(),
         client_dir: r"C:\Users\lenovo\AppData\Roaming\com.sarathi.app\clients\claude-code".into(),

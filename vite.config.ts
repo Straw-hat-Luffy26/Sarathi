@@ -13,15 +13,19 @@ export default defineConfig(async () => ({
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
   // 2. tauri expects a fixed port, fail if that port is not available
+  //
+  // Not the Tauri template's 1420: ARJUN uses 1420/1421, and with both dev
+  // servers on one port Sarathi's window would load ARJUN's frontend. Keep this
+  // in step with `devUrl` in src-tauri/tauri.conf.json.
   server: {
-    port: 1420,
+    port: 1430,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 1421,
+          port: 1431,
         }
       : undefined,
     watch: {

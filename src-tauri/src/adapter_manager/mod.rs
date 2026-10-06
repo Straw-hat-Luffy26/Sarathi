@@ -91,6 +91,11 @@ pub const SOURCE_USER: &str = "user";
 /// Written by the automatic capability sweep during a model download.
 pub const SOURCE_AUTO_DISCOVERY: &str = "auto-discovery";
 
+/// An empty file in an adapter's directory meaning the user set it to "Not
+/// used". Automatic sorting skips any adapter carrying it; choosing a slot by
+/// hand removes it.
+pub const USER_UNASSIGNED_MARKER: &str = "unassigned-by-user";
+
 /// Below this, a "weight file" is a stub, an error page, or a truncated download
 /// rather than a real adapter.
 const MIN_ADAPTER_WEIGHT_BYTES: u64 = 100_000;
@@ -156,6 +161,8 @@ impl AdapterRegistry {
     }
 
     /// Brings a manifest written before the inventory existed up to date.
+    ///
+    /// Idempotent: a manifest already in inventory form is left alone.
     ///
     /// Older manifests hold only `adapters`, keyed by capability — one adapter
     /// per capability, because that was the only shape available. Each becomes
@@ -501,6 +508,72 @@ impl AdapterRegistry {
         Self::persist(package_dir, &final_manifest)
     }
 
+    /// Sorts the adapters the startup scan could not, once Laya is running.
+    ///
+    /// The startup scan runs offline and before Laya has loaded, so an adapter
+    /// whose name says nothing legible is left unsorted there. This waits for
+    /// Laya, then gives each such adapter its model card and Laya's judgement.
+    /// Returns at once when Laya is off or not installed. Blocking: run it on
+    /// its own thread.
+    pub fn assign_unsorted_when_laya_ready(app_data_dir: &Path) {
+        use crate::capability::laya::{self, LayaStatus};
+
+        let Some(router) = laya::global() else { return };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(600);
+        loop {
+            match router.status() {
+                LayaStatus::Ready { .. } => break,
+                LayaStatus::Starting if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
+                _ => return,
+            }
+        }
+
+        let models_base = app_data_dir.join("models");
+        let token = crate::config::hf_token::get();
+        let mut sorted = 0usize;
+        for package_dir in Self::installed_package_dirs(&models_base) {
+            let Ok(mut manifest) = Self::read_manifest(&package_dir) else { continue };
+            let Ok(dirs) = fs::read_dir(package_dir.join("adapters")) else { continue };
+
+            let mut changed = false;
+            for entry in dirs.flatten() {
+                // Only adapters the startup scan left unsorted. One that already
+                // holds a slot is the startup scan's business, and counting it
+                // here would report sorting that never happened.
+                let prefix = format!("adapters/{}/", entry.file_name().to_string_lossy());
+                let sorted_already = manifest
+                    .installed_adapters
+                    .values()
+                    .chain(manifest.adapters.values())
+                    .any(|a| a.adapter_file.as_deref().is_some_and(|f| f.starts_with(&prefix)));
+                if sorted_already {
+                    continue;
+                }
+
+                let infer = |repo_id: &str| {
+                    let card = crate::model_providers::huggingface::use_case::fetch_card_blocking(
+                        repo_id,
+                        token.as_deref(),
+                    );
+                    crate::capability::assign::infer_with_laya(repo_id, &[], card.as_deref())
+                };
+                if Self::register_adapter_dir_with(&entry.path(), &mut manifest, &infer) {
+                    changed = true;
+                    sorted += 1;
+                }
+            }
+            if changed {
+                manifest.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = Self::write_manifest(&package_dir, &manifest);
+            }
+        }
+        if sorted > 0 {
+            log::info!("[STARTUP_SCAN] Laya sorted {sorted} more adapter(s) by what they are for");
+        }
+    }
+
     /// Startup Scan: Scans all local packages, validates adapter files on disk, updates registry, manifest.json & profile.json.
     /// Zero remote calls. Ensures UI and backend are immediately 100% synchronized on boot.
     pub fn perform_startup_scan(app_data_dir: &Path) {
@@ -582,6 +655,18 @@ impl AdapterRegistry {
     ///
     /// Returns whether the manifest changed.
     fn register_adapter_dir(dir: &Path, manifest: &mut ModelPackageManifest) -> bool {
+        Self::register_adapter_dir_with(dir, manifest, &|repo_id| {
+            crate::capability::assign::infer(repo_id, &[])
+        })
+    }
+
+    /// [`Self::register_adapter_dir`], choosing a slot for an unsorted adapter
+    /// with `infer` — offline at startup, card and Laya once Laya is ready.
+    fn register_adapter_dir_with(
+        dir: &Path,
+        manifest: &mut ModelPackageManifest,
+        infer: &dyn Fn(&str) -> Option<crate::capability::CapabilityAssignment>,
+    ) -> bool {
         if !dir.is_dir() {
             return false;
         }
@@ -596,22 +681,42 @@ impl AdapterRegistry {
             None => return false,
         };
 
-        // The record already pointing into *this* directory, if there is one.
+        // The user set this adapter to "Not used". Sorting it again on the next
+        // launch would undo that choice, every launch, forever.
+        if dir.join(USER_UNASSIGNED_MARKER).exists() {
+            return false;
+        }
+
+        // Joining a slot another adapter holds is only safe against the
+        // inventory, where that adapter is recorded as the slot's default. An
+        // older manifest names it only in the active view.
+        Self::migrate_to_inventory(manifest);
+
+        // The record already pointing into *this* directory, if there is one —
+        // whether it is the slot's active adapter or one waiting behind it.
         //
         // Everything below hangs off the distinction between "refresh what this
         // adapter already holds" and "claim a slot for it": reading the target
         // slot blindly would copy another adapter's rank onto this one and
         // overwrite whichever adapter the user had put there.
         let prefix = format!("adapters/{}/", dir_name);
+        let points_here =
+            |a: &AdapterManifestInfo| a.adapter_file.as_deref().is_some_and(|f| f.starts_with(&prefix));
         let own = manifest
             .adapters
             .iter()
-            .find(|(_, a)| a.adapter_file.as_deref().map(|f| f.starts_with(&prefix)).unwrap_or(false))
-            .map(|(key, record)| (key.clone(), record.clone()));
+            .find(|(_, a)| points_here(a))
+            .or_else(|| {
+                manifest
+                    .installed_adapters
+                    .iter()
+                    .find(|(_, a)| points_here(a) && !a.capability.is_empty())
+            })
+            .map(|(_, record)| (record.capability.clone(), record.clone()));
 
         let (cap_key, inferred_confidence) = match &own {
             Some((key, _)) => (key.clone(), None),
-            None => match Self::claim_free_capability(&dir_name, dir, manifest) {
+            None => match Self::claim_capability(&dir_name, dir, manifest, infer) {
                 Some(found) => found,
                 None => return false,
             },
@@ -682,25 +787,25 @@ impl AdapterRegistry {
 
     /// Picks a capability for an adapter that does not already hold one.
     ///
-    /// Only a *free* slot is claimed. If another adapter already fills the
-    /// capability this one would land in, that adapter keeps it: a scan runs on
-    /// every launch, and one that could evict a binding would undo a user's
-    /// choice silently and repeatedly. The newcomer stays installed and
-    /// assignable by hand.
-    fn claim_free_capability(
+    /// The adapter joins its slot's inventory. If another adapter already fills
+    /// that capability, it keeps it — `register_installed` only makes an adapter
+    /// the default for a slot that has none — so a scan that runs on every
+    /// launch never evicts a binding or undoes a user's choice. The newcomer is
+    /// filed under its specialty, ready to be switched to, instead of sitting in
+    /// "Unsorted".
+    fn claim_capability(
         dir_name: &str,
         dir: &Path,
         manifest: &ModelPackageManifest,
+        infer: &dyn Fn(&str) -> Option<crate::capability::CapabilityAssignment>,
     ) -> Option<(String, Option<String>)> {
         // A directory named after a capability is self-describing — that is the
         // shape the discovery sweep writes. Anything else is a repository name,
-        // and offline there are no tags to consult, so the name is all there is:
-        // a hint, recorded as one.
+        // read for a skill word first and then for what it specialises in.
         let (key, confidence) = if crate::capability::assign::is_known_capability(dir_name) {
             (dir_name.to_string(), None)
         } else {
-            let inferred = Self::read_source_repo(dir)
-                .and_then(|repo_id| crate::capability::assign::infer(&repo_id, &[]));
+            let inferred = Self::read_source_repo(dir).and_then(|repo_id| infer(&repo_id));
 
             match inferred {
                 Some(a) => (a.capability, Some(a.confidence.as_str().to_string())),
@@ -717,19 +822,28 @@ impl AdapterRegistry {
             }
         };
 
-        let taken = manifest
-            .adapters
-            .get(&key)
-            .map(|a| a.adapter_file.is_some())
-            .unwrap_or(false);
-
-        if taken {
+        // The inventory is keyed by directory name. A record for some *other*
+        // directory under the same key — a pre-inventory record keyed by its
+        // capability, colliding with a sweep-written `adapters/<capability>/` —
+        // would be overwritten by joining, so that one adapter stays unsorted.
+        let prefix = format!("adapters/{dir_name}/");
+        let key_taken_by_another = manifest.installed_adapters.get(dir_name).is_some_and(|r| {
+            !r.adapter_file.as_deref().is_some_and(|f| f.starts_with(&prefix))
+        });
+        if key_taken_by_another {
             log::info!(
-                "[STARTUP_SCAN] '{}' suits '{}', which another adapter already fills — left unassigned",
+                "[STARTUP_SCAN] '{}' shares its inventory id with another adapter — left unassigned",
+                dir.display()
+            );
+            return None;
+        }
+
+        if manifest.adapters.get(&key).is_some_and(|a| a.adapter_file.is_some()) {
+            log::info!(
+                "[STARTUP_SCAN] '{}' suits '{}', which another adapter already uses — filed behind it",
                 dir.display(),
                 key
             );
-            return None;
         }
 
         Some((key, confidence))
@@ -925,6 +1039,113 @@ mod tests {
         assert_eq!(record.repo_id.as_deref(), Some("someone/sql-coder-lora"));
         // Inferred from the name alone, so it must not claim the author said so.
         assert_eq!(record.assignment_confidence.as_deref(), Some("suggested"));
+    }
+
+    /// The Storage screen's "Unsorted" adapters: no skill word in either name,
+    /// but each specialty settles a slot.
+    #[test]
+    fn a_specialty_files_an_adapter_whose_name_names_no_skill() {
+        let package = scratch("scan_specialty");
+        install_adapter(
+            &package,
+            "someone_drug-ade-relation-extractor",
+            "adapter.gguf",
+            Some("someone/qwen2.5-3b-instruct-qlora-drug-ade-relation-extractor"),
+        );
+        install_adapter(&package, "someone_elmo-rlvr-lora", "adapter.gguf", Some("someone/elmo-rlvr-lora"));
+
+        let mut manifest = base_manifest();
+        for dir in ["someone_drug-ade-relation-extractor", "someone_elmo-rlvr-lora"] {
+            assert!(AdapterRegistry::register_adapter_dir(&package.join("adapters").join(dir), &mut manifest));
+        }
+
+        let research = &manifest.installed_adapters["someone_drug-ade-relation-extractor"];
+        assert_eq!(research.capability, "research");
+        assert_eq!(research.assignment_confidence.as_deref(), Some("inferred"));
+        assert_eq!(manifest.installed_adapters["someone_elmo-rlvr-lora"].capability, "reasoning");
+    }
+
+    #[test]
+    fn not_used_is_remembered_across_scans() {
+        let package = scratch("scan_not_used");
+        install_adapter(&package, "someone_sql-coder-lora", "adapter.gguf", Some("someone/sql-coder-lora"));
+        fs::write(
+            package.join("adapters").join("someone_sql-coder-lora").join(USER_UNASSIGNED_MARKER),
+            b"",
+        )
+        .unwrap();
+
+        let mut manifest = base_manifest();
+        let changed = AdapterRegistry::register_adapter_dir(
+            &package.join("adapters").join("someone_sql-coder-lora"),
+            &mut manifest,
+        );
+        assert!(!changed, "the user said not to use it");
+        assert!(manifest.installed_adapters.is_empty());
+    }
+
+    #[test]
+    fn a_second_adapter_for_a_slot_is_filed_behind_the_first() {
+        let package = scratch("scan_join");
+        install_adapter(&package, "someone_sql-coder-lora", "adapter.gguf", Some("someone/sql-coder-lora"));
+        install_adapter(&package, "someone_python-coder-lora", "adapter.gguf", Some("someone/python-coder-lora"));
+
+        let mut manifest = base_manifest();
+        for dir in ["someone_sql-coder-lora", "someone_python-coder-lora"] {
+            assert!(AdapterRegistry::register_adapter_dir(&package.join("adapters").join(dir), &mut manifest));
+        }
+
+        assert_eq!(manifest.installed_adapters["someone_python-coder-lora"].capability, "coding");
+        assert_eq!(
+            manifest.capability_defaults.get("coding").map(String::as_str),
+            Some("someone_sql-coder-lora"),
+            "the first adapter keeps the slot; the second waits behind it"
+        );
+        assert_eq!(
+            manifest.adapters["coding"].adapter_file.as_deref(),
+            Some("adapters/someone_sql-coder-lora/adapter.gguf")
+        );
+    }
+
+    #[test]
+    fn a_hand_filed_adapter_behind_the_default_is_not_re_sorted() {
+        // Filed under research by hand, not the slot's default. A scan that only
+        // looked at active bindings would re-infer it into coding every launch.
+        let package = scratch("scan_keep_non_default");
+        install_adapter(&package, "someone_sql-coder-lora", "adapter.gguf", Some("someone/sql-coder-lora"));
+
+        let mut manifest = base_manifest();
+        manifest.installed_adapters.insert(
+            "someone_sql-coder-lora".to_string(),
+            AdapterManifestInfo {
+                capability: "research".to_string(),
+                status: "installed".to_string(),
+                adapter_file: Some("adapters/someone_sql-coder-lora/adapter.gguf".to_string()),
+                assignment_confidence: Some("manual".to_string()),
+                ..Default::default()
+            },
+        );
+        manifest.installed_adapters.insert(
+            "other".to_string(),
+            AdapterManifestInfo {
+                capability: "research".to_string(),
+                status: "installed".to_string(),
+                adapter_file: Some("adapters/other/adapter.gguf".to_string()),
+                ..Default::default()
+            },
+        );
+        manifest.capability_defaults.insert("research".to_string(), "other".to_string());
+        AdapterRegistry::rebuild_active_bindings(&mut manifest);
+
+        AdapterRegistry::register_adapter_dir(
+            &package.join("adapters").join("someone_sql-coder-lora"),
+            &mut manifest,
+        );
+
+        let record = &manifest.installed_adapters["someone_sql-coder-lora"];
+        assert_eq!(record.capability, "research", "the user's slot stands");
+        assert_eq!(record.assignment_confidence.as_deref(), Some("manual"));
+        assert!(!manifest.capability_defaults.contains_key("coding"));
     }
 
     #[test]

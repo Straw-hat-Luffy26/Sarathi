@@ -34,7 +34,12 @@ import {
   type Capability,
   type InstalledAdapter,
 } from '../services/adapters.service';
-import { formatSize, type AdapterPage } from '../services/catalog.service';
+import {
+  formatSize,
+  useCaseText,
+  useCaseTooltip,
+  type AdapterPage,
+} from '../services/catalog.service';
 import {
   GROUP_DESCRIPTIONS,
   GROUP_LABELS,
@@ -820,6 +825,18 @@ export const Storage: React.FC = () => {
                                         aria-label={`Select ${cand.name}`}
                                       />
                                       <span className={styles.adapterName}>{cand.name}</span>
+                                      {cand.useCase && (
+                                        <span
+                                          className={
+                                            cand.useCase.source === 'none'
+                                              ? styles.useCaseUnknown
+                                              : styles.useCase
+                                          }
+                                          title={useCaseTooltip(cand.useCase)}
+                                        >
+                                          {useCaseText(cand.useCase)}
+                                        </span>
+                                      )}
                                       <span className={styles.muted}>
                                         {cand.ggufReady ? 'ready' : 'converts on install'}
                                       </span>

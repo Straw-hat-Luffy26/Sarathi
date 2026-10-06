@@ -23,7 +23,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let app_data = PathBuf::from(args.next().expect("usage: <app-data-dir> <out-dir> [port]"));
     let out_dir = PathBuf::from(args.next().expect("usage: <app-data-dir> <out-dir> [port]"));
-    let port: u16 = args.next().map(|p| p.parse().expect("port")).unwrap_or(11435);
+    let port: u16 = args.next().map(|p| p.parse().expect("port")).unwrap_or(11535);
 
     let registry = mcp::load(&app_data);
     for w in &registry.warnings {

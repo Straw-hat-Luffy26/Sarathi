@@ -34,6 +34,11 @@ pub enum AssignmentConfidence {
     Stated,
     /// Read out of the repository name — a hint, not a statement.
     Suggested,
+    /// Matched from what the adapter specialises in — finance, drug safety,
+    /// RLVR training — rather than from a skill word in its tags or name.
+    Inferred,
+    /// Laya read the adapter's description and picked the slot.
+    Laya,
     /// The user chose it.
     Manual,
 }
@@ -44,6 +49,8 @@ impl AssignmentConfidence {
         match self {
             Self::Stated => "stated",
             Self::Suggested => "suggested",
+            Self::Inferred => "inferred",
+            Self::Laya => "laya",
             Self::Manual => "manual",
         }
     }
@@ -157,8 +164,57 @@ pub fn infer(repo_id: &str, tags: &[String]) -> Option<CapabilityAssignment> {
         });
     }
 
-    // 3. Nothing legible. Say so instead of inventing a slot.
-    None
+    // 3. What it specialises in. "Drug ADE relation extractor" names no skill,
+    //    but extraction from medical text is plainly a research-slot job.
+    by_use_case(repo_id, tags, None)
+}
+
+/// Step 3 of [`infer`], with a model card when one is in hand.
+fn by_use_case(repo_id: &str, tags: &[String], card: Option<&str>) -> Option<CapabilityAssignment> {
+    use crate::model_providers::huggingface::use_case;
+
+    let uc = use_case::from_metadata(repo_id, tags, card);
+    use_case::slot_for(&uc).map(|slot| CapabilityAssignment {
+        capability: slot.to_string(),
+        confidence: AssignmentConfidence::Inferred,
+    })
+}
+
+/// [`infer`], then the model card, then Laya — for when an adapter's tags and
+/// name say nothing a slot can be read from.
+///
+/// Blocking (Laya answers synchronously), so call it from a blocking context.
+/// Still returns `None` for an adapter whose specialty no slot serves —
+/// lyrics, roleplay — unless Laya is confident; filing those under a slot
+/// would only make them fire on the wrong prompts.
+pub fn infer_with_laya(repo_id: &str, tags: &[String], card: Option<&str>) -> Option<CapabilityAssignment> {
+    /// Laya's calibrated probability below which its slot is not used. Five
+    /// slots put chance at 0.2; this is twice that.
+    const MIN_CONFIDENCE: f32 = 0.4;
+
+    if let Some(found) = infer(repo_id, tags) {
+        return Some(found);
+    }
+    if let Some(found) = card.and_then(|c| by_use_case(repo_id, tags, Some(c))) {
+        return Some(found);
+    }
+
+    let summary = card.and_then(crate::model_providers::huggingface::use_case::first_sentence);
+    let name = repo_id.rsplit('/').next().unwrap_or(repo_id);
+    let text = match &summary {
+        Some(s) => format!("{name} — {s}"),
+        None => name.to_string(),
+    };
+    let slots: Vec<&str> = AdapterCapability::all().iter().map(|c| c.key()).collect();
+    let (slot, confidence) = crate::capability::laya::global()?.choose(
+        &text,
+        "Which kind of request should the LoRA adapter described in `request` be used for?",
+        &slots,
+    )?;
+    (confidence >= MIN_CONFIDENCE).then(|| CapabilityAssignment {
+        capability: slot,
+        confidence: AssignmentConfidence::Laya,
+    })
 }
 
 /// True when `capability` is a slot the runtime can actually route to.
@@ -244,6 +300,40 @@ mod tests {
         }
     }
 
+    /// The two adapters that sat in "Unsorted" on the Storage screen: neither
+    /// names a skill, but each one's specialty settles its slot.
+    #[test]
+    fn a_specialty_settles_the_slot_when_no_skill_word_does() {
+        let drug = infer("someone/qwen2.5-3b-instruct-qlora-drug-ade-relation-extractor", &[]).unwrap();
+        assert_eq!(drug.capability, "research");
+        assert_eq!(drug.confidence, AssignmentConfidence::Inferred);
+
+        let rlvr = infer("someone/elmo-rlvr-lora", &[]).unwrap();
+        assert_eq!(rlvr.capability, "reasoning");
+        assert_eq!(rlvr.confidence, AssignmentConfidence::Inferred);
+
+        let finance = infer("someone/my-tune", &tags(&["finance", "credit-analysis"])).unwrap();
+        assert_eq!(finance.capability, "research");
+    }
+
+    #[test]
+    fn a_specialty_with_no_routing_slot_is_not_misfiled() {
+        // Lyrics turns are routed as general chat; a research binding would
+        // only fire this adapter on the wrong prompts.
+        assert!(infer("someone/gemma-3-4b-nepali-lyrics-lora", &[]).is_none());
+        assert!(infer("someone/kitten-roleplay-lora", &[]).is_none());
+    }
+
+    #[test]
+    fn without_laya_the_extended_inference_is_the_plain_one() {
+        // Laya is not running in tests, so nothing new can be invented here.
+        assert!(infer_with_laya("someone/experiment-3", &[], None).is_none());
+        let card = "Writes credit memos for loan officers at banks.";
+        let found = infer_with_laya("someone/rinlekha", &[], Some(card)).unwrap();
+        assert_eq!(found.capability, "research", "the card settles it before Laya is asked");
+        assert_eq!(found.confidence, AssignmentConfidence::Inferred);
+    }
+
     #[test]
     fn an_illegible_adapter_is_left_unassigned() {
         assert!(infer("someone/my-finetune-v2", &[]).is_none());
@@ -287,6 +377,8 @@ mod tests {
         // orphan every existing record.
         assert_eq!(AssignmentConfidence::Stated.as_str(), "stated");
         assert_eq!(AssignmentConfidence::Suggested.as_str(), "suggested");
+        assert_eq!(AssignmentConfidence::Inferred.as_str(), "inferred");
+        assert_eq!(AssignmentConfidence::Laya.as_str(), "laya");
         assert_eq!(AssignmentConfidence::Manual.as_str(), "manual");
     }
 }

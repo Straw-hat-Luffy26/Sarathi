@@ -1,0 +1,13 @@
+{
+  "version": "sarathi-capability-v1",
+  "questionId": "capability",
+  "instructions": "Which kind of work does `request` ask the assistant to do?",
+  "criteria": {
+    "coding": "write, fix, review or explain program code, scripts, shell commands or SQL",
+    "mathematics": "calculate, solve equations, prove results or work with numbers and units",
+    "reasoning": "think through a decision: compare options, plan steps or find a root cause",
+    "tool-calling": "produce JSON, structured output or function-call arguments for a tool",
+    "research": "summarise, extract or synthesise findings from documents, papers or sources",
+    "general": "greetings, thanks, small talk, general knowledge or a follow-up with no task"
+  }
+}

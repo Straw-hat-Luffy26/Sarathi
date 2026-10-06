@@ -20,6 +20,27 @@ Python here targets the **system interpreter**. Do not create a venv,
 virtualenv, conda env, or any project-local Python environment — global `pip`,
 or `uv tool install` for a package that needs isolation.
 
+## Capability (LoRA) routing with Laya
+
+Each chat turn's capability slot — and so its LoRA adapter — is chosen by the
+Laya sidecar in `sidecars/laya_router/` (stdio JSON-RPC, no port), driven by
+`src-tauri/src/capability/laya.rs`, falling back to the keyword classifier
+when Laya is off (`ai_settings.laya_routing`), not installed, or slower than
+1.5 s. Install with `.\scripts\laya-setup.ps1`: it adds only `laya==0.3.20`
+(`--no-deps`) to the system interpreter and puts weights in
+`%APPDATA%\com.sarathi.app\laya`. Laya does not choose models for hardware;
+that stays in the deterministic `model_recommendation/` engine.
+
+## Coexisting with ARJUN
+
+ARJUN (`C:\Users\lenovo\Desktop\Arjun-1`) is a separate app grown from this
+codebase. Never edit it. Sarathi must not reuse its ports — ARJUN owns gateway
+11435 and Vite 1420/1421; Sarathi uses gateway **11535** and Vite **1430/1431**
+— nor its `ARJUN_*` variables or `com.arjun.workbench` data. ARJUN *reads*
+Sarathi's `%APPDATA%\com.sarathi.app` (`mcp-servers/`, `models/`), so do not
+move or delete those. Both apps share `laya==0.3.20` in the system
+interpreter; do not change that pin on one side only.
+
 ## Skill routing
 
 - Changes to the Rust launcher/model logic (`src-tauri/src/launcher/`) → `/review` before merge

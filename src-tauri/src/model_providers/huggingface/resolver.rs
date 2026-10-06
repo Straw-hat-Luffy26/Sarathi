@@ -5,12 +5,33 @@
 use serde::{Deserialize, Serialize};
 use anyhow::{Result, anyhow};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ResolvedArtifact {
-    pub repo_id: String,
+/// One file to download. A split model is several of these.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactPart {
+    /// Path inside the repository, including any folder.
     pub file_name: String,
     pub download_url: String,
     pub size_bytes: u64,
+    pub sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResolvedArtifact {
+    pub repo_id: String,
+    /// The file llama.cpp is pointed at: the model itself, or the first shard
+    /// of a split one.
+    pub file_name: String,
+    pub download_url: String,
+    /// Bytes across every part — what has to fit on disk.
+    pub size_bytes: u64,
+    /// Every file that makes up the model, first shard first.
+    ///
+    /// A split model is `-00001-of-0000N` through `-0000N-of-0000N`, and
+    /// llama.cpp needs all of them beside each other to load. Downloading only
+    /// the first — what this used to do — produced a model that the runtime's
+    /// own completeness check then refused. Always at least one entry.
+    #[serde(default)]
+    pub parts: Vec<ArtifactPart>,
     /// The quantization actually chosen.
     ///
     /// May differ from what was asked for. A repository's files are matched on
@@ -35,10 +56,114 @@ struct HfTreeItem {
     lfs: Option<HfLfsInfo>,
 }
 
+impl HfTreeItem {
+    fn byte_size(&self) -> u64 {
+        self.lfs.as_ref().map(|l| l.size).or(self.size).unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct HfLfsInfo {
     oid: String,
     size: u64,
+}
+
+/// Splits `dir/Model-Q4_K_M-00002-of-00007.gguf` into
+/// (`dir/Model-Q4_K_M`, 2, `00007`), the llama.cpp `gguf-split` naming.
+pub(crate) fn split_name(path: &str) -> Option<(&str, u32, &str)> {
+    let stem = path.strip_suffix(".gguf")?;
+    let mut parts = stem.rsplitn(4, '-');
+    let total = parts.next()?;
+    if parts.next()? != "of" {
+        return None;
+    }
+    let index = parts.next()?;
+    let prefix = parts.next()?;
+    let five_digits = |s: &str| s.len() == 5 && s.chars().all(|c| c.is_ascii_digit());
+    if !five_digits(total) || !five_digits(index) {
+        return None;
+    }
+    Some((prefix, index.parse().ok()?, total))
+}
+
+/// Every file of the model `selected` belongs to, first shard first.
+///
+/// A file that is not split is its own complete set. A split one needs every
+/// sibling present: a repository missing a shard holds a model nobody can load,
+/// and saying so before a multi-gigabyte download beats finding out after.
+fn shard_set(selected: &HfTreeItem, items: &[HfTreeItem]) -> Result<Vec<HfTreeItem>> {
+    let Some((prefix, _, total)) = split_name(&selected.path) else {
+        return Ok(vec![selected.clone()]);
+    };
+    let count: u32 = total.parse().map_err(|_| anyhow!("bad shard count in {}", selected.path))?;
+
+    let mut set = Vec::with_capacity(count as usize);
+    for index in 1..=count {
+        let name = format!("{prefix}-{index:05}-of-{total}.gguf");
+        match items.iter().find(|i| i.path == name) {
+            Some(item) => set.push(item.clone()),
+            None => {
+                return Err(anyhow!(
+                    "{} is split into {count} files but the repository does not list {name}; \
+                     the model cannot be loaded without every part",
+                    selected.path
+                ))
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// Every file in a repository, including those inside folders.
+///
+/// Recursive because large builds live in folders: unsloth publishes
+/// `BF16/GLM-5.3-BF16-00001-of-00033.gguf`, one folder per quantization, and the
+/// top-level listing shows only the folder names. Followed across pages
+/// because the Hub pages long listings. `None` when the Hub cannot be read, so
+/// the caller can fall back rather than fail.
+async fn list_tree(
+    client: &reqwest::Client,
+    repo_id: &str,
+    hf_token: Option<&str>,
+) -> Option<Vec<HfTreeItem>> {
+    /// A repository with more files than this is not a model repository.
+    const MAX_PAGES: usize = 20;
+
+    let mut url = format!("https://huggingface.co/api/models/{repo_id}/tree/main?recursive=true");
+    let mut items = Vec::new();
+    for _ in 0..MAX_PAGES {
+        let mut req = client.get(&url);
+        if let Some(token) = hf_token.map(str::trim).filter(|t| !t.is_empty()) {
+            req = req.header("Authorization", format!("Bearer {token}"));
+        }
+        let resp = req.send().await.ok()?;
+        if !resp.status().is_success() {
+            log::warn!("[HF RESOLVER] Listing {repo_id} returned {}", resp.status());
+            return None;
+        }
+        // The token rides along on every page, so a next link is followed only
+        // while it stays on the Hub.
+        let next = next_page(resp.headers()).filter(|n| n.starts_with("https://huggingface.co/"));
+        items.extend(resp.json::<Vec<HfTreeItem>>().await.ok()?);
+        match next {
+            Some(n) => url = n,
+            None => return Some(items),
+        }
+    }
+    Some(items)
+}
+
+/// The `rel="next"` URL of a `Link` header, which the Hub uses to page long
+/// file listings.
+fn next_page(headers: &reqwest::header::HeaderMap) -> Option<String> {
+    let link = headers.get(reqwest::header::LINK)?.to_str().ok()?;
+    link.split(',').find_map(|entry| {
+        let (url, params) = entry.split_once(';')?;
+        params
+            .split(';')
+            .any(|p| p.trim() == "rel=\"next\"")
+            .then(|| url.trim().trim_start_matches('<').trim_end_matches('>').to_string())
+    })
 }
 
 /// Orders the files to probe, most likely first.
@@ -157,6 +282,63 @@ mod ranking_tests {
     fn an_empty_repository_ranks_to_nothing() {
         assert!(rank_candidates(&[], &[]).is_empty());
     }
+
+    #[test]
+    fn split_names_are_read_in_the_gguf_split_form() {
+        assert_eq!(
+            split_name("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00002-of-00007.gguf"),
+            Some(("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL", 2, "00007"))
+        );
+        assert_eq!(split_name("model-Q4_K_M.gguf"), None);
+        assert_eq!(split_name("model-1-of-3.gguf"), None, "counts are zero-padded to five");
+    }
+
+    /// The real layout of `unsloth/GLM-5.3-GGUF`: a folder per quantization and
+    /// a first shard holding only metadata.
+    #[test]
+    fn the_whole_shard_set_is_collected_from_the_first_shard() {
+        let items = vec![
+            item("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00003.gguf", 9_428_677),
+            item("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00002-of-00003.gguf", 49_172_427_136),
+            item("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00003-of-00003.gguf", 30_000_000_000),
+            item("BF16/GLM-5.3-BF16-00001-of-00002.gguf", 1),
+        ];
+        let set = shard_set(&items[0], &items).unwrap();
+        assert_eq!(paths(&set), paths(&items[..3]));
+        assert_eq!(set.iter().map(HfTreeItem::byte_size).sum::<u64>(), 79_181_855_813);
+    }
+
+    #[test]
+    fn a_missing_shard_is_refused_before_anything_downloads() {
+        let items = vec![
+            item("m-Q4_K_M-00001-of-00003.gguf", 10),
+            item("m-Q4_K_M-00003-of-00003.gguf", 10),
+        ];
+        let err = shard_set(&items[0], &items).unwrap_err().to_string();
+        assert!(err.contains("00002-of-00003"), "{err}");
+    }
+
+    #[test]
+    fn a_single_file_is_its_own_set() {
+        let one = item("model-Q4_K_M.gguf", 4_000);
+        assert_eq!(paths(&shard_set(&one, std::slice::from_ref(&one)).unwrap()), vec!["model-Q4_K_M.gguf"]);
+    }
+
+    #[test]
+    fn the_next_page_is_read_from_the_link_header() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::LINK,
+            "<https://huggingface.co/api/models/a/b/tree/main?recursive=true&cursor=abc>; rel=\"next\""
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            next_page(&headers).as_deref(),
+            Some("https://huggingface.co/api/models/a/b/tree/main?recursive=true&cursor=abc")
+        );
+        assert_eq!(next_page(&reqwest::header::HeaderMap::new()), None);
+    }
 }
 
 /// Maps base model IDs from catalog to canonical Hugging Face GGUF repositories
@@ -197,26 +379,15 @@ pub fn resolve_gguf_repo(model_id: &str) -> String {
 /// Resolves exact downloadable GGUF artifact for a given model and quantization
 pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Option<&str>) -> Result<ResolvedArtifact> {
     let repo_id = resolve_gguf_repo(model_id);
-    let api_url = format!("https://huggingface.co/api/models/{}/tree/main", repo_id);
 
     let client = reqwest::Client::builder()
         .user_agent("Sarathi/0.1.0 (Windows; x64)")
         .build()?;
 
-    let mut req = client.get(&api_url);
-    if let Some(token) = hf_token {
-        if !token.trim().is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", token.trim()));
-        }
-    }
-
     let quant_lower = quantization.to_lowercase();
     let quant_clean = quant_lower.replace('_', "");
 
-    let resp = req.send().await;
-    if let Ok(res) = resp {
-        if res.status().is_success() {
-            if let Ok(items) = res.json::<Vec<HfTreeItem>>().await {
+    if let Some(items) = list_tree(&client, &repo_id, hf_token).await {
                 // Collect all matching GGUF files for the requested quantization
                 let mut matches: Vec<HfTreeItem> = Vec::new();
                 for item in &items {
@@ -274,10 +445,26 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
                                 .cloned()
                                 .unwrap_or_else(|| candidates[0].clone());
 
-                            let size = selected.lfs.as_ref().map(|l| l.size).or(selected.size).unwrap_or(0);
-                            let sha256 = selected.lfs.clone().map(|l| l.oid);
-                            let download_url =
-                                format!("https://huggingface.co/{}/resolve/main/{}", repo_id, selected.path);
+                            // The probe read the first shard's header; the model
+                            // is every shard. The first shard of a newer split
+                            // can be metadata alone — 9 MB of a 300 GB model —
+                            // so sizes come from the whole set, never from it.
+                            let parts: Vec<ArtifactPart> = shard_set(&selected, &all_gguf)?
+                                .into_iter()
+                                .map(|item| ArtifactPart {
+                                    download_url: format!(
+                                        "https://huggingface.co/{}/resolve/main/{}",
+                                        repo_id, item.path
+                                    ),
+                                    size_bytes: item.byte_size(),
+                                    sha256: item.lfs.as_ref().map(|l| l.oid.clone()),
+                                    file_name: item.path,
+                                })
+                                .collect();
+
+                            let size: u64 = parts.iter().map(|p| p.size_bytes).sum();
+                            let sha256 = parts[0].sha256.clone();
+                            let download_url = parts[0].download_url.clone();
 
                             // Read from the file, not from the request. Asking
                             // for BF16 and receiving the repository's MXFP4
@@ -297,10 +484,11 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
                             }
 
                             log::info!(
-                                "[HF RESOLVER] Resolved '{}' — architecture '{}', {} bytes",
+                                "[HF RESOLVER] Resolved '{}' — architecture '{}', {} bytes in {} file(s)",
                                 selected.path,
                                 architecture.as_deref().unwrap_or("unverified"),
-                                size
+                                size,
+                                parts.len()
                             );
 
                             return Ok(ResolvedArtifact {
@@ -308,6 +496,7 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
                                 file_name: selected.path,
                                 download_url,
                                 size_bytes: size,
+                                parts,
                                 quantization: actual_quant,
                                 sha256,
                                 architecture,
@@ -323,8 +512,6 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
                         }
                     }
                 }
-            }
-        }
     }
 
     // Fallback: construct canonical Hugging Face URL if direct API tree search timed out or hit offline mode
@@ -342,6 +529,12 @@ pub async fn resolve_artifact(model_id: &str, quantization: &str, hf_token: Opti
     );
 
     Ok(ResolvedArtifact {
+        parts: vec![ArtifactPart {
+            file_name: file_name.clone(),
+            download_url: download_url.clone(),
+            size_bytes,
+            sha256: sha256.clone(),
+        }],
         repo_id,
         file_name,
         download_url,

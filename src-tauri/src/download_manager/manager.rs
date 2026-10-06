@@ -31,6 +31,150 @@ enum StreamOutcome {
     Interrupted,
 }
 
+/// How one file's download ended.
+#[derive(Debug, PartialEq)]
+enum PartOutcome {
+    /// Written, verified and renamed into place.
+    Done,
+    /// Pause or cancel arrived; later parts must not start.
+    Interrupted,
+}
+
+/// Where one file sits within the whole download.
+///
+/// A split model is several files fetched one after another, and the user is
+/// waiting for the model, not for whichever shard is in flight. Progress is
+/// reported against the whole, and only the last part may call it complete.
+#[derive(Debug, Clone, Copy)]
+struct PartScope {
+    /// Bytes already on disk from the parts before this one.
+    bytes_before: u64,
+    /// Bytes across every part; 0 when the server never said.
+    whole_total: u64,
+    /// Whether finishing this part finishes the download.
+    last: bool,
+}
+
+impl PartScope {
+    /// Overall progress, given this part's.
+    fn overall(&self, part_bytes: u64) -> u64 {
+        self.bytes_before + part_bytes
+    }
+
+    /// Overall size, given this part's expected size.
+    fn total(&self, part_expected: u64) -> u64 {
+        if self.whole_total > 0 {
+            self.whole_total
+        } else {
+            self.bytes_before + part_expected
+        }
+    }
+}
+
+/// One file of a download, with where it goes.
+struct PartPlan {
+    url: String,
+    temp_path: PathBuf,
+    /// Where a verified shard of a split model waits for the others.
+    ///
+    /// The storage scan treats any `.gguf` in `base/` as an installed model.
+    /// Finalising shards one at a time would list a split model as installed
+    /// the moment its first shard landed — often a metadata-only file of a few
+    /// megabytes — and leave it listed, unloadable, after a cancel. A `.staged`
+    /// file is invisible to the scan; every shard is renamed into place only
+    /// once all of them are verified.
+    staged_path: PathBuf,
+    destination_path: PathBuf,
+    size_bytes: u64,
+    sha256: Option<String>,
+}
+
+impl PartPlan {
+    /// Builds the plan for every part, all into `storage_dir`.
+    ///
+    /// Folders are dropped: llama.cpp finds a split model's shards by name
+    /// beside the first one, so `BF16/Model-BF16-00002-of-00004.gguf` must land
+    /// next to shard one, not in a subfolder of its own.
+    fn for_parts(storage_dir: &Path, parts: &[resolver::ArtifactPart]) -> Vec<Self> {
+        parts
+            .iter()
+            .map(|p| {
+                let base = p.file_name.rsplit('/').next().unwrap_or(&p.file_name).to_string();
+                Self {
+                    url: p.download_url.clone(),
+                    temp_path: storage_dir.join(format!("{base}.part")),
+                    staged_path: storage_dir.join(format!("{base}.staged")),
+                    destination_path: storage_dir.join(base),
+                    size_bytes: p.size_bytes,
+                    sha256: p.sha256.clone(),
+                }
+            })
+            .collect()
+    }
+
+    fn has_size(&self, path: &Path) -> bool {
+        self.size_bytes > 0 && std::fs::metadata(path).is_ok_and(|m| m.len() == self.size_bytes)
+    }
+
+    /// In its final place, at full size.
+    fn is_installed(&self) -> bool {
+        self.has_size(&self.destination_path)
+    }
+
+    /// Downloaded and verified, whether installed or still staged. An unknown
+    /// size is not evidence of either.
+    fn is_complete(&self) -> bool {
+        self.is_installed() || self.has_size(&self.staged_path)
+    }
+
+    /// Bytes of this part already on disk, finished or partial.
+    fn bytes_on_disk(&self) -> u64 {
+        if self.is_complete() {
+            return self.size_bytes;
+        }
+        std::fs::metadata(&self.temp_path).map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Moves every staged shard into place, the first shard last, so the file
+    /// the storage scan keys on appears only once the rest are already there.
+    fn install_all(plans: &[PartPlan]) -> std::io::Result<()> {
+        for plan in plans.iter().rev() {
+            if plan.is_installed() {
+                continue;
+            }
+            if plan.destination_path.exists() {
+                std::fs::remove_file(&plan.destination_path)?;
+            }
+            std::fs::rename(&plan.staged_path, &plan.destination_path)?;
+        }
+        Ok(())
+    }
+}
+
+/// The staged shards beside `first_shard` that belong to the same split model.
+///
+/// Matched on the exact `<prefix>-NNNNN-of-<total>` name, because every
+/// quantization of a model shares one `base/` folder and another may be
+/// downloading there at the same moment.
+fn staged_shards_of(first_shard: &Path) -> Vec<PathBuf> {
+    let Some(name) = first_shard.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Some((prefix, _, total)) = resolver::split_name(name) else {
+        return Vec::new();
+    };
+    let Some(dir) = first_shard.parent() else {
+        return Vec::new();
+    };
+    let Ok(count) = total.parse::<u32>() else {
+        return Vec::new();
+    };
+    (1..=count)
+        .map(|i| dir.join(format!("{prefix}-{i:05}-of-{total}.gguf.staged")))
+        .filter(|p| p.is_file())
+        .collect()
+}
+
 /// Distinguishes failures worth retrying from failures worth reporting.
 enum StreamError {
     /// Connection-level problem — resume and try again.
@@ -738,51 +882,68 @@ impl DownloadManager {
         log::info!("[DOWNLOAD_DIAGNOSTIC] Artifact resolved successfully: repo={}, file={}, url={}, size_bytes={}", 
             artifact.repo_id, artifact.file_name, artifact.download_url, artifact.size_bytes);
 
-        let file_name = artifact.file_name.split('/').last().unwrap_or(&artifact.file_name).to_string();
-        let destination_path = storage_dir.join(&file_name);
-        let temp_path = storage_dir.join(format!("{}.part", file_name));
+        // Every file of the model: one for a single GGUF, all shards of a split.
+        let parts = if artifact.parts.is_empty() {
+            vec![resolver::ArtifactPart {
+                file_name: artifact.file_name.clone(),
+                download_url: artifact.download_url.clone(),
+                size_bytes: artifact.size_bytes,
+                sha256: artifact.sha256.clone(),
+            }]
+        } else {
+            artifact.parts.clone()
+        };
+        let plans = PartPlan::for_parts(&storage_dir, &parts);
 
-        // Check if final ready file already exists.
+        // The task reports the file llama.cpp is pointed at — the first shard.
+        let destination_path = plans[0].destination_path.clone();
+        let temp_path = plans
+            .iter()
+            .find(|p| !p.is_complete())
+            .unwrap_or(&plans[0])
+            .temp_path
+            .clone();
+
+        // Check whether every part is already in place.
         //
         // An unknown artifact size is not evidence that whatever is on disk is
         // complete — treating it as such marked truncated files as ready.
-        if destination_path.exists() {
-            let metadata = tokio::fs::metadata(&destination_path).await?;
-            if artifact.size_bytes > 0 && metadata.len() == artifact.size_bytes {
-                log::info!("[DOWNLOAD_DIAGNOSTIC] Model artifact already downloaded & verified at {:?}", destination_path);
-                let completed_task = DownloadTask {
-                    id: task_id.clone(),
-                    model_id,
-                    model_name,
-                    provider_id,
-                    quantization,
-                    format,
-                    backend,
-                    url: artifact.download_url,
-                    destination_path: destination_path.to_string_lossy().to_string(),
-                    temp_path: temp_path.to_string_lossy().to_string(),
-                    total_bytes: metadata.len(),
-                    downloaded_bytes: metadata.len(),
-                    status: DownloadStatus::Completed,
-                    speed_bps: 0.0,
-                    eta_seconds: Some(0),
-                    checksum: artifact.sha256,
-                    error: None,
-                    created_at: chrono::Utc::now().to_rfc3339(),
-                    updated_at: chrono::Utc::now().to_rfc3339(),
-                };
-                self.tasks.lock().unwrap().insert(task_id.clone(), completed_task.clone());
-                self.broadcast_progress(&app_handle, &completed_task);
-                return Ok(task_id);
-            }
+        // A split download interrupted after its last shard verified but before
+        // the shards were moved into place finishes that step here.
+        if plans.iter().all(PartPlan::is_complete) && PartPlan::install_all(&plans).is_ok() {
+            log::info!(
+                "[DOWNLOAD_DIAGNOSTIC] Model artifact already downloaded & verified at {:?} ({} file(s))",
+                destination_path,
+                plans.len()
+            );
+            let completed_task = DownloadTask {
+                id: task_id.clone(),
+                model_id,
+                model_name,
+                provider_id,
+                quantization,
+                format,
+                backend,
+                url: artifact.download_url,
+                destination_path: destination_path.to_string_lossy().to_string(),
+                temp_path: temp_path.to_string_lossy().to_string(),
+                total_bytes: artifact.size_bytes,
+                downloaded_bytes: artifact.size_bytes,
+                status: DownloadStatus::Completed,
+                speed_bps: 0.0,
+                eta_seconds: Some(0),
+                checksum: artifact.sha256,
+                error: None,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            self.tasks.lock().unwrap().insert(task_id.clone(), completed_task.clone());
+            self.broadcast_progress(&app_handle, &completed_task);
+            return Ok(task_id);
         }
 
-        // Determine existing downloaded bytes from .part file
-        let initial_bytes = if temp_path.exists() {
-            tokio::fs::metadata(&temp_path).await?.len()
-        } else {
-            0
-        };
+        // Bytes already on disk across every part, finished or partial.
+        let initial_bytes: u64 = plans.iter().map(PartPlan::bytes_on_disk).sum();
 
         let total_bytes = artifact.size_bytes;
 
@@ -822,13 +983,14 @@ impl DownloadManager {
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
 
-        // HuggingFace's LFS object id is the file's SHA-256, so it doubles as the
-        // integrity check the downloader never previously performed.
-        let expected_sha256 = artifact.sha256;
-
         self.tasks.lock().unwrap().insert(task_id.clone(), task.clone());
         self.broadcast_progress(&app_handle, &task);
-        log::info!("[DOWNLOAD_DIAGNOSTIC] Starting streaming download for task {} ({:.2} MB expected)", task_id, total_bytes as f64 / 1_048_576.0);
+        log::info!(
+            "[DOWNLOAD_DIAGNOSTIC] Starting streaming download for task {} ({:.2} MB expected in {} file(s))",
+            task_id,
+            total_bytes as f64 / 1_048_576.0,
+            plans.len()
+        );
 
         // Set up cancel watch channel
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -841,20 +1003,92 @@ impl DownloadManager {
         let app_handle_clone = app_handle.clone();
 
         tokio::spawn(async move {
-            let res = Self::run_download_loop(
-                &app_handle_clone,
-                &task_id_clone,
-                &artifact.download_url,
-                &PathBuf::from(&task.temp_path),
-                &PathBuf::from(&task.destination_path),
-                total_bytes,
-                initial_bytes,
-                hf_token,
-                expected_sha256,
-                cancel_rx,
-                tasks_map.clone(),
-            )
-            .await;
+            // One part at a time, into one folder. Parts already complete are
+            // skipped, so resuming a split download picks up at the first
+            // shard that is not finished rather than starting over.
+            let mut bytes_before = 0u64;
+            let mut res: Result<()> = Ok(());
+            let mut finished = true;
+            let count = plans.len();
+            // A single file finalises itself. Shards of a split model are
+            // staged, then installed together below — see `PartPlan`.
+            let split = count > 1;
+            for (index, plan) in plans.iter().enumerate() {
+                let scope = PartScope {
+                    bytes_before,
+                    whole_total: total_bytes,
+                    last: !split,
+                };
+
+                if plan.is_complete() {
+                    bytes_before += plan.size_bytes;
+                    continue;
+                }
+
+                // A pause or cancel that lands between parts must not start the
+                // next one: cancel has already cleaned up, and a new `.part`
+                // created after it would be left behind.
+                if *cancel_rx.borrow() {
+                    finished = false;
+                    break;
+                }
+
+                // Cancel deletes the task's `.part`, so it must name the part
+                // actually being written.
+                if let Some(t) = tasks_map.lock().unwrap().get_mut(&task_id_clone) {
+                    t.temp_path = plan.temp_path.to_string_lossy().to_string();
+                }
+
+                // HuggingFace's LFS object id is the file's SHA-256, so it
+                // doubles as each part's integrity check.
+                let outcome = Self::run_download_loop(
+                    &app_handle_clone,
+                    &task_id_clone,
+                    &plan.url,
+                    &plan.temp_path,
+                    if split { &plan.staged_path } else { &plan.destination_path },
+                    plan.size_bytes,
+                    std::fs::metadata(&plan.temp_path).map(|m| m.len()).unwrap_or(0),
+                    hf_token.clone(),
+                    plan.sha256.clone(),
+                    cancel_rx.clone(),
+                    tasks_map.clone(),
+                    scope,
+                )
+                .await;
+
+                match outcome {
+                    Ok(PartOutcome::Done) => bytes_before += plan.size_bytes,
+                    Ok(PartOutcome::Interrupted) => {
+                        finished = false;
+                        break;
+                    }
+                    Err(e) => {
+                        finished = false;
+                        res = Err(if split {
+                            e.context(format!("part {} of {}", index + 1, count))
+                        } else {
+                            e
+                        });
+                        break;
+                    }
+                }
+            }
+
+            if split && finished {
+                match PartPlan::install_all(&plans) {
+                    Ok(()) => {
+                        log::info!(
+                            "[DOWNLOAD_DIAGNOSTIC] ✓ All {count} shards verified and installed for task {}",
+                            task_id_clone
+                        );
+                        Self::mark_completed(&app_handle_clone, &task_id_clone, &tasks_map, bytes_before);
+                    }
+                    Err(e) => {
+                        res = Err(anyhow!("all {count} shards downloaded, but moving them into place failed: {e}"))
+                    }
+                }
+            }
 
             cancel_senders_map.lock().unwrap().remove(&task_id_clone);
 
@@ -886,7 +1120,8 @@ impl DownloadManager {
         expected_sha256: Option<String>,
         cancel_rx: watch::Receiver<bool>,
         tasks: Arc<Mutex<HashMap<String, DownloadTask>>>,
-    ) -> Result<()> {
+        scope: PartScope,
+    ) -> Result<PartOutcome> {
         let client = reqwest::Client::builder()
             .user_agent("Sarathi/0.1.0 (Windows; x64)")
             .build()?;
@@ -912,12 +1147,13 @@ impl DownloadManager {
                 hf_token.as_deref(),
                 &cancel_rx,
                 &tasks,
+                scope,
             )
             .await
             {
                 Ok(StreamOutcome::Interrupted) => {
                     log::info!("[DOWNLOAD_DIAGNOSTIC] Pause/Cancel signal received for task {}", task_id);
-                    return Ok(());
+                    return Ok(PartOutcome::Interrupted);
                 }
                 Ok(StreamOutcome::Finished { downloaded, expected }) => {
                     if expected > 0 {
@@ -957,7 +1193,7 @@ impl DownloadManager {
                     tokio::time::sleep(backoff).await;
 
                     if *cancel_rx.borrow() {
-                        return Ok(());
+                        return Ok(PartOutcome::Interrupted);
                     }
                 }
             }
@@ -966,7 +1202,7 @@ impl DownloadManager {
         // Verification step
         log::info!("[DOWNLOAD_DIAGNOSTIC] Streaming finished for task {}. Updating status to Verifying...", task_id);
         if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = downloaded;
+            task.downloaded_bytes = scope.overall(downloaded);
             task.status = DownloadStatus::Verifying;
             task.speed_bps = 0.0;
             task.error = None;
@@ -1013,18 +1249,36 @@ impl DownloadManager {
         tokio::fs::rename(temp_path, destination_path).await?;
         log::info!("[DOWNLOAD_DIAGNOSTIC] ✓ Atomic finalization complete: renamed {:?} -> {:?}", temp_path, destination_path);
 
-        // Update task status to Completed
+        // Only the last part finishes the download; a finished shard of a split
+        // model is progress, not a model.
+        if scope.last {
+            Self::mark_completed(app_handle, task_id, &tasks, scope.overall(final_size));
+        } else if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
+            task.downloaded_bytes = scope.overall(final_size);
+            task.status = DownloadStatus::Downloading;
+            task.updated_at = chrono::Utc::now().to_rfc3339();
+            let _ = app_handle.emit("download:progress", Self::make_payload(task));
+        }
+
+        Ok(PartOutcome::Done)
+    }
+
+    /// Marks a task finished with `total` bytes on disk and tells the UI.
+    fn mark_completed(
+        app_handle: &tauri::AppHandle,
+        task_id: &str,
+        tasks: &Arc<Mutex<HashMap<String, DownloadTask>>>,
+        total: u64,
+    ) {
         if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = final_size;
-            task.total_bytes = final_size;
+            task.downloaded_bytes = total;
+            task.total_bytes = total;
             task.status = DownloadStatus::Completed;
             task.speed_bps = 0.0;
             task.eta_seconds = Some(0);
             task.updated_at = chrono::Utc::now().to_rfc3339();
             let _ = app_handle.emit("download:progress", Self::make_payload(task));
         }
-
-        Ok(())
     }
 
     /// Streams the artifact once, appending to `temp_path`.
@@ -1043,6 +1297,7 @@ impl DownloadManager {
         hf_token: Option<&str>,
         cancel_rx: &watch::Receiver<bool>,
         tasks: &Arc<Mutex<HashMap<String, DownloadTask>>>,
+        scope: PartScope,
     ) -> std::result::Result<StreamOutcome, StreamError> {
         let mut req = client.get(url);
         if let Some(token) = hf_token {
@@ -1121,9 +1376,9 @@ impl DownloadManager {
 
         // Broadcast initial progress immediately upon connection
         if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-            task.downloaded_bytes = downloaded;
-            if expected_total > 0 {
-                task.total_bytes = expected_total;
+            task.downloaded_bytes = scope.overall(downloaded);
+            if scope.total(expected_total) > 0 {
+                task.total_bytes = scope.total(expected_total);
             }
             task.status = DownloadStatus::Downloading;
             let _ = app_handle.emit("download:progress", Self::make_payload(task));
@@ -1162,7 +1417,10 @@ impl DownloadManager {
             if sample_elapsed >= 0.25 {
                 let bytes_diff = downloaded.saturating_sub(last_sample_bytes);
                 let speed_bps = if sample_elapsed > 0.0 { bytes_diff as f64 / sample_elapsed } else { 0.0 };
-                let remaining_bytes = expected_total.saturating_sub(downloaded);
+                // Time to the end of the model, not of the shard in flight.
+                let remaining_bytes = scope
+                    .total(expected_total)
+                    .saturating_sub(scope.overall(downloaded));
                 let eta_seconds = if speed_bps > 0.0 {
                     Some((remaining_bytes as f64 / speed_bps) as u64)
                 } else {
@@ -1173,9 +1431,9 @@ impl DownloadManager {
                 last_sample_bytes = downloaded;
 
                 if let Some(task) = tasks.lock().unwrap().get_mut(task_id) {
-                    task.downloaded_bytes = downloaded;
-                    if expected_total > 0 {
-                        task.total_bytes = expected_total;
+                    task.downloaded_bytes = scope.overall(downloaded);
+                    if scope.total(expected_total) > 0 {
+                        task.total_bytes = scope.total(expected_total);
                     }
                     task.speed_bps = if speed_bps.is_nan() || speed_bps.is_infinite() { 0.0 } else { speed_bps };
                     task.eta_seconds = eta_seconds;
@@ -1275,6 +1533,16 @@ impl DownloadManager {
                         temp_path, task_id_owned
                     );
                 });
+            }
+
+            // A cancelled split download also discards the shards it had
+            // already verified. They are invisible to the storage scan while
+            // staged, so nothing else would ever reclaim their space.
+            for staged in staged_shards_of(Path::new(&task.destination_path)) {
+                match std::fs::remove_file(&staged) {
+                    Ok(()) => log::info!("[DOWNLOAD_DIAGNOSTIC] Removed staged shard {:?}", staged),
+                    Err(e) => log::warn!("[DOWNLOAD_DIAGNOSTIC] Could not remove {:?}: {e}", staged),
+                }
             }
 
             task.status = DownloadStatus::Cancelled;
@@ -1483,6 +1751,125 @@ mod tests {
             dir,
             PathBuf::from("C:\\AppData\\models\\huggingface\\Qwen_Qwen2.5-Coder-7B\\base")
         );
+    }
+
+    fn part(name: &str, size: u64) -> resolver::ArtifactPart {
+        resolver::ArtifactPart {
+            file_name: name.into(),
+            download_url: format!("https://huggingface.co/x/y/resolve/main/{name}"),
+            size_bytes: size,
+            sha256: None,
+        }
+    }
+
+    /// llama.cpp finds shards by name beside the first one, so every part of a
+    /// split model must land in the same folder, whatever folder the repository
+    /// kept it in.
+    #[test]
+    fn every_shard_lands_beside_the_first() {
+        let dir = std::path::Path::new("store");
+        let plans = PartPlan::for_parts(
+            dir,
+            &[
+                part("BF16/GLM-BF16-00001-of-00002.gguf", 9_000_000),
+                part("BF16/GLM-BF16-00002-of-00002.gguf", 40_000_000_000),
+            ],
+        );
+        assert_eq!(plans[0].destination_path, dir.join("GLM-BF16-00001-of-00002.gguf"));
+        assert_eq!(plans[1].destination_path, dir.join("GLM-BF16-00002-of-00002.gguf"));
+        assert_eq!(plans[1].temp_path, dir.join("GLM-BF16-00002-of-00002.gguf.part"));
+    }
+
+    #[test]
+    fn progress_is_reported_against_the_whole_model() {
+        let second = PartScope { bytes_before: 4_000, whole_total: 10_000, last: false };
+        assert_eq!(second.overall(1_500), 5_500);
+        assert_eq!(second.total(6_000), 10_000);
+
+        // Unknown overall size: the parts so far plus this one is the best answer.
+        let unknown = PartScope { bytes_before: 4_000, whole_total: 0, last: true };
+        assert_eq!(unknown.total(6_000), 10_000);
+    }
+
+    #[test]
+    fn a_finished_part_is_recognised_and_a_partial_one_counted() {
+        let dir = std::env::temp_dir().join(format!("sarathi-parts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plans = PartPlan::for_parts(&dir, &[part("m-00001-of-00002.gguf", 4), part("m-00002-of-00002.gguf", 6)]);
+
+        std::fs::write(&plans[0].destination_path, b"abcd").unwrap();
+        std::fs::write(&plans[1].temp_path, b"xy").unwrap();
+
+        assert!(plans[0].is_complete());
+        assert!(!plans[1].is_complete());
+        assert_eq!(plans.iter().map(PartPlan::bytes_on_disk).sum::<u64>(), 6);
+
+        // A file of the wrong size is not complete, and an unknown size never is.
+        std::fs::write(&plans[0].destination_path, b"abc").unwrap();
+        assert!(!plans[0].is_complete());
+        let unsized_plan = PartPlan::for_parts(&dir, &[part("m-00001-of-00002.gguf", 0)]);
+        assert!(!unsized_plan[0].is_complete());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The storage scan lists any `.gguf` in `base/`. A split model must not
+    /// appear there until every shard is in hand, and its first shard — the
+    /// one the scan keys on — must be the last to appear.
+    #[test]
+    fn split_shards_stay_staged_until_all_are_verified() {
+        let dir = std::env::temp_dir().join(format!("sarathi-staging-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let plans = PartPlan::for_parts(
+            &dir,
+            &[part("m-Q4-00001-of-00002.gguf", 2), part("m-Q4-00002-of-00002.gguf", 3)],
+        );
+
+        // Only the second shard has arrived: it is complete but not installed.
+        std::fs::write(&plans[1].staged_path, b"bbb").unwrap();
+        assert!(plans[1].is_complete());
+        assert!(!plans[1].is_installed());
+        let visible = |d: &Path| {
+            std::fs::read_dir(d)
+                .unwrap()
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|x| x == "gguf"))
+                .count()
+        };
+        assert_eq!(visible(&dir), 0, "nothing may look installed yet");
+
+        std::fs::write(&plans[0].staged_path, b"aa").unwrap();
+        PartPlan::install_all(&plans).unwrap();
+        assert!(plans.iter().all(PartPlan::is_installed));
+        assert_eq!(visible(&dir), 2);
+        assert!(!plans[0].staged_path.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_finds_only_this_models_staged_shards() {
+        let dir = std::env::temp_dir().join(format!("sarathi-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in [
+            "m-Q4-00001-of-00003.gguf.staged",
+            "m-Q4-00003-of-00003.gguf.staged",
+            // Another quantization of the same model, downloading alongside.
+            "m-Q8-00001-of-00002.gguf.staged",
+            "m-Q4-00002-of-00003.gguf.part",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+
+        let mut found = staged_shards_of(&dir.join("m-Q4-00001-of-00003.gguf"));
+        found.sort();
+        assert_eq!(
+            found,
+            vec![dir.join("m-Q4-00001-of-00003.gguf.staged"), dir.join("m-Q4-00003-of-00003.gguf.staged")]
+        );
+        assert!(staged_shards_of(&dir.join("single-Q4_K_M.gguf")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

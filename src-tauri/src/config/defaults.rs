@@ -45,6 +45,19 @@ pub struct AiSettings {
     /// implicit on behaviour.
     #[serde(default)]
     pub auto_load_on_startup: bool,
+
+    /// Whether Laya decides which capability (and so which LoRA adapter) each
+    /// turn uses, when its weights are installed.
+    ///
+    /// On by default because it only takes effect once `scripts/laya-setup.ps1`
+    /// has been run; until then, and whenever it is off, the keyword classifier
+    /// decides exactly as before. Defaulted so older config files keep parsing.
+    #[serde(default = "default_true")]
+    pub laya_routing: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for AiSettings {
@@ -55,6 +68,7 @@ impl Default for AiSettings {
             use_gpu: true,
             gpu_layers: 35,
             auto_load_on_startup: false,
+            laya_routing: true,
         }
     }
 }

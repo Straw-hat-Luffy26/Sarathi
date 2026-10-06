@@ -165,6 +165,42 @@ export interface AdapterListing {
   installable: boolean;
   /** Why it cannot be installed, in plain language. */
   blockedReason?: string | null;
+  /** What the adapter is for. Present on every listing the backend sends. */
+  useCase?: AdapterUseCase;
+}
+
+/** What an adapter is for, and how Sarathi knows. */
+export interface AdapterUseCase {
+  /** One or two short labels, e.g. `Finance` or `Tax · Law`. */
+  label: string;
+  /** The language it targets, when that is not English. */
+  language?: string;
+  /** Where the label came from. `none` means nothing said. */
+  source: 'tags' | 'name' | 'card' | 'laya' | 'none';
+  /** The first sentence of its model card, when it has one. */
+  summary?: string;
+}
+
+/** The chip text: `Finance` or `Lyrics & music · Nepali`. */
+export function useCaseText(u: AdapterUseCase): string {
+  return u.language ? `${u.label} · ${u.language}` : u.label;
+}
+
+/**
+ * The chip's tooltip: where the label came from, then the card's own words.
+ *
+ * A label read from the author's tags and one guessed by Laya must not look
+ * equally certain, so the source is always stated.
+ */
+export function useCaseTooltip(u: AdapterUseCase): string {
+  const source = {
+    tags: "From the author's tags.",
+    name: "From the adapter's name.",
+    card: 'From its model card.',
+    laya: 'Picked by Laya from its description.',
+    none: 'Its author does not say what it is for.',
+  }[u.source];
+  return u.summary ? `${source}\n\n${u.summary}` : source;
 }
 
 export interface AdapterPage {

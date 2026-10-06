@@ -176,7 +176,7 @@ Both target clients support remote MCP — verified against the installed binari
 So the connection story is:
 
 ```
-claude mcp add --transport http sarathi http://127.0.0.1:11435/mcp \
+claude mcp add --transport http sarathi http://127.0.0.1:11535/mcp \
   --header "Authorization: Bearer <per-client token>"
 ```
 
@@ -411,7 +411,7 @@ that must be made explicitly rather than discovered later.
        └──────────────┬──────┴────────────────────────┘
                       ▼
         ┌─────────────────────────────────────────────┐
-        │ Sarathi  ::  axum router  (127.0.0.1:11435)  │
+        │ Sarathi  ::  axum router  (127.0.0.1:11535)  │
         │                                             │
         │  /v1/chat/completions  /v1/messages         │  ← unauthenticated (unchanged)
         │  ────────────────────────────────────────   │

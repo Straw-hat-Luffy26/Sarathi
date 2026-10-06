@@ -21,5 +21,10 @@ pub mod toolcall;
 pub use server::{start_gateway, GatewayHandle};
 pub use state::{GatewayConfig, GatewayState, GatewayStats, ClientActivity};
 
-/// Default port. Deliberately not Ollama's 11434, so both can run at once.
-pub const DEFAULT_PORT: u16 = 11435;
+/// Default port.
+///
+/// Not Ollama's 11434, and no longer 11435 either: ARJUN, which grew out of this
+/// codebase, kept 11435 for its own gateway. With both installed, whichever
+/// started second fell back to a random port, and every tool pointed at 11435
+/// quietly talked to the *other* application's model. 11535 is used by neither.
+pub const DEFAULT_PORT: u16 = 11535;

@@ -100,6 +100,85 @@ impl std::fmt::Display for RateLimited {
 
 impl std::error::Error for RateLimited {}
 
+/// Requests left in HuggingFace's current rate-limit window, as the most recent
+/// response reported it. `u64::MAX` until any response has said.
+static REMAINING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// When that window resets, in Unix milliseconds; 0 when not reported.
+///
+/// `REMAINING` is only ever refreshed by a response, so without this a sweep
+/// that stopped at its reserve would leave a low count behind that nothing
+/// clears — and the next sweep would refuse to start long after the Hub had
+/// restored the allowance.
+static RESET_AT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Requests a sweep leaves unspent in the window.
+///
+/// The Hub allows an authenticated account 1,000 API requests per five minutes
+/// and an anonymous address far fewer, and a 20-page sweep wants ~2,000. Run to
+/// exhaustion, the sweep left nothing behind: every search, adapter lookup and
+/// download resolution in the next five minutes was refused with 429, which is
+/// what "fetching from HuggingFace is broken" looked like from the app. Stopping
+/// with this much in hand keeps everything the user does next working, and the
+/// merge in `catalog_cache` means the repositories not reached this time are
+/// carried over rather than lost.
+const SWEEP_RESERVE: u64 = 150;
+
+/// Reads one `key=<number>` parameter of `RateLimit: "api";r=<remaining>;t=<seconds>`
+/// (IETF draft syntax, as the Hub sends it).
+fn rate_limit_param(value: &str, key: &str) -> Option<u64> {
+    value
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix(key)?.strip_prefix('='))
+        .and_then(|n| n.trim().parse().ok())
+}
+
+/// Requests remaining in the window.
+fn parse_remaining(value: &str) -> Option<u64> {
+    rate_limit_param(value, "r")
+}
+
+fn record_rate_limit(headers: &reqwest::header::HeaderMap) {
+    use std::sync::atomic::Ordering;
+
+    let Some(value) = headers.get("ratelimit").and_then(|v| v.to_str().ok()) else {
+        return;
+    };
+    if let Some(remaining) = parse_remaining(value) {
+        REMAINING.store(remaining, Ordering::Relaxed);
+        let reset_at = rate_limit_param(value, "t").map_or(0, |secs| now_ms() + secs * 1000);
+        RESET_AT_MS.store(reset_at, Ordering::Relaxed);
+    }
+}
+
+/// True once a sweep has spent the window down to its reserve.
+fn sweep_budget_spent() -> bool {
+    use std::sync::atomic::Ordering;
+    budget_spent(
+        REMAINING.load(Ordering::Relaxed),
+        RESET_AT_MS.load(Ordering::Relaxed),
+        now_ms(),
+    )
+}
+
+/// The rule behind [`sweep_budget_spent`], kept pure so it can be tested
+/// without racing the network tests that update [`REMAINING`].
+fn budget_spent(remaining: u64, reset_at_ms: u64, now_ms: u64) -> bool {
+    // A window that has rolled over has its whole allowance back, whatever the
+    // last response said.
+    if reset_at_ms != 0 && now_ms >= reset_at_ms {
+        return false;
+    }
+    remaining < SWEEP_RESERVE + CONCURRENCY as u64
+}
+
 /// Per-request timeout. Detail calls are small JSON documents.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -161,6 +240,7 @@ async fn ids_from_search(url: &str, token: Option<&str>, min_downloads: u64) -> 
     let client = client(token)?;
 
     let resp = client.get(url).send().await?;
+    record_rate_limit(resp.headers());
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
         return Err(RateLimited { had_token: token.is_some() }.into());
@@ -181,6 +261,7 @@ async fn ids_from_search(url: &str, token: Option<&str>, min_downloads: u64) -> 
 pub async fn fetch_repo(repo_id: &str, token: Option<&str>) -> Result<GgufRepo> {
     let client = client(token)?;
     let resp = client.get(detail_url(repo_id)).send().await?;
+    record_rate_limit(resp.headers());
 
     let status = resp.status();
     if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
@@ -236,6 +317,15 @@ pub async fn fetch_repos_reporting(
     }
 
     for chunk in repo_ids.chunks(CONCURRENCY) {
+        if sweep_budget_spent() {
+            log::warn!(
+                "[HF_CATALOG] Stopping after {} of {total} repositories to keep {SWEEP_RESERVE} \
+                 HuggingFace requests in hand; the rest are kept from the stored library",
+                out.len()
+            );
+            break;
+        }
+
         let futures = chunk.iter().map(|id| async move {
             match fetch_repo(id, token).await {
                 Ok(repo) => (Some(repo), false),
@@ -326,6 +416,12 @@ pub struct AdapterListing {
     /// Why it cannot be installed, in the user's words. `None` when it can.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<String>,
+    /// What the adapter is for — `Finance`, `Tax · Law`, `Lyrics & music` —
+    /// for every adapter, not only the ones that fill a capability slot.
+    ///
+    /// `None` only in listings cached before this existed; those are refetched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub use_case: Option<super::use_case::UseCase>,
 }
 
 /// Serde default for [`AdapterListing::installable`].
@@ -455,7 +551,11 @@ fn to_adapter_listing(raw: RawModelInfo) -> AdapterListing {
     // `capability/assign.rs` uses when the adapter is installed.
     let assignment = crate::capability::assign::infer(&raw.id, &raw.tags);
 
+    // From tags and name only; `adapter_discovery` folds in the model card.
+    let use_case = super::use_case::from_metadata(&raw.id, &raw.tags, None);
+
     AdapterListing {
+        use_case: Some(use_case),
         size_bytes,
         capability: assignment.as_ref().map(|a| a.capability.clone()),
         capability_confidence: assignment
@@ -673,6 +773,13 @@ pub async fn discover_repos_reporting(
     }
 
     for page in 0..total_pages {
+        // Each listed repository costs a detail request later, so paging on
+        // with the window nearly spent only queues work that cannot run.
+        if page > 0 && sweep_budget_spent() {
+            log::warn!("[HF_CATALOG] Rate-limit window nearly spent; stopping at page {page}");
+            break;
+        }
+
         if let Some(report) = progress {
             report(SweepProgress::Searching {
                 page: page + 1,
@@ -900,6 +1007,42 @@ mod tests {
         let authed = RateLimited { had_token: true }.to_string();
         assert!(authed.contains("Wait"), "should advise waiting instead: {authed}");
         assert_ne!(anon, authed);
+    }
+
+    #[test]
+    fn the_hubs_rate_limit_header_is_understood() {
+        // Verbatim shapes from live responses.
+        assert_eq!(parse_remaining(r#""api";r=998;t=204"#), Some(998));
+        assert_eq!(parse_remaining(r#""api";r=0;t=12"#), Some(0));
+        assert_eq!(parse_remaining(r#""api"; r=395 ; t=268"#), Some(395));
+        assert_eq!(parse_remaining("garbage"), None);
+        assert_eq!(parse_remaining(r#""api";t=204"#), None);
+        assert_eq!(rate_limit_param(r#""api";r=998;t=204"#, "t"), Some(204));
+        assert_eq!(
+            rate_limit_param(r#""api";tr=5;t=9"#, "t"),
+            Some(9),
+            "a key must match whole, not as a prefix of another"
+        );
+    }
+
+    #[test]
+    fn a_sweep_stops_with_requests_still_in_hand() {
+        let now = 1_000_000;
+        let later = now + 60_000;
+        assert!(!budget_spent(u64::MAX, 0, now), "an unknown window must not block a sweep");
+        assert!(!budget_spent(SWEEP_RESERVE + CONCURRENCY as u64 + 50, later, now));
+        assert!(
+            budget_spent(SWEEP_RESERVE, later, now),
+            "the reserve is for the user's next action, not the sweep"
+        );
+        assert!(budget_spent(0, 0, now), "with no reset reported, a spent count holds");
+    }
+
+    #[test]
+    fn a_window_that_has_reset_is_not_still_spent() {
+        // The count was low when last seen, but the window it described is over.
+        assert!(!budget_spent(0, 1_000, 2_000));
+        assert!(budget_spent(0, 2_000, 1_000), "still inside the window");
     }
 
     #[test]

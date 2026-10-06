@@ -23,7 +23,10 @@ import {
   onCatalogProgress,
   onCatalogUpdated,
   refreshModelLibrary,
+  useCaseText,
+  useCaseTooltip,
   type AdapterPage,
+  type AdapterUseCase,
   type CatalogPage,
   type CatalogProgress,
 } from '../services/catalog.service';
@@ -1361,6 +1364,7 @@ function DetailDrawer({ card, onClose }: DrawerProps) {
                     <tr className={styles.quantHead}>
                       <th scope="col" aria-label="Select" />
                       <th scope="col">Adapter</th>
+                      <th scope="col">Use case</th>
                       <th scope="col">By</th>
                       <th scope="col" className={styles.qFit}>
                         Usable
@@ -1442,6 +1446,7 @@ interface AdapterRowProps {
     ggufReady: boolean;
     installable: boolean;
     blockedReason?: string | null;
+    useCase?: AdapterUseCase;
   };
   installing: boolean;
   installed: boolean;
@@ -1509,6 +1514,18 @@ function AdapterRow({
             <span className={styles.adapterFocus}>{a.focus}</span>
           </button>
         </td>
+        <td>
+          {/* Every adapter says what it is for. "Not stated" is shown, not left
+            * blank, so an empty cell never reads as a rendering fault. */}
+          {a.useCase && (
+            <span
+              className={a.useCase.source === 'none' ? styles.useCaseUnknown : styles.useCase}
+              title={useCaseTooltip(a.useCase)}
+            >
+              {useCaseText(a.useCase)}
+            </span>
+          )}
+        </td>
         <td className={styles.adapterAuthor}>{a.author}</td>
         <td className={styles.qFit}>
           {/* An adapter the installer would refuse says so here, with the reason
@@ -1562,12 +1579,17 @@ function AdapterRow({
 
       {open && (
         <tr>
-          <td colSpan={5} className={styles.adapterDetailCell}>
+          <td colSpan={6} className={styles.adapterDetailCell}>
             {loading && <p className={styles.adapterNotice}>Reading its page…</p>}
             {failed && <p className={styles.adapterError}>{failed}</p>}
 
             {details && (
               <div className={styles.adapterDetail}>
+                {a.useCase?.summary && (
+                  <p className={styles.detailLine}>
+                    <strong>What it is for:</strong> {a.useCase.summary}
+                  </p>
+                )}
                 {details.effects.length > 0 && (
                   <ul className={styles.effects}>
                     {details.effects.map((e) => (

@@ -5,6 +5,14 @@ use tauri::Manager;
 use crate::adapter_manager::AdapterRegistry;
 use crate::model_intelligence::{ModelIntelligenceManager, ModelProfile, InferenceParameters};
 
+/// Whether Laya is deciding capability (LoRA) switches, and if not, why.
+#[tauri::command]
+pub fn get_laya_status() -> crate::capability::laya::LayaStatus {
+    crate::capability::laya::global()
+        .map(|router| router.status())
+        .unwrap_or(crate::capability::laya::LayaStatus::Starting)
+}
+
 #[tauri::command]
 pub async fn get_model_profile(
     app_handle: tauri::AppHandle,

@@ -94,22 +94,33 @@ pub fn run() {
             // reaches the Hub. Catalog browsing and adapter discovery run from
             // plain commands with no app handle, so they read it from there
             // rather than opening config.json themselves.
-            {
+            let laya_routing = {
                 let config_path = crate::config::ConfigManager::get_config_path(app.handle());
                 match crate::config::ConfigManager::load(&config_path) {
-                    Ok(cfg) if !cfg.hf_token.trim().is_empty() => {
-                        crate::config::hf_token::set(Some(cfg.hf_token));
-                        info!("HuggingFace token loaded from settings");
+                    Ok(cfg) => {
+                        if !cfg.hf_token.trim().is_empty() {
+                            crate::config::hf_token::set(Some(cfg.hf_token.clone()));
+                            info!("HuggingFace token loaded from settings");
+                        } else {
+                            info!(
+                                "No HuggingFace token in settings (environment: {})",
+                                crate::config::hf_token::source()
+                            );
+                        }
+                        cfg.ai_settings.laya_routing
                     }
-                    Ok(_) => {
-                        info!(
-                            "No HuggingFace token in settings (environment: {})",
-                            crate::config::hf_token::source()
-                        );
+                    Err(e) => {
+                        log::warn!("Could not read config for HuggingFace token: {e:#}");
+                        crate::config::defaults::AiSettings::default().laya_routing
                     }
-                    Err(e) => log::warn!("Could not read config for HuggingFace token: {e:#}"),
                 }
-            }
+            };
+
+            // Laya decides which capability — and so which LoRA adapter — each
+            // turn gets. Loading its checkpoint takes seconds, so it starts in
+            // the background; until it is ready, and if it is not installed,
+            // the keyword classifier routes exactly as before.
+            crate::capability::laya::start_global(&app_data_dir, laya_routing);
 
             let pack_manager = Arc::new(crate::model_recommendation::pack_manager::PackManager::new(&app_data_dir).expect("Failed to initialize PackManager"));
             app.manage(pack_manager);
@@ -274,6 +285,9 @@ pub fn run() {
             if let Ok(app_data_dir) = app.path().app_data_dir() {
                 std::thread::spawn(move || {
                     adapter_manager::AdapterRegistry::perform_startup_scan(&app_data_dir);
+                    // The scan is offline and runs before Laya has loaded, so
+                    // adapters whose names say nothing are sorted once it has.
+                    adapter_manager::AdapterRegistry::assign_unsorted_when_laya_ready(&app_data_dir);
                 });
             }
 
@@ -345,6 +359,7 @@ pub fn run() {
             commands::inference::restore_last_session,
 
             // Model Intelligence Layer Commands
+            commands::intelligence::get_laya_status,
             commands::intelligence::get_model_profile,
             commands::intelligence::update_model_profile,
             commands::intelligence::refresh_model_profile,

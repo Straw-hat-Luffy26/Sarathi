@@ -144,28 +144,72 @@ pub struct RawModelInfo {
     pub gguf: Option<RawGguf>,
 }
 
-/// Pipeline tags Sarathi can serve.
+/// Pipeline tags for models that answer a text prompt in text but also accept
+/// images, audio or video.
 ///
-/// The GGUF filter alone also returns OCR, text-to-speech, embedding, and
-/// vision models — `PaddleOCR-VL`, `surya-ocr`, and `svara-tts` all ship GGUF
-/// files but cannot answer a chat request. They were previously dropped only
-/// because their filenames failed quantization parsing, which is luck rather
-/// than a rule. Checking the declared task rejects them deliberately.
+/// Every current frontier open-weight family is one of these. Qwen 3.5 and
+/// later, Gemma 4, and their fine-tunes are natively multimodal, and the Hub
+/// tags them `image-text-to-text` (official Gemma 4 builds say `any-to-any`).
+/// llama.cpp serves them as ordinary chat models — the vision projector is a
+/// separate optional file — so rejecting the tag emptied the catalog of exactly
+/// the models people come looking for: 65 of the 100 most-downloaded GGUF
+/// repositories were being discarded, `unsloth/Qwen3.5-9B-GGUF` and
+/// `unsloth/gemma-4-12b-it-GGUF` among them.
+const MULTIMODAL_CHAT_PIPELINES: &[&str] = &[
+    "image-text-to-text",
+    "any-to-any",
+    "visual-question-answering",
+    "video-text-to-text",
+    "audio-text-to-text",
+];
+
+/// Whether a repository with this pipeline tag can serve a chat request.
+///
+/// The GGUF filter alone also returns speech, embedding, image and video
+/// models — `svara-tts`, `parakeet`, `Z-Image-Turbo` all ship GGUF files but
+/// cannot answer a chat request. Checking the declared task rejects them
+/// deliberately rather than by luck of filename parsing.
+///
+/// A multimodal tag is accepted only alongside a chat template in the GGUF
+/// metadata. The template is the model's own statement that it takes chat
+/// turns, which the tag alone is not: the same tag also covers vision encoders
+/// shipped without one.
 ///
 /// `None` is accepted: many quantization repos leave the tag unset, and
 /// excluding those would discard a large part of the usable catalog.
-pub fn is_servable_pipeline(tag: Option<&str>) -> bool {
+pub fn is_servable_pipeline(tag: Option<&str>, has_chat_template: bool) -> bool {
     match tag {
         None => true,
-        Some(t) => matches!(t, "text-generation" | "text2text-generation" | "conversational"),
+        Some("text-generation" | "text2text-generation" | "conversational") => true,
+        Some(t) if MULTIMODAL_CHAT_PIPELINES.contains(&t) => has_chat_template,
+        Some(_) => false,
     }
 }
 
 impl RawModelInfo {
     /// Builds a [`GgufRepo`], or `None` when the repo cannot serve chat requests.
     pub fn into_repo(self) -> Option<GgufRepo> {
-        if !is_servable_pipeline(self.pipeline_tag.as_deref()) {
+        let has_chat_template = self
+            .gguf
+            .as_ref()
+            .and_then(|g| g.chat_template.as_deref())
+            .is_some_and(|t| !t.trim().is_empty());
+        if !is_servable_pipeline(self.pipeline_tag.as_deref(), has_chat_template) {
             return None;
+        }
+
+        // Listing a model the bundled llama.cpp cannot load sends the user off
+        // to download tens of gigabytes that fail at the last step. An unknown
+        // architecture string is not evidence either way, so only a named,
+        // unsupported one is refused.
+        if let Some(arch) = self.gguf.as_ref().and_then(|g| g.architecture.as_deref()) {
+            if !super::runtime_arch::is_loadable(arch) {
+                log::debug!(
+                    "[HF_DISCOVERY] Skipping {}: architecture '{arch}' is not in the bundled llama.cpp",
+                    self.id
+                );
+                return None;
+            }
         }
 
         // The parameter count has to be read before the sizes are parsed: it is
@@ -319,15 +363,26 @@ pub fn quantization_label(filename: &str) -> Option<String> {
 /// These files are real and needed for vision models, but they are companions
 /// to a quantization, never a choice of one.
 fn is_companion_file(filename: &str) -> bool {
-    // Companions are kept in a subfolder in some repositories — the gemma-4
-    // repo puts its multi-token-prediction module in `MTP/`. The model itself,
-    // including every shard of it, sits at the top level in each layout seen
-    // so far, so a nested GGUF is not a size a person can choose.
-    if filename.contains('/') {
-        return true;
+    // Folders hold both kinds. The gemma-4 repo keeps its multi-token-prediction
+    // module in `MTP/`; unsloth keeps its large split builds one folder per
+    // quantization, `BF16/GLM-5.3-BF16-00001-of-00033.gguf`, and for a model
+    // that size every build is in a folder — rejecting them all listed GLM-5.3
+    // as having nothing to download. The folder's own name tells them apart: a
+    // quantization folder is named like one, a side-car folder is not.
+    //
+    // Listing these is only honest because the resolver lists the tree
+    // recursively and the downloader fetches every shard of a split build.
+    let (folder, file) = match filename.rsplit_once('/') {
+        Some((dir, file)) => (Some(dir.rsplit('/').next().unwrap_or(dir)), file),
+        None => (None, filename),
+    };
+    if let Some(folder) = folder {
+        if quantization_label(&format!("{folder}.gguf")).is_none() {
+            return true;
+        }
     }
 
-    let base = filename.to_ascii_lowercase();
+    let base = file.to_ascii_lowercase();
     // `.` counts as a separator alongside `-` and `_`. Without it
     // `Qwen3.8-27B.mmproj-Q8_0.gguf` is not recognised as a projector at all —
     // the token is there, but preceded by a dot — and the file goes on to parse
@@ -1139,11 +1194,58 @@ mod tests {
         assert!(r.into_repo().is_none());
     }
 
+    fn gguf_meta(arch: &str, chat_template: Option<&str>) -> RawGguf {
+        RawGguf {
+            total: Some(9_000_000_000),
+            architecture: Some(arch.to_string()),
+            context_length: Some(32768),
+            chat_template: chat_template.map(String::from),
+            bos_token: None,
+            eos_token: None,
+        }
+    }
+
+    /// `unsloth/GLM-5.3-GGUF` keeps every build in a folder named for its
+    /// quantization; `unsloth/gemma-4-12b-it-GGUF` keeps its MTP head in `MTP/`.
+    #[test]
+    fn builds_in_quantization_folders_are_listed_and_side_car_folders_are_not() {
+        let files = vec![
+            // ~2.6 bits per weight across the set; the first shard is metadata.
+            sib("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00003.gguf", 9_428_677),
+            sib("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00002-of-00003.gguf", 125_000_000_000),
+            sib("UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00003-of-00003.gguf", 125_000_000_000),
+            sib("BF16/GLM-5.3-BF16-00001-of-00002.gguf", 700_000_000_000),
+            sib("BF16/GLM-5.3-BF16-00002-of-00002.gguf", 800_000_000_000),
+            sib("MTP/mtp-GLM-5.3-Q8_0.gguf", 2_000_000_000),
+            sib("BF16/mmproj-BF16.gguf", 1_200_000_000),
+            sib("mmproj-F16.gguf", 1_100_000_000),
+        ];
+
+        let mut quants = parse_quantizations(&files, 753_864_139_008);
+        quants.sort_by(|a, b| a.label.cmp(&b.label));
+
+        let labels: Vec<&str> = quants.iter().map(|q| q.label.as_str()).collect();
+        assert_eq!(labels, vec!["BF16", "Q2_K_XL"], "got {quants:?}");
+
+        let q2 = &quants[1];
+        assert!(q2.is_sharded);
+        assert_eq!(q2.size_bytes, 250_009_428_677, "every shard counts, not the metadata-only first");
+        assert_eq!(q2.filename, "UD-Q2_K_XL/GLM-5.3-UD-Q2_K_XL-00001-of-00003.gguf");
+    }
+
     #[test]
     fn non_chat_models_are_rejected_even_when_they_ship_gguf() {
         // These are real examples seen in a live sweep. They carry .gguf files
-        // but cannot answer a chat request.
-        for tag in ["image-text-to-text", "text-to-speech", "feature-extraction", "automatic-speech-recognition"] {
+        // but cannot answer a chat request. `image-text-to-text` is here with no
+        // chat template: the tag alone does not establish a chat model.
+        for tag in [
+            "image-text-to-text",
+            "text-to-speech",
+            "feature-extraction",
+            "automatic-speech-recognition",
+            "image-text-to-video",
+            "text-to-image",
+        ] {
             let r = raw(Some(tag), vec![sib("model-Q4_K_M.gguf", 1_000_000)]);
             assert!(
                 r.into_repo().is_none(),
@@ -1158,6 +1260,44 @@ mod tests {
             let r = raw(Some(tag), vec![sib("model-Q4_K_M.gguf", 1_000_000)]);
             assert!(r.into_repo().is_some(), "pipeline '{tag}' should be accepted");
         }
+    }
+
+    /// The regression that emptied the catalog of current models: Qwen 3.5+
+    /// and Gemma 4 are tagged multimodal by the Hub and were all discarded,
+    /// although llama.cpp serves every one of them as a chat model.
+    #[test]
+    fn natively_multimodal_chat_models_are_accepted() {
+        for (tag, arch) in [
+            ("image-text-to-text", "qwen35"),
+            ("image-text-to-text", "gemma4"),
+            ("any-to-any", "gemma4"),
+            ("visual-question-answering", "qwen2vl"),
+        ] {
+            let mut r = raw(Some(tag), vec![sib("Qwen3.5-9B-Q4_K_M.gguf", 5_680_000_000)]);
+            r.gguf = Some(gguf_meta(arch, Some("{{ messages }}")));
+            let repo = r.into_repo();
+            assert!(repo.is_some(), "{tag}/{arch} with a chat template must be listed");
+        }
+    }
+
+    #[test]
+    fn a_multimodal_tag_with_a_blank_template_is_still_not_a_chat_model() {
+        let mut r = raw(Some("image-text-to-text"), vec![sib("m-Q4_K_M.gguf", 5_680_000_000)]);
+        r.gguf = Some(gguf_meta("qwen35", Some("   ")));
+        assert!(r.into_repo().is_none());
+    }
+
+    #[test]
+    fn an_architecture_the_runtime_cannot_load_is_not_listed() {
+        // Seen live: `unsloth/Qwen3.8-Flash-Next-GGUF` reports `qwen4exp`, which
+        // the bundled llama.cpp does not know.
+        let mut r = raw(Some("text-generation"), vec![sib("m-Q4_K_M.gguf", 5_680_000_000)]);
+        r.gguf = Some(gguf_meta("qwen4exp", Some("{{ messages }}")));
+        assert!(r.into_repo().is_none());
+
+        let mut ok = raw(Some("text-generation"), vec![sib("m-Q4_K_M.gguf", 5_680_000_000)]);
+        ok.gguf = Some(gguf_meta("qwen35", Some("{{ messages }}")));
+        assert!(ok.into_repo().is_some(), "a supported architecture must pass");
     }
 
     #[test]

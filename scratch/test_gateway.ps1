@@ -9,7 +9,7 @@
 # points at the cause instead of just going red.
 
 $ErrorActionPreference = 'Continue'
-$base = 'http://127.0.0.1:11435'
+$base = 'http://127.0.0.1:11535'
 $pass = 0
 $fail = 0
 

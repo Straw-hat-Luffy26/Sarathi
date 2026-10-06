@@ -188,6 +188,7 @@ mod tests {
         assert!(!c.apply_capabilities, "must not interfere with client prompts by default");
         assert_eq!(c.port, super::super::DEFAULT_PORT);
         assert_ne!(c.port, 11434, "must not collide with Ollama");
+        assert_ne!(c.port, 11435, "must not collide with ARJUN's gateway");
     }
 
     #[test]

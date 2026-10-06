@@ -392,8 +392,31 @@ pub async fn download_adapter(
     // capability resolver can only bind what `manifest.adapters[<capability>]`
     // names, so an adapter that was downloaded, converted and verified but never
     // recorded here would show as installed and never once be used.
-    let assignment = crate::capability::assign::infer(&adapter_repo_id, &tags);
+    // Tags and name first; when they name no skill, the model card and Laya
+    // read what the adapter specialises in. Off the async runtime, because both
+    // the card fetch and Laya block.
+    let assignment = match crate::capability::assign::infer(&adapter_repo_id, &tags) {
+        Some(found) => Some(found),
+        None => {
+            let repo = adapter_repo_id.clone();
+            let tags = tags.clone();
+            let token = crate::config::hf_token::get();
+            tokio::task::spawn_blocking(move || {
+                let card = crate::model_providers::huggingface::use_case::fetch_card_blocking(
+                    &repo,
+                    token.as_deref(),
+                );
+                crate::capability::assign::infer_with_laya(&repo, &tags, card.as_deref())
+            })
+            .await
+            .ok()
+            .flatten()
+        }
+    };
     let capability = assignment.as_ref().map(|a| a.capability.clone());
+
+    // A reinstall starts afresh: an earlier "Not used" was about the old copy.
+    let _ = std::fs::remove_file(target_dir.join(crate::adapter_manager::USER_UNASSIGNED_MARKER));
 
     if let Some(assigned) = &assignment {
         if let Err(e) = register_adapter(
@@ -670,12 +693,19 @@ pub async fn set_adapter_capability(
     )
     .map_err(|e| e.to_string())?;
 
+    let adapter_dir = store::adapters_root(&package).join(&adapter_id);
+    let marker = adapter_dir.join(crate::adapter_manager::USER_UNASSIGNED_MARKER);
+
     let Some(key) = capability else {
+        // Remembered, so automatic sorting on the next launch does not put it
+        // straight back into a slot the user just took it out of.
+        if let Err(e) = std::fs::write(&marker, b"") {
+            log::warn!("[ADAPTERS] Could not record that '{adapter_id}' is not used: {e}");
+        }
         log::info!("[ADAPTERS] '{adapter_id}' unassigned for '{model_id}'");
         return Ok(());
     };
-
-    let adapter_dir = store::adapters_root(&package).join(&adapter_id);
+    let _ = std::fs::remove_file(&marker);
     let (weight_file, size_bytes) = AdapterRegistry::verify_adapter_files(&adapter_dir)
         .ok_or_else(|| format!("No usable adapter found in '{adapter_id}'."))?;
 

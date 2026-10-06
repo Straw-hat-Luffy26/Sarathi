@@ -136,6 +136,7 @@ pub async fn compatible_adapters(
     }
 
     let mut adapters = fetch(&base, token).await?;
+    enrich_use_cases(&mut adapters, token).await;
     // Cached before judging: what the Hub published is a fact about the adapter,
     // while installability is a fact about *this* base model. Storing the verdict
     // would make the cache wrong the moment it is read for a different one.
@@ -184,6 +185,109 @@ async fn fetch(base_model_id: &str, token: Option<&str>) -> Result<Vec<AdapterLi
     Ok(exact)
 }
 
+// ─── Use cases ──────────────────────────────────────────────────────────────
+
+/// Reads each adapter's model card and settles what it is for.
+///
+/// Tags and the repository name already gave most adapters a use case; the
+/// card supplies a one-line description for all of them and the use case for
+/// names like `rinlekha` that say nothing. One small request per adapter — at
+/// most [`LIMIT`] — made once per lookup and then cached with it for a week.
+///
+/// Laya reads what is still unsettled. It runs on the CPU beside chat routing,
+/// so it is given a few adapters, not the whole list.
+async fn enrich_use_cases(adapters: &mut [AdapterListing], token: Option<&str>) {
+    use super::use_case;
+
+    const CONCURRENCY: usize = 6;
+    /// Laya calls per lookup. Each takes about half a second on a laptop CPU.
+    const LAYA_BUDGET: usize = 8;
+
+    let Ok(client) = reqwest::Client::builder()
+        .user_agent("Sarathi/0.1.0")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+    else {
+        return;
+    };
+
+    for chunk in adapters.chunks_mut(CONCURRENCY) {
+        let cards = futures_util::future::join_all(
+            chunk.iter().map(|a| fetch_card(&client, &a.repo_id, token)),
+        )
+        .await;
+        for (adapter, card) in chunk.iter_mut().zip(cards) {
+            let current = adapter
+                .use_case
+                .take()
+                .unwrap_or_else(|| use_case::from_metadata(&adapter.repo_id, &[], None));
+            adapter.use_case = Some(match card {
+                Some(text) => use_case::with_card(&current, &adapter.repo_id, &text),
+                None => current,
+            });
+        }
+    }
+
+    let unsettled: Vec<(usize, String, Option<String>)> = adapters
+        .iter()
+        .enumerate()
+        .filter_map(|(i, a)| {
+            let uc = a.use_case.as_ref()?;
+            (uc.source == "none").then(|| (i, a.repo_id.clone(), uc.summary.clone()))
+        })
+        .take(LAYA_BUDGET)
+        .collect();
+    if unsettled.is_empty() {
+        return;
+    }
+
+    // Laya blocks while it thinks, so it runs off the async runtime.
+    let picks = tokio::task::spawn_blocking(move || {
+        unsettled
+            .into_iter()
+            .filter_map(|(i, id, summary)| use_case::from_laya(&id, summary.as_deref()).map(|l| (i, l)))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+
+    for (i, label) in picks {
+        if let Some(uc) = adapters[i].use_case.as_mut() {
+            log::debug!("[ADAPTERS] Laya named '{}' a {label} adapter", adapters[i].repo_id);
+            uc.label = label;
+            uc.source = "laya".to_string();
+        }
+    }
+}
+
+/// The head of an adapter's README: the purpose is in the first paragraph, and
+/// some cards run to megabytes of benchmark tables.
+async fn fetch_card(client: &reqwest::Client, repo_id: &str, token: Option<&str>) -> Option<String> {
+    const CARD_BYTES: usize = 8 * 1024;
+
+    let mut req = client
+        .get(format!("https://huggingface.co/{repo_id}/raw/main/README.md"))
+        .header(reqwest::header::RANGE, format!("bytes=0-{}", CARD_BYTES - 1));
+    if let Some(t) = token.map(str::trim).filter(|t| !t.is_empty()) {
+        req = req.bearer_auth(t);
+    }
+    let mut resp = req.send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+
+    // Read only as far as needed, even from a server that ignored the range.
+    let mut body: Vec<u8> = Vec::with_capacity(CARD_BYTES);
+    while body.len() < CARD_BYTES {
+        match resp.chunk().await {
+            Ok(Some(bytes)) => body.extend_from_slice(&bytes),
+            _ => break,
+        }
+    }
+    body.truncate(CARD_BYTES);
+    Some(String::from_utf8_lossy(&body).into_owned())
+}
+
 // ─── Cache ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -210,6 +314,12 @@ fn read_cached(
     let text = std::fs::read_to_string(cache_path(app_data_dir)).ok()?;
     let file: CacheFile = serde_json::from_str(&text).ok()?;
     let entry = file.entries.get(base_model_id)?;
+
+    // Written before every adapter carried a use case. Served as it stands, the
+    // list would show some adapters with one and some without for a week.
+    if entry.adapters.iter().any(|a| a.use_case.is_none()) {
+        return None;
+    }
 
     let fetched = chrono::DateTime::parse_from_rfc3339(&entry.fetched_at).ok()?;
     // A clock that has gone backwards must not read as a negative age.
@@ -278,7 +388,20 @@ mod tests {
             likes: 1,
             gguf_ready: ready,
             focus: "coding".to_string(),
+            use_case: Some(crate::model_providers::huggingface::use_case::from_metadata(repo, &[], None)),
         }
+    }
+
+    #[test]
+    fn a_listing_cached_before_use_cases_existed_is_refetched() {
+        let dir = scratch("pre-use-case");
+        let mut old = listing("org/a", true);
+        old.use_case = None;
+        write_cached(&dir, "Qwen/Qwen2.5-7B-Instruct", &[old]);
+        assert!(
+            read_cached(&dir, "Qwen/Qwen2.5-7B-Instruct").is_none(),
+            "every adapter must show a use case, so an old listing is not served"
+        );
     }
 
     #[test]

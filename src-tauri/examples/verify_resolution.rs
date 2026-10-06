@@ -19,6 +19,10 @@ const CASES: &[(&str, &str, &str)] = &[
     // A dense model, to prove nothing that worked has been broken.
     ("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", "Q4_K_M", "ordinary dense model"),
     ("bartowski/Llama-3.2-1B-Instruct-GGUF", "Q4_K_M", "small dense model"),
+    // Split builds kept in a folder per quantization. Every shard must come
+    // back, and the first is metadata only, so the size is the set's.
+    ("unsloth/Qwen3.6-27B-GGUF", "BF16", "2-shard split in a BF16/ folder — every part"),
+    ("unsloth/GLM-5.3-GGUF", "UD-Q2_K_XL", "7-shard split, metadata-only first shard"),
 ];
 
 #[tokio::main]
@@ -37,6 +41,7 @@ async fn main() {
                 println!("  -> file:         {}", a.file_name);
                 println!("  -> quantization: {} (requested {quant})", a.quantization);
                 println!("  -> size:         {:.2} GB", a.size_bytes as f64 / 1e9);
+                println!("  -> parts:        {}", a.parts.len());
                 println!(
                     "  -> architecture: {}",
                     a.architecture.as_deref().unwrap_or("<unverified: Hub unreachable>")

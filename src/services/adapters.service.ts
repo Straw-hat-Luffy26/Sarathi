@@ -31,12 +31,14 @@ export const CAPABILITY_LABELS: Record<Capability, string> = {
 };
 
 /** How an adapter's capability slot was arrived at — see capability/assign.rs. */
-export type AssignmentConfidence = 'stated' | 'suggested' | 'manual';
+export type AssignmentConfidence = 'stated' | 'suggested' | 'inferred' | 'laya' | 'manual';
 
 /** Plain-language provenance, so a guess is never shown as a fact. */
 export const ASSIGNMENT_SOURCE: Record<AssignmentConfidence, string> = {
   stated: "from the author's tags",
   suggested: "guessed from the adapter's name",
+  inferred: 'matched to what it specialises in',
+  laya: 'picked by Laya from its description',
   manual: 'your choice',
 };
 
